@@ -1,0 +1,2932 @@
+//! Run records: one small ZON file per run in `$XDG_STATE_HOME/zbx/runs/<name>.zon` (or
+//! `~/.local/state/zbx/runs/` when that is unset), with the name, the rootfs, the command, the
+//! times and how the run ended. It is the state `zbx bundle` needs (slice 3) and what a later
+//! `list` and re-adoption (M2) read. It is not a registry: nothing here starts, stops or lists.
+//!
+//! The format has a version, written first. A reader accepts every version up to
+//! `constants.record_version` and fills what an older one lacks with defaults; a newer one is
+//! skipped, never misread. Version 9 added what the run's tree is bound to (`.binding`: `none`,
+//! `result:<64 hex>` or `manifest:<64 hex>`), so that `zbx exec` can judge it by the policy as
+//! the run was judged; an older record has none, which reads as unknown. Version 8 added the
+//! user the command ran as (`.user`, `"UID:GID"`;
+//! an older record has none, which reads as unknown) and a fourth kind of mount, `mount:` (M6b,
+//! `--mount`, writable), whose host path is the resolved one. Version 7 added the other mounts
+//! of the run (`.mounts`, one string of
+//! `kind:...` values separated by spaces, `mounts.text`): a secret's host path is in it, its
+//! bytes never are; an older record has none. Version 6 added the state volumes the run mounted
+//! (`.state`, one
+//! string of `--state` values, `NAME:PATH[:ro]`, separated by spaces), so that `zbx state ls` can
+//! say which container uses a volume; an older record has none. Version 5 added what the run
+//! could reach (`network`, `publish`) and the names, never the values, of the variables set with
+//! `-e`; an older record reads with no
+//! network (unknown), no forwards and no names. Version 4 added the digest of the tree the
+//! container was started from and the path of its upper layer (both empty for a run of a plain
+//! `--rootfs` directory). Version 3 added the host pid of the container's PID 1 and of the
+//! supervisor that waits for it (what re-adoption looks for). Version 2 added the limits, the
+//! scope's name, why the run ended (`EndReason`) and whether it was detached; a version 1
+//! record reads with no limits, no scope, not detached, and the reason its exit implies. Unknown
+//! fields are ignored, so a later zbx may add some. The file is plain ZON, but the reader is a
+//! line reader for the shape the writer produces (one field per
+//! line), because the standard ZON parser allocates and this must not.
+//!
+//! Writing is atomic: the bytes go to a temporary file in the same directory, which is renamed
+//! over the final name, so a reader sees the old record or the new one. At most
+//! `constants.runs_max` records are kept; saving one past that deletes the oldest. A record that
+//! cannot be read is skipped and counted, never fatal, and it is the first to be deleted.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const constants = @import("../constants.zig");
+const host_mod = @import("../host.zig");
+const codes = @import("../diag/codes.zig");
+const spec_mod = @import("spec.zig");
+const volume = @import("../state/volume.zig");
+const mounts_mod = @import("mounts.zig");
+const devices_mod = @import("devices.zig");
+const knobs = @import("knobs.zig");
+
+const Host = host_mod.Host;
+
+const labels_bytes_max = constants.labels_count_max *
+    (constants.label_key_bytes_max + constants.label_value_bytes_max + 2);
+const env_names_bytes_max = constants.run_env_count_max * (constants.env_name_bytes_max + 1);
+
+pub const IdsMode = enum { single, full };
+
+pub const Exit = union(enum) {
+    /// Written when the run starts; still this after a zbx that died with its container.
+    running,
+    exited: u8,
+    signaled: u8,
+    /// The command never started; this is the diagnostic code that said why.
+    start_failed: codes.Code,
+    /// The run was lost: zbx could not wait for the container to the end.
+    lost,
+};
+
+/// Why a run ended, as the exit report says it (`ExitReason`): the same words as the JSON
+/// `container_exit.reason`. `none` is a run that has not ended, never started or was lost.
+pub const EndReason = enum { none, exited, signal, oom, pid_limit };
+
+/// The reason an exit implies when nothing more is known (version 1 records, or a view that
+/// does not say).
+pub fn reason_of(exit: Exit) EndReason {
+    if (exit == .signaled) assert(exit.signaled > 0);
+    return switch (exit) {
+        .exited => .exited,
+        .signaled => .signal,
+        .running, .start_failed, .lost => .none,
+    };
+}
+
+pub const Label = spec_mod.Label;
+
+/// What goes into a record.
+pub const View = struct {
+    name: []const u8,
+    rootfs: []const u8,
+    command: []const []const u8,
+    labels: []const Label,
+    started: u64,
+    ended: ?u64,
+    exit: Exit,
+    ids: IdsMode,
+    zbx_version: []const u8,
+    /// The JSON line of the diagnostic that ended the run, for a bundle; empty for none.
+    diagnostic: []const u8 = "",
+    /// Why it ended; `none` means what `exit` implies (`reason_of`).
+    reason: EndReason = .none,
+    limits: spec_mod.Limits = .{},
+    /// The cgroup scope's name, or empty if the run had none.
+    scope: []const u8 = "",
+    detached: bool = false,
+    /// The run was stopped because its time (`--timeout`) was up; `exit` and `reason` still say
+    /// how it ended (the signal that did it).
+    timed_out: bool = false,
+    /// The host's pid of the container's PID 1, and of the process that waits for it (the
+    /// `zbx` that started the run, or the supervisor of a detached one); zero if unknown.
+    pid: u32 = 0,
+    supervisor: u32 = 0,
+    /// Version 4: the digest of the tree the run started from, and the upper layer of its
+    /// overlay; empty for a run of a directory.
+    tree: []const u8 = "",
+    upper: []const u8 = "",
+    /// Version 5: what the container could reach, the forwards of `--publish` (only with
+    /// `user`), and the names of the variables set with `-e`. A value is never in a record.
+    network: spec_mod.Network = .none,
+    publish: []const spec_mod.Publish = &.{},
+    env_names: []const []const u8 = &.{},
+    /// Version 6: the state volumes the run mounted.
+    state: []const volume.Mount = &.{},
+    /// Version 7: the other mounts (`--tmpfs`, `--bind`, `--secret`; version 8: `--mount`).
+    mounts: []const mounts_mod.Mount = &.{},
+    /// Version 8: the user the command ran as; null is root (written as 0:0).
+    user: ?spec_mod.User = null,
+    /// Version 9: what the tree is bound to, for the policy gate at `zbx exec`.
+    binding: Binding = .none,
+    /// Version 10: the listener the run asked for (`--listen`), never a descriptor.
+    listen: ?spec_mod.Listen = null,
+    /// Version 10: the host devices the run asked for (`--device`), as it asked.
+    devices: []const devices_mod.Device = &.{},
+    /// Version 11: what a lazy run (`zbx run --lazy`, S2) fetched; null for any other run, which
+    /// then writes no line.
+    lazy: ?Lazy = null,
+    /// Version 12: the workload knobs, `--ulimit` and `--sysctl` (`--shm-size` is
+    /// `limits.shm_bytes`). A run that set none writes no line for them, and an older version.
+    rlimits: spec_mod.Rlimits = .{},
+    sysctls: []const spec_mod.Sysctl = &.{},
+};
+
+/// Whether a run set an M2b knob, and so its record is version 12.
+fn has_knobs(view: *const View) bool {
+    assert(view.sysctls.len <= constants.sysctls_max);
+    const result = view.limits.shm_bytes != null or view.rlimits.count() > 0 or
+        view.sysctls.len > 0;
+    if (view.sysctls.len > 0) assert(result);
+    return result;
+}
+
+/// A lazy run's fetching, as its record keeps it (`.lazy`) and `ps`/`inspect` JSON shows it.
+pub const Lazy = struct {
+    /// The sources the resolver had (the store's peers, the registry).
+    sources: u32,
+    /// Chunk bytes fetched for readers that waited for them, and by the background fill.
+    demand_bytes: u64,
+    fill_bytes: u64,
+    /// Reads that ended in an error (`EIO`).
+    errors: u64,
+    /// How much of the image was local when the run's record was last written.
+    local_percent: u8,
+
+    pub fn fetched_bytes(lazy: *const Lazy) u64 {
+        return lazy.demand_bytes +| lazy.fill_bytes; // A record is read as found: never overflows.
+    }
+};
+
+pub const Binding = spec_mod.Binding;
+
+// ---- Writing -------------------------------------------------------------------------------
+
+fn write_string(writer: *std.Io.Writer, text: []const u8) void {
+    assert(text.len <= constants.file_bytes_max);
+    write_bytes(writer, "\"");
+    for (text) |byte| {
+        switch (byte) {
+            '"' => write_bytes(writer, "\\\""),
+            '\\' => write_bytes(writer, "\\\\"),
+            '\n' => write_bytes(writer, "\\n"),
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => write_byte(writer, byte),
+            else => write_format(writer, "\\x{x:0>2}", .{byte}),
+        }
+    }
+    write_bytes(writer, "\"");
+}
+
+// The record is rendered into a buffer that `render` proves large enough for the worst case, so
+// these three cannot fail.
+
+fn write_bytes(writer: *std.Io.Writer, bytes: []const u8) void {
+    assert(writer.buffer.len >= constants.record_bytes_max);
+    writer.writeAll(bytes) catch unreachable; // Cannot fail: the buffer holds a maximal record.
+}
+
+fn write_byte(writer: *std.Io.Writer, byte: u8) void {
+    assert(writer.buffer.len >= constants.record_bytes_max);
+    writer.writeByte(byte) catch unreachable; // Cannot fail: same bound as `write_bytes`.
+}
+
+fn write_format(writer: *std.Io.Writer, comptime format: []const u8, args: anytype) void {
+    assert(writer.buffer.len >= constants.record_bytes_max);
+    writer.print(format, args) catch unreachable; // Cannot fail: same bound as `write_bytes`.
+}
+
+/// The record as ZON text, in `buffer` (which must be `record_bytes_max` bytes). The worst case
+/// fits: every string byte is at most four bytes escaped, and the command, the labels, the name
+/// and the rootfs are bounded (the comptime check below adds them up).
+pub fn render(view: *const View, buffer: *[constants.record_bytes_max]u8) []const u8 {
+    assert(view.name.len > 0);
+    assert(view.command.len > 0);
+    var writer = std.Io.Writer.fixed(buffer);
+    write_bytes(&writer, ".{\n");
+    // A record without a listener stays at the plain version, byte for byte as before M8b.
+    const plain = constants.record_version_plain;
+    const has_new = view.listen != null or view.devices.len > 0;
+    const version = if (has_knobs(view))
+        constants.record_version_knobs
+    else if (view.lazy != null)
+        constants.record_version_lazy
+    else if (has_new) constants.record_version_listen else plain;
+    write_format(&writer, "    .version = {d},\n", .{version});
+    write_bytes(&writer, "    .name = ");
+    write_string(&writer, view.name);
+    write_bytes(&writer, ",\n    .rootfs = ");
+    write_string(&writer, view.rootfs);
+    write_bytes(&writer, ",\n");
+    write_command(&writer, view.command);
+    write_labels(&writer, view.labels);
+    write_format(&writer, "    .started = {d},\n", .{view.started});
+    if (view.ended) |ended| {
+        write_format(&writer, "    .ended = {d},\n", .{ended});
+    } else {
+        write_bytes(&writer, "    .ended = null,\n");
+    }
+    write_exit(&writer, view.exit);
+    write_format(&writer, "    .ids = .{s},\n", .{@tagName(view.ids)});
+    write_scope_fields(&writer, view);
+    write_bytes(&writer, "    .zbx = ");
+    write_string(&writer, view.zbx_version);
+    write_bytes(&writer, ",\n");
+    if (view.diagnostic.len > 0) {
+        assert(view.diagnostic.len <= constants.diag_json_bytes_max);
+        write_bytes(&writer, "    .diagnostic = ");
+        write_string(&writer, view.diagnostic);
+        write_bytes(&writer, ",\n");
+    }
+    write_bytes(&writer, "}\n");
+    const text = writer.buffered();
+    assert(text.len <= buffer.len);
+    return text;
+}
+
+/// The fields version 2 added, one per line like the rest.
+fn write_scope_fields(writer: *std.Io.Writer, view: *const View) void {
+    assert(view.scope.len <= constants.scope_name_bytes_max);
+    const reason = if (view.reason == .none) reason_of(view.exit) else view.reason;
+    write_format(writer, "    .reason = .{s},\n", .{@tagName(reason)});
+    write_format(writer, "    .detached = {s},\n", .{if (view.detached) "true" else "false"});
+    write_format(writer, "    .timed_out = {s},\n", .{if (view.timed_out) "true" else "false"});
+    write_bytes(writer, "    .scope = ");
+    write_string(writer, view.scope);
+    write_bytes(writer, ",\n");
+    write_format(writer, "    .pid = {d},\n", .{view.pid});
+    write_format(writer, "    .supervisor = {d},\n", .{view.supervisor});
+    write_limit(writer, "limit_memory", view.limits.memory_bytes);
+    write_limit(writer, "limit_pids", view.limits.pids);
+    write_limit(writer, "limit_cpu_millis", view.limits.cpu_millis);
+    assert(view.tree.len <= constants.store_digest_text_bytes);
+    assert(view.upper.len <= constants.containers_path_bytes_max);
+    write_bytes(writer, "    .tree = ");
+    write_string(writer, view.tree);
+    write_bytes(writer, ",\n    .upper = ");
+    write_string(writer, view.upper);
+    write_bytes(writer, ",\n");
+    write_network_fields(writer, view);
+}
+
+/// The fields version 5 added: the network, the forwards as the text typed, the `-e` names.
+fn write_network_fields(writer: *std.Io.Writer, view: *const View) void {
+    assert(spec_mod.publish_problem(view.network, view.publish) == null);
+    assert(spec_mod.env_names_problem(view.env_names) == null);
+    write_format(writer, "    .network = .{s},\n", .{@tagName(view.network)});
+    write_bytes(writer, "    .publish = .{");
+    for (view.publish, 0..) |forward, index| {
+        var storage: [spec_mod.publish_text_bytes_max]u8 = undefined;
+        write_bytes(writer, if (index == 0) " \"" else ", \"");
+        write_bytes(writer, forward.text(&storage));
+        write_bytes(writer, "\"");
+    }
+    // The names are one string, separated by spaces (a POSIX name has none): two strings in a row
+    // would read to the bundle's redactor as a secret name and its value.
+    write_bytes(writer, " },\n    .env_names = \"");
+    for (view.env_names, 0..) |name, index| {
+        if (index > 0) write_bytes(writer, " ");
+        write_bytes(writer, name);
+    }
+    write_bytes(writer, "\",\n");
+    write_state(writer, view.state);
+    write_mounts(writer, view.state, view.mounts);
+    const user = view.user orelse spec_mod.User{ .uid = 0, .gid = 0 };
+    write_format(writer, "    .user = \"{d}:{d}\",\n", .{ user.uid, user.gid });
+    write_binding(writer, view.binding);
+    write_listen(writer, view.listen);
+    write_devices(writer, view.devices);
+    write_lazy(writer, view.lazy);
+    write_knobs(writer, view);
+}
+
+/// The lines version 12 added, each only for a knob the run set: `.limit_shm = 268435456,`,
+/// `.ulimits = "nofile=4096:8192 stack=8388608:unlimited",` (one string, as `--ulimit` takes
+/// each, so that the bundle's redactor never reads two strings in a row), and
+/// `.sysctls = .{ "net.core.somaxconn=4096" },` (a value may hold a space, so one string each;
+/// a key is on the allowlist and never a secret's name).
+fn write_knobs(writer: *std.Io.Writer, view: *const View) void {
+    assert(view.rlimits.problem() == null);
+    assert(knobs.list_problem(view.sysctls, view.network.isolated()) == null);
+    if (view.limits.shm_bytes) |shm_bytes| {
+        assert(shm_bytes >= constants.shm_bytes_min);
+        if (view.limits.memory_bytes) |memory_bytes| assert(shm_bytes <= memory_bytes);
+        write_format(writer, "    .limit_shm = {d},\n", .{shm_bytes});
+    }
+    if (view.rlimits.count() > 0) {
+        var storage: [ulimits_text_bytes_max]u8 = undefined;
+        write_bytes(writer, "    .ulimits = \"");
+        write_bytes(writer, ulimits_text(&view.rlimits, &storage));
+        write_bytes(writer, "\",\n");
+    }
+    if (view.sysctls.len == 0) return;
+    write_bytes(writer, "    .sysctls = .{");
+    for (view.sysctls, 0..) |sysctl, index| {
+        var storage: [sysctl_text_bytes_max]u8 = undefined;
+        const text = std.fmt.bufPrint(&storage, "{s}={s}", .{ sysctl.key, sysctl.value }) catch
+            unreachable; // Cannot fail: a key on the list and a value within its bound.
+        write_bytes(writer, if (index == 0) " " else ", ");
+        write_string(writer, text);
+    }
+    write_bytes(writer, " },\n");
+}
+
+/// `name=soft:hard` for each limit set, in `Resource` order, space-separated; `unlimited` for
+/// no bound. `knobs.parse_ulimit` reads each back as the same limit.
+pub fn ulimits_text(
+    rlimits: *const spec_mod.Rlimits,
+    buffer: *[ulimits_text_bytes_max]u8,
+) []const u8 {
+    assert(rlimits.problem() == null);
+    var writer = std.Io.Writer.fixed(buffer);
+    for (std.enums.values(knobs.Resource)) |resource| {
+        const limit = rlimits.get(resource) orelse continue;
+        if (writer.end > 0) writer.writeByte(' ') catch unreachable; // Sized for all four.
+        writer.print("{s}=", .{@tagName(resource)}) catch unreachable; // Same.
+        write_rlimit_value(&writer, limit.soft);
+        writer.writeByte(':') catch unreachable; // Same.
+        write_rlimit_value(&writer, limit.hard);
+    }
+    assert((writer.end > 0) == (rlimits.count() > 0));
+    return writer.buffered();
+}
+
+fn write_rlimit_value(writer: *std.Io.Writer, value: u64) void {
+    assert(writer.buffer.len == ulimits_text_bytes_max);
+    if (value == knobs.unlimited) {
+        writer.writeAll("unlimited") catch unreachable; // Sized for all four at their widest.
+    } else {
+        writer.print("{d}", .{value}) catch unreachable; // Same.
+    }
+}
+
+/// Four `name=soft:hard`, each number at its widest (20 digits), and the spaces.
+pub const ulimits_text_bytes_max = knobs.resources_count * ("memlock=".len + 2 * 20 + 2);
+const sysctl_text_bytes_max = knobs.key_bytes_max + 1 + constants.sysctl_value_bytes_max;
+const sysctls_bytes_max = constants.sysctls_max * (sysctl_text_bytes_max + 1);
+
+const lazy_format = "    .lazy = .{{ .sources = {d}, .demand_bytes = {d}, .fill_bytes = {d}, " ++
+    ".errors = {d}, .local_percent = {d} }},\n";
+
+/// `.lazy = .{ .sources = 2, ... },` for a lazy run; no line for any other.
+fn write_lazy(writer: *std.Io.Writer, lazy: ?Lazy) void {
+    assert(writer.end <= writer.buffer.len);
+    const found = lazy orelse return;
+    assert(found.local_percent <= 100);
+    assert(found.sources <= constants.lazy_sources_max);
+    write_format(writer, lazy_format, .{
+        found.sources, found.demand_bytes,  found.fill_bytes,
+        found.errors,  found.local_percent,
+    });
+}
+
+/// `.devices = "/dev/dri/renderD128 /dev/kfd",` for a run with devices; no line for one without,
+/// and then the record is version 10.
+fn write_devices(writer: *std.Io.Writer, devices: []const devices_mod.Device) void {
+    assert(writer.end <= writer.buffer.len);
+    assert(devices_mod.list_problem(devices) == null);
+    if (devices.len == 0) return;
+    var storage: [devices_mod.text_bytes_max]u8 = undefined;
+    write_bytes(writer, "    .devices = ");
+    write_string(writer, devices_mod.text(devices, &storage));
+    write_bytes(writer, ",\n");
+}
+
+/// `.listen = "127.0.0.1:8080",` for a run with a listener; no line for one without.
+fn write_listen(writer: *std.Io.Writer, listen: ?spec_mod.Listen) void {
+    assert(writer.end <= writer.buffer.len);
+    // Only a run with a listener writes the line, and then the record is version 10.
+    const found = listen orelse return;
+    var storage: [spec_mod.listen_text_bytes_max]u8 = undefined;
+    write_format(writer, "    .listen = \"{s}\",\n", .{found.text(&storage)});
+}
+
+fn write_binding(writer: *std.Io.Writer, binding: Binding) void {
+    assert(writer.end <= writer.buffer.len);
+    assert(writer.buffer.len > 0);
+    switch (binding) {
+        .none => write_bytes(writer, "    .binding = \"none\",\n"),
+        .result => |bytes| write_format(writer, "    .binding = \"result:{s}\",\n", .{
+            &std.fmt.bytesToHex(bytes, .lower),
+        }),
+        .manifest => |bytes| write_format(writer, "    .binding = \"manifest:{s}\",\n", .{
+            &std.fmt.bytesToHex(bytes, .lower),
+        }),
+    }
+}
+
+/// `.mounts = "bind:/srv:/data tmpfs:/scratch:67108864",`: one string, for the same reason.
+fn write_mounts(
+    writer: *std.Io.Writer,
+    state: []const volume.Mount,
+    mounts: []const mounts_mod.Mount,
+) void {
+    assert(mounts_mod.list_problem(state, mounts) == null);
+    var text: [mounts_text_bytes_max]u8 = undefined;
+    var used: usize = 0;
+    for (mounts, 0..) |*mount, index| {
+        var buffer: [constants.mount_value_bytes_max]u8 = undefined;
+        const value = mounts_mod.text(mount, &buffer);
+        if (index > 0) {
+            text[used] = ' ';
+            used += 1;
+        }
+        @memcpy(text[used..][0..value.len], value);
+        used += value.len;
+    }
+    write_bytes(writer, "    .mounts = ");
+    write_string(writer, text[0..used]);
+    write_bytes(writer, ",\n");
+}
+
+const mounts_text_bytes_max = constants.mounts_max * (constants.mount_value_bytes_max + 1);
+
+/// `.state = "pgdata:/var/lib/postgresql/data cfg:/etc/app:ro",`: one string, as `env_names` is
+/// (a target holds no space), so that the bundle's redactor never reads two strings in a row.
+fn write_state(writer: *std.Io.Writer, mounts: []const volume.Mount) void {
+    assert(volume.list_problem(mounts) == null);
+    var text: [state_text_bytes_max]u8 = undefined;
+    var used: usize = 0;
+    for (mounts, 0..) |*mount, index| {
+        var buffer: [constants.state_value_bytes_max]u8 = undefined;
+        const value = volume.mount_text(mount, &buffer);
+        if (index > 0) {
+            text[used] = ' ';
+            used += 1;
+        }
+        @memcpy(text[used..][0..value.len], value);
+        used += value.len;
+    }
+    write_bytes(writer, "    .state = ");
+    write_string(writer, text[0..used]);
+    write_bytes(writer, ",\n");
+}
+
+const state_text_bytes_max = constants.state_volumes_max * (constants.state_value_bytes_max + 1);
+
+fn write_limit(writer: *std.Io.Writer, name: []const u8, value: anytype) void {
+    assert(name.len > 0);
+    assert(writer.buffer.len >= constants.record_bytes_max);
+    if (value) |number| {
+        write_format(writer, "    .{s} = {d},\n", .{ name, number });
+    } else {
+        write_format(writer, "    .{s} = null,\n", .{name});
+    }
+}
+
+fn write_command(writer: *std.Io.Writer, command: []const []const u8) void {
+    var bytes: usize = 0;
+    var kept: usize = 0;
+    assert(command.len <= constants.record_command_bytes_max); // Every word is at least a byte.
+    for (command) |word| {
+        if (bytes + word.len > constants.record_command_bytes_max) break;
+        bytes += word.len;
+        kept += 1;
+    }
+    write_bytes(writer, "    .command = .{");
+    for (command[0..kept], 0..) |word, index| {
+        write_bytes(writer, if (index == 0) " " else ", ");
+        write_string(writer, word);
+    }
+    write_bytes(writer, " },\n");
+    assert(kept <= command.len);
+    const truncated = if (kept < command.len) "true" else "false";
+    write_format(writer, "    .command_truncated = {s},\n", .{truncated});
+}
+
+fn write_labels(writer: *std.Io.Writer, labels: []const Label) void {
+    assert(labels.len <= constants.labels_count_max);
+    assert(writer.buffer.len >= constants.record_bytes_max);
+    write_bytes(writer, "    .labels = .{");
+    for (labels, 0..) |label, index| {
+        write_bytes(writer, if (index == 0) " .{ " else ", .{ ");
+        write_string(writer, label.key);
+        write_bytes(writer, ", ");
+        write_string(writer, label.value);
+        write_bytes(writer, " }");
+    }
+    write_bytes(writer, " },\n");
+}
+
+fn write_exit(writer: *std.Io.Writer, exit: Exit) void {
+    assert(writer.buffer.len >= constants.record_bytes_max);
+    if (exit == .signaled) assert(exit.signaled > 0);
+    switch (exit) {
+        .running => write_bytes(writer, "    .exit = .running,\n"),
+        .lost => write_bytes(writer, "    .exit = .lost,\n"),
+        .exited => |code| write_format(writer, "    .exit = .{{ .exited = {d} }},\n", .{code}),
+        .signaled => |number| {
+            write_format(writer, "    .exit = .{{ .signaled = {d} }},\n", .{number});
+        },
+        .start_failed => |code| {
+            const format = "    .exit = .{{ .start_failed = \"{s}\" }},\n";
+            write_format(writer, format, .{codes.full_name(code)});
+        },
+    }
+}
+
+comptime {
+    // The worst record: a name and a rootfs and a version string with every byte escaped to four,
+    // the command at its cut, eight labels at their bounds with every byte escaped, and the
+    // fixed text and numbers. It must fit.
+    const strings = 4 * (constants.container_name_bytes_max + constants.rootfs_bytes_max + 64);
+    const command = 4 * constants.record_command_bytes_max + 8 * constants.command_words_count_max;
+    // A label's key is printable ASCII, so at most two bytes each (a quote or a backslash); its
+    // value may be any byte, four escaped.
+    const label_bytes = 2 * constants.label_key_bytes_max + 4 * constants.label_value_bytes_max;
+    const labels = constants.labels_count_max * (label_bytes + 16);
+    const diagnostic = 4 * constants.diag_json_bytes_max + 32;
+    const scope = 4 * constants.scope_name_bytes_max + 160; // The name and the version 2 lines.
+    const store_strings = constants.store_digest_text_bytes + constants.containers_path_bytes_max;
+    const store = 4 * store_strings + 64;
+    const network = constants.publish_count_max * 16 +
+        4 * constants.run_env_count_max * (constants.env_name_bytes_max + 4) + 128;
+    // A volume's name is lowercase letters, digits and `._-`: never escaped. Its target is any
+    // byte, four escaped, and `:ro` follows.
+    const state_target = 4 * constants.state_target_bytes_max;
+    const state_value = constants.state_name_bytes_max + 1 + state_target + 3;
+    const state = constants.state_volumes_max * (state_value + 1) + 32;
+    // Version 7's other mounts and version 8's user: every byte of the mounts' text escaped to
+    // four, and `.user = "4294967295:4294967295",` with its name and newline.
+    const mounts = 4 * mounts_text_bytes_max + 32;
+    const user = 48;
+    // Version 9: `.binding = "manifest:<64 hex>",` with its newline.
+    const binding = 96;
+    // Version 10: `.listen = "127.0.0.1:65535",` with its newline.
+    const listen = 48;
+    // `.devices = "...",`: the paths hold no byte that is escaped (`devices.path_problem`).
+    const devices = devices_mod.text_bytes_max + 32;
+    // Version 11: `.lazy = .{ ... },`: the fixed text and five numbers at their widest.
+    const lazy = std.fmt.count(lazy_format, .{
+        constants.lazy_sources_max, std.math.maxInt(u64), std.math.maxInt(u64),
+        std.math.maxInt(u64),       100,
+    });
+    // Version 12: the shm size, the ulimits (never escaped) and each sysctl with its quotes and
+    // separator. A value is printable ASCII (`knobs.form_problem`), so a byte escapes to at most
+    // two (a quote or a backslash).
+    const knob_lines = 64 + ulimits_text_bytes_max + 32 +
+        constants.sysctls_max * (knobs.key_bytes_max + 2 * constants.sysctl_value_bytes_max + 8);
+    const total = strings + command + labels + diagnostic + scope + store + network + state +
+        mounts + user + binding + listen + devices + lazy + knob_lines + 512;
+    assert(total <= constants.record_bytes_max);
+}
+
+// ---- Reading -------------------------------------------------------------------------------
+
+/// A record read back. Only what the readers so far need: the rest of the file is ignored.
+pub const Parsed = struct {
+    /// 0 for a record with no version field (older than the field).
+    version: u32,
+    name: [constants.container_name_bytes_max]u8,
+    name_len: u8,
+    rootfs: [constants.rootfs_bytes_max]u8,
+    rootfs_len: u16,
+    started: u64,
+    ended: ?u64,
+    exit: Exit,
+    ids: ?IdsMode,
+    /// The diagnostic JSON line the run ended with; empty when the record has none.
+    diagnostic: [constants.diag_json_bytes_max]u8,
+    diagnostic_len: u16,
+    /// Version 2: why it ended (derived from `exit` for an older record).
+    reason: EndReason,
+    detached: bool,
+    /// Version 3: the run was stopped for its time.
+    timed_out: bool,
+    scope: [constants.scope_name_bytes_max]u8,
+    scope_len: u8,
+    limits: spec_mod.Limits,
+    /// Version 3: the host pids (zero for an older record).
+    pid: u32,
+    supervisor: u32,
+    /// Version 4: the tree digest and the upper layer; empty for an older record.
+    tree: [constants.store_digest_text_bytes]u8,
+    tree_len: u8,
+    upper: [constants.containers_path_bytes_max]u8,
+    upper_len: u16,
+    /// The command's words, each followed by a NUL; `command_truncated` says the record cut it.
+    command: [constants.record_command_bytes_max + constants.command_words_count_max]u8,
+    command_len: u16,
+    command_words: u8,
+    /// The labels, key then value, each followed by a NUL.
+    labels: [labels_bytes_max]u8,
+    labels_len: u16,
+    labels_count: u8,
+    /// Version 5: null for an older record, which did not say what the container could reach.
+    network: ?spec_mod.Network,
+    publish: [constants.publish_count_max]spec_mod.Publish,
+    publish_count: u8,
+    /// The names of the `-e` variables, each followed by a NUL. Never a value.
+    env_names: [env_names_bytes_max]u8,
+    env_names_len: u16,
+    env_names_count: u8,
+    /// Version 6: the state volumes, each as `--state` takes it, followed by a NUL.
+    state: [state_text_bytes_max]u8,
+    state_len: u16,
+    state_count: u8,
+    /// Version 7: the other mounts, each as `mounts.text` writes it, followed by a NUL.
+    mounts: [mounts_text_bytes_max]u8,
+    mounts_len: u16,
+    mounts_count: u8,
+    /// Version 8: the user the command ran as; null for an older record, which did not say.
+    user: ?spec_mod.User,
+    /// Version 9: null for an older record, which did not say; the gate then trusts only a
+    /// statement of the tree alone (it fails closed).
+    binding: ?Binding,
+    /// Version 10: the listener the run asked for; null for an older record or none.
+    listen: ?spec_mod.Listen,
+    /// Version 10: the paths of the run's `--device`s, space-separated; empty for none.
+    devices: [devices_mod.text_bytes_max]u8,
+    devices_len: u16,
+    /// Version 11: what a lazy run fetched; null for any other run or an older record.
+    lazy: ?Lazy,
+    /// Version 12: the `--ulimit`s (none for an older record or a run without); `--shm-size` is
+    /// `limits.shm_bytes`.
+    rlimits: spec_mod.Rlimits,
+    /// Version 12: the `--sysctl`s, each `key=value` followed by a NUL.
+    sysctls: [sysctls_bytes_max]u8,
+    sysctls_len: u16,
+    sysctls_count: u8,
+
+    /// The `index`th `--sysctl`; its strings point into this record.
+    pub fn sysctl_at(parsed: *const Parsed, index: u32) spec_mod.Sysctl {
+        assert(index < parsed.sysctls_count);
+        assert(parsed.sysctls_len > 0);
+        var parts = std.mem.splitScalar(u8, parsed.sysctls[0..parsed.sysctls_len], 0);
+        var at: u32 = 0;
+        while (parts.next()) |text| : (at += 1) {
+            if (at == index) return knobs.parse_sysctl(text).ok; // `parse_sysctls` checked each.
+        }
+        unreachable; // The count says it is there.
+    }
+
+    /// The `--device` paths the run asked for, as one string.
+    pub fn devices_text(parsed: *const Parsed) []const u8 {
+        assert(parsed.devices_len <= devices_mod.text_bytes_max);
+        return parsed.devices[0..parsed.devices_len];
+    }
+
+    /// The `index`th other mount the run made; its strings point into this record.
+    pub fn mount_at(parsed: *const Parsed, index: u32) mounts_mod.Mount {
+        assert(index < parsed.mounts_count);
+        assert(parsed.mounts_len > 0);
+        var parts = std.mem.splitScalar(u8, parsed.mounts[0..parsed.mounts_len], 0);
+        var at: u32 = 0;
+        while (parts.next()) |value| : (at += 1) {
+            if (at == index) return mounts_mod.parse_text(value).?; // `parse_mounts` checked each.
+        }
+        unreachable; // The count says it is there.
+    }
+
+    /// The `index`th state volume the run mounted.
+    pub fn state_mount(parsed: *const Parsed, index: u32) volume.Mount {
+        assert(index < parsed.state_count);
+        assert(parsed.state_len > 0);
+        var parts = std.mem.splitScalar(u8, parsed.state[0..parsed.state_len], 0);
+        var at: u32 = 0;
+        while (parts.next()) |text| : (at += 1) {
+            if (at == index) return volume.parse_mount(text).ok; // `parse_state` checked each.
+        }
+        unreachable; // The count says it is there.
+    }
+
+    pub fn publish_slice(parsed: *const Parsed) []const spec_mod.Publish {
+        assert(parsed.publish_count <= constants.publish_count_max);
+        return parsed.publish[0..parsed.publish_count];
+    }
+
+    /// The `index`th name of the `-e` variables.
+    pub fn env_name(parsed: *const Parsed, index: u32) []const u8 {
+        assert(index < parsed.env_names_count);
+        var parts = std.mem.splitScalar(u8, parsed.env_names[0..parsed.env_names_len], 0);
+        var at: u32 = 0;
+        while (parts.next()) |name| : (at += 1) {
+            if (at == index) return name;
+        }
+        unreachable; // The count says it is there.
+    }
+
+    /// The `index`th word of the command.
+    pub fn command_word(parsed: *const Parsed, index: u32) []const u8 {
+        assert(index < parsed.command_words);
+        assert(parsed.command_len > 0);
+        var words = std.mem.splitScalar(u8, parsed.command[0..parsed.command_len], 0);
+        var at: u32 = 0;
+        while (words.next()) |word| : (at += 1) {
+            if (at == index) return word;
+        }
+        unreachable; // The count says it is there.
+    }
+
+    /// The `index`th label's key and value.
+    pub fn label(parsed: *const Parsed, index: u32) [2][]const u8 {
+        assert(index < parsed.labels_count);
+        assert(parsed.labels_len > 0);
+        var parts = std.mem.splitScalar(u8, parsed.labels[0..parsed.labels_len], 0);
+        var at: u32 = 0;
+        while (parts.next()) |key| : (at += 1) {
+            const value = parts.next().?; // Written in pairs.
+            if (at == index) return .{ key, value };
+        }
+        unreachable; // The count says it is there.
+    }
+
+    pub fn tree_slice(parsed: *const Parsed) []const u8 {
+        assert(parsed.tree_len <= parsed.tree.len);
+        return parsed.tree[0..parsed.tree_len];
+    }
+
+    pub fn upper_slice(parsed: *const Parsed) []const u8 {
+        assert(parsed.upper_len <= parsed.upper.len);
+        return parsed.upper[0..parsed.upper_len];
+    }
+
+    pub fn scope_slice(parsed: *const Parsed) []const u8 {
+        assert(parsed.scope_len <= constants.scope_name_bytes_max);
+        return parsed.scope[0..parsed.scope_len];
+    }
+
+    pub fn diagnostic_slice(parsed: *const Parsed) []const u8 {
+        assert(parsed.diagnostic_len <= parsed.diagnostic.len);
+        return parsed.diagnostic[0..parsed.diagnostic_len];
+    }
+
+    pub fn name_slice(parsed: *const Parsed) []const u8 {
+        assert(parsed.name_len > 0);
+        return parsed.name[0..parsed.name_len];
+    }
+
+    pub fn rootfs_slice(parsed: *const Parsed) []const u8 {
+        assert(parsed.rootfs_len <= parsed.rootfs.len);
+        return parsed.rootfs[0..parsed.rootfs_len];
+    }
+};
+
+pub const ParseError = error{
+    /// Not a record this reader can use.
+    Malformed,
+    /// Written by a newer zbx.
+    Newer,
+};
+
+fn hex_digit(byte: u8) ?u8 {
+    return std.fmt.charToDigit(byte, 16) catch null;
+}
+
+/// Reads a ZON string literal into `out`; returns its length. Null if it is not one, does not
+/// fit, or uses an escape the writer never produces.
+fn parse_string(literal: []const u8, out: []u8) ?usize {
+    if (literal.len < 2) return null;
+    if (literal[0] != '"') return null;
+    if (literal[literal.len - 1] != '"') return null;
+    const body = literal[1 .. literal.len - 1];
+    var length: usize = 0;
+    var at: usize = 0;
+    while (at < body.len) : (at += 1) {
+        if (length == out.len) return null;
+        var byte = body[at];
+        if (byte == '"') return null; // An unescaped quote ends the string early.
+        if (byte == '\\') {
+            at += 1;
+            if (at == body.len) return null;
+            switch (body[at]) {
+                '"', '\\' => byte = body[at],
+                'n' => byte = '\n',
+                'x' => {
+                    if (at + 2 >= body.len) return null;
+                    const high = hex_digit(body[at + 1]) orelse return null;
+                    const low = hex_digit(body[at + 2]) orelse return null;
+                    byte = high * 16 + low;
+                    at += 2;
+                },
+                else => return null,
+            }
+        }
+        out[length] = byte;
+        length += 1;
+    }
+    return length;
+}
+
+fn parse_exit(value: []const u8) ?Exit {
+    assert(value.len <= constants.record_bytes_max);
+    assert(value.len > 0);
+    if (std.mem.eql(u8, value, ".running")) return .running;
+    if (std.mem.eql(u8, value, ".lost")) return .lost;
+    const open = ".{ .";
+    if (!std.mem.startsWith(u8, value, open)) return null;
+    if (!std.mem.endsWith(u8, value, " }")) return null;
+    const inner = value[open.len .. value.len - 2];
+    const equals = std.mem.indexOf(u8, inner, " = ") orelse return null;
+    const key = inner[0..equals];
+    const operand = inner[equals + 3 ..];
+    if (std.mem.eql(u8, key, "start_failed")) {
+        var text: [16]u8 = undefined;
+        const length = parse_string(operand, &text) orelse return null;
+        return .{ .start_failed = codes.parse(text[0..length]) orelse return null };
+    }
+    const number = std.fmt.parseInt(u8, operand, 10) catch return null;
+    if (std.mem.eql(u8, key, "exited")) return .{ .exited = number };
+    if (std.mem.eql(u8, key, "signaled")) {
+        if (number == 0) return null;
+        if (number >= constants.signal_number_max) return null;
+        return .{ .signaled = number };
+    }
+    return null;
+}
+
+/// Reads a record. `Newer` for a version this zbx does not know; `Malformed` for anything that
+/// is not a record this reader understands. Never reads past `text`, never allocates.
+pub fn parse(text: []const u8, out: *Parsed) ParseError!void {
+    assert(text.len <= constants.record_bytes_max);
+    out.version = 0;
+    out.name_len = 0;
+    out.rootfs_len = 0;
+    out.started = 0;
+    out.ended = null;
+    out.exit = .running;
+    out.ids = null;
+    out.diagnostic_len = 0;
+    out.reason = .none;
+    out.detached = false;
+    out.timed_out = false;
+    out.scope_len = 0;
+    out.limits = .{};
+    out.pid = 0;
+    out.supervisor = 0;
+    out.tree_len = 0;
+    out.upper_len = 0;
+    out.command_len = 0;
+    out.command_words = 0;
+    out.labels_len = 0;
+    out.labels_count = 0;
+    out.network = null;
+    out.publish_count = 0;
+    out.env_names_len = 0;
+    out.env_names_count = 0;
+    out.state_len = 0;
+    out.state_count = 0;
+    out.mounts_len = 0;
+    out.mounts_count = 0;
+    out.user = null;
+    out.binding = null;
+    out.listen = null;
+    out.devices_len = 0;
+    out.lazy = null;
+    out.rlimits = .{};
+    out.sysctls_len = 0;
+    out.sysctls_count = 0;
+    var has_reason = false;
+    var have_start = false;
+    var opened = false;
+    var closed = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (!opened) {
+            if (!std.mem.eql(u8, line, ".{")) return error.Malformed;
+            opened = true;
+            continue;
+        }
+        if (closed) return error.Malformed; // Nothing follows the closing brace.
+        if (std.mem.eql(u8, line, "}")) {
+            closed = true;
+            continue;
+        }
+        try parse_field(line, out, &have_start);
+        if (std.mem.startsWith(u8, line, ".reason = ")) has_reason = true;
+    }
+    if (!opened or !closed) return error.Malformed;
+    if (out.version > constants.record_version) return error.Newer;
+    if (out.name_len == 0) return error.Malformed;
+    if (!have_start) return error.Malformed;
+    if (!has_reason) out.reason = reason_of(out.exit);
+    if (spec_mod.name_problem(out.name_slice()) != null) return error.Malformed;
+    try check_network_fields(out);
+    try check_mounts(out);
+    try check_knobs(out);
+}
+
+/// What `render` asserts about the version 12 fields: a `/dev/shm` of at least a page and not
+/// above `--memory`, and sysctls that `--sysctl` takes for the run's network.
+fn check_knobs(out: *const Parsed) ParseError!void {
+    assert(out.sysctls_count <= constants.sysctls_max);
+    assert(out.rlimits.problem() == null); // `parse_ulimits` refused soft above hard.
+    // Render writes version 12 exactly when a knob is set, so a knob in an older version, or a
+    // version 12 record without one, is not a record any zbx wrote.
+    const knobbed = out.limits.shm_bytes != null or out.rlimits.count() > 0 or
+        out.sysctls_count > 0;
+    if (knobbed) {
+        if (out.version < constants.record_version_knobs) return error.Malformed;
+    } else {
+        if (out.version == constants.record_version_knobs) return error.Malformed;
+    }
+    if (out.rlimits.nofile) |nofile| {
+        // `--ulimit` refuses an unlimited nofile, so no run that started has one.
+        if (nofile.hard == knobs.unlimited) return error.Malformed;
+    }
+    if (out.limits.shm_bytes) |shm_bytes| {
+        if (shm_bytes < constants.shm_bytes_min) return error.Malformed;
+        if (out.limits.memory_bytes) |memory_bytes| {
+            if (shm_bytes > memory_bytes) return error.Malformed;
+        }
+    }
+    if (out.sysctls_count == 0) return;
+    // A record that does not say the network cannot say which keys its namespace allowed.
+    const network = out.network orelse return error.Malformed;
+    var list: [constants.sysctls_max]spec_mod.Sysctl = undefined;
+    for (0..out.sysctls_count) |at| list[at] = out.sysctl_at(@intCast(at));
+    const sysctls = list[0..out.sysctls_count];
+    if (knobs.list_problem(sysctls, network.isolated()) != null) return error.Malformed;
+}
+
+/// What `render` asserts about the mounts: the state volumes and the other mounts together are a
+/// list a run may have.
+fn check_mounts(out: *const Parsed) ParseError!void {
+    var state: [constants.state_volumes_max]volume.Mount = undefined;
+    for (0..out.state_count) |at| state[at] = out.state_mount(@intCast(at));
+    var mounts: [constants.mounts_max]mounts_mod.Mount = undefined;
+    for (0..out.mounts_count) |at| mounts[at] = out.mount_at(@intCast(at));
+    if (mounts_mod.list_problem(state[0..out.state_count], mounts[0..out.mounts_count]) != null) {
+        return error.Malformed;
+    }
+}
+
+/// What `render` asserts about the version 5 fields, so that a damaged file cannot read as valid
+/// and crash the next write: forwards only with `user`, none twice; names unique and POSIX.
+fn check_network_fields(out: *const Parsed) ParseError!void {
+    // The names first: they do not depend on the network, and a record that has lost its
+    // `.network` line must not carry names past the check that `render` asserts.
+    var words: [constants.run_env_count_max][]const u8 = undefined;
+    for (0..out.env_names_count) |at| words[at] = out.env_name(@intCast(at));
+    if (spec_mod.env_names_problem(words[0..out.env_names_count]) != null) {
+        return error.Malformed;
+    }
+    const network = out.network orelse {
+        // A record that does not say the network does not say forwards either.
+        if (out.publish_count > 0) return error.Malformed;
+        return;
+    };
+    // `publish_problem` asserts the implication, so a damaged file is refused before it.
+    if (out.publish_count > 0 and network != .user) return error.Malformed;
+    if (spec_mod.publish_problem(network, out.publish_slice()) != null) return error.Malformed;
+}
+
+fn parse_field(line: []const u8, out: *Parsed, have_start: *bool) ParseError!void {
+    assert(line.len <= constants.record_bytes_max);
+    assert(out.name_len <= constants.container_name_bytes_max);
+    if (line[0] != '.') return error.Malformed;
+    const equals = std.mem.indexOf(u8, line, " = ") orelse return error.Malformed;
+    const key = line[1..equals];
+    var value = line[equals + 3 ..];
+    if (value.len == 0 or value[value.len - 1] != ',') return error.Malformed;
+    value = value[0 .. value.len - 1];
+    if (value.len == 0) return error.Malformed; // `.key = ,`: no field has an empty value.
+    if (std.mem.eql(u8, key, "version")) {
+        out.version = std.fmt.parseInt(u32, value, 10) catch return error.Malformed;
+    } else if (std.mem.eql(u8, key, "name")) {
+        const length = parse_string(value, &out.name) orelse return error.Malformed;
+        out.name_len = @intCast(length);
+    } else if (std.mem.eql(u8, key, "rootfs")) {
+        out.rootfs_len = @intCast(parse_string(value, &out.rootfs) orelse return error.Malformed);
+    } else if (std.mem.eql(u8, key, "started")) {
+        out.started = std.fmt.parseInt(u64, value, 10) catch return error.Malformed;
+        have_start.* = true;
+    } else if (std.mem.eql(u8, key, "ended")) {
+        const none = std.mem.eql(u8, value, "null");
+        const number = if (none) 0 else std.fmt.parseInt(u64, value, 10) catch
+            return error.Malformed;
+        out.ended = if (none) null else number;
+    } else if (std.mem.eql(u8, key, "exit")) {
+        out.exit = parse_exit(value) orelse return error.Malformed;
+    } else if (std.mem.eql(u8, key, "diagnostic")) {
+        const length = parse_string(value, &out.diagnostic) orelse return error.Malformed;
+        out.diagnostic_len = @intCast(length);
+    } else if (parse_scope_field(key, value, out)) |accepted| {
+        if (!accepted) return error.Malformed;
+    } else if (std.mem.eql(u8, key, "ids")) {
+        out.ids = std.meta.stringToEnum(IdsMode, std.mem.trimStart(u8, value, ".")) orelse
+            return error.Malformed;
+    }
+    // Any other field is ignored: a later zbx may add some.
+}
+
+/// A field version 2 added: null if `key` is not one, else whether the value was good.
+fn parse_scope_field(key: []const u8, value: []const u8, out: *Parsed) ?bool {
+    assert(key.len > 0);
+    assert(value.len > 0);
+    if (std.mem.eql(u8, key, "reason")) {
+        const name = std.mem.trimStart(u8, value, ".");
+        out.reason = std.meta.stringToEnum(EndReason, name) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "detached")) {
+        const yes = std.mem.eql(u8, value, "true");
+        if (!yes and !std.mem.eql(u8, value, "false")) return false;
+        out.detached = yes;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "timed_out")) {
+        const yes = std.mem.eql(u8, value, "true");
+        if (!yes and !std.mem.eql(u8, value, "false")) return false;
+        out.timed_out = yes;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "scope")) {
+        const length = parse_string(value, &out.scope) orelse return false;
+        out.scope_len = @intCast(length);
+        return true;
+    }
+    if (std.mem.eql(u8, key, "pid")) {
+        out.pid = std.fmt.parseInt(u32, value, 10) catch return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "supervisor")) {
+        out.supervisor = std.fmt.parseInt(u32, value, 10) catch return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "tree")) {
+        const length = parse_string(value, &out.tree) orelse return false;
+        out.tree_len = @intCast(length);
+        return true;
+    }
+    if (std.mem.eql(u8, key, "upper")) {
+        const length = parse_string(value, &out.upper) orelse return false;
+        out.upper_len = @intCast(length);
+        return true;
+    }
+    if (std.mem.eql(u8, key, "network")) {
+        const name = std.mem.trimStart(u8, value, ".");
+        out.network = std.meta.stringToEnum(spec_mod.Network, name) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "publish")) return parse_publish_list(value, out);
+    if (std.mem.eql(u8, key, "env_names")) return parse_env_names(value, out);
+    if (std.mem.eql(u8, key, "state")) return parse_state(value, out);
+    if (std.mem.eql(u8, key, "mounts")) return parse_mounts(value, out);
+    if (std.mem.eql(u8, key, "user")) return parse_user(value, out);
+    if (std.mem.eql(u8, key, "binding")) return parse_binding(value, out);
+    if (std.mem.eql(u8, key, "listen")) return parse_listen_field(value, out);
+    if (std.mem.eql(u8, key, "devices")) return parse_devices(value, out);
+    if (std.mem.eql(u8, key, "lazy")) return parse_lazy(value, out);
+    if (std.mem.eql(u8, key, "ulimits")) return parse_ulimits(value, out);
+    if (std.mem.eql(u8, key, "sysctls")) return parse_sysctls(value, out);
+    if (std.mem.eql(u8, key, "command")) return parse_command(value, out);
+    if (std.mem.eql(u8, key, "labels")) return parse_labels(value, out);
+    return parse_limit_field(key, value, out);
+}
+
+/// The limit fields: null if `key` is not one, else whether the value was good.
+fn parse_limit_field(key: []const u8, value: []const u8, out: *Parsed) ?bool {
+    assert(key.len > 0);
+    assert(value.len > 0);
+    if (std.mem.eql(u8, key, "limit_memory")) {
+        out.limits.memory_bytes = parse_limit(u64, value) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "limit_pids")) {
+        out.limits.pids = parse_limit(u32, value) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "limit_cpu_millis")) {
+        out.limits.cpu_millis = parse_limit(u32, value) orelse return false;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "limit_shm")) {
+        // Written only when set: `null` is not a value render writes.
+        // Digits only, as render writes it: `parseInt` would also take `+` and `_`.
+        if (value.len > 20) return false;
+        for (value) |digit| if (!std.ascii.isDigit(digit)) return false;
+        if (value.len > 1 and value[0] == '0') return false; // Render writes no leading zero.
+        const shm_bytes = std.fmt.parseUnsigned(u64, value, 10) catch return false;
+        if (shm_bytes < constants.shm_bytes_min) return false; // Render asserts the bound.
+        out.limits.shm_bytes = shm_bytes;
+        return true;
+    }
+    return null;
+}
+
+/// `"nofile=4096:8192 stack=8388608:unlimited"`: what `ulimits_text` writes, each name once. A
+/// value `--ulimit` would refuse is not a record this version wrote.
+fn parse_ulimits(value: []const u8, out: *Parsed) bool {
+    assert(value.len <= constants.record_bytes_max);
+    out.rlimits = .{}; // A repeated field: the later one wins.
+    var text: [ulimits_text_bytes_max]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    if (length == 0) return false; // Render writes no line for no limit.
+    var parts = std.mem.splitScalar(u8, text[0..length], ' ');
+    while (parts.next()) |part| {
+        const found = parse_rlimit(part) orelse return false;
+        if (out.rlimits.get(found.resource) != null) return false;
+        out.rlimits.set(found.resource, found.limit);
+    }
+    assert(out.rlimits.count() > 0);
+    // Only what render writes: the same text back (both values, digits, the resources' order).
+    var again: [ulimits_text_bytes_max]u8 = undefined;
+    return std.mem.eql(u8, ulimits_text(&out.rlimits, &again), text[0..length]);
+}
+
+/// One `name=soft:hard` as `ulimits_text` writes it. Not `knobs.parse_ulimit`: a limit given with
+/// a unit (`stack=17179869183g`) is written in bytes, which can be more digits than a flag takes.
+fn parse_rlimit(text: []const u8) ?knobs.Ulimit {
+    assert(text.len <= ulimits_text_bytes_max);
+    const equals = std.mem.indexOfScalar(u8, text, '=') orelse return null;
+    const resource = std.meta.stringToEnum(knobs.Resource, text[0..equals]) orelse return null;
+    const values = text[equals + 1 ..];
+    const colon = std.mem.indexOfScalar(u8, values, ':') orelse return null;
+    const soft = parse_rlimit_value(values[0..colon]) orelse return null;
+    const hard = parse_rlimit_value(values[colon + 1 ..]) orelse return null;
+    if (soft > hard) return null;
+    return .{ .resource = resource, .limit = .{ .soft = soft, .hard = hard } };
+}
+
+/// `unlimited`, or the digits of a number below it.
+fn parse_rlimit_value(text: []const u8) ?u64 {
+    assert(text.len <= ulimits_text_bytes_max);
+    if (std.mem.eql(u8, text, "unlimited")) return knobs.unlimited;
+    if (text.len == 0 or text.len > 20) return null;
+    for (text) |digit| if (!std.ascii.isDigit(digit)) return null;
+    const value = std.fmt.parseUnsigned(u64, text, 10) catch return null; // Past 2^64.
+    if (value == knobs.unlimited) return null; // Render writes that as `unlimited`.
+    assert(value < knobs.unlimited);
+    return value;
+}
+
+/// `.{ "net.core.somaxconn=4096", ... }`: each a `--sysctl` of good form, kept NUL-separated.
+/// Only the form render writes: `.{ `, strings apart by `, `, then ` }`. Whether the list suits
+/// the run's network is `check_knobs`'s, once every field is read.
+fn parse_sysctls(value: []const u8, out: *Parsed) bool {
+    assert(value.len <= constants.record_bytes_max);
+    out.sysctls_len = 0; // A repeated field: the later one wins.
+    out.sysctls_count = 0;
+    if (!std.mem.startsWith(u8, value, ".{ ")) return false;
+    var at: usize = ".{ ".len;
+    while (true) {
+        if (at >= value.len or value[at] != '"') return false;
+        const found = next_literal(value, at) orelse return false;
+        if (out.sysctls_count == constants.sysctls_max) return false;
+        const room = out.sysctls[out.sysctls_len..];
+        assert(room.len >= sysctl_text_bytes_max + 1); // Sized for `sysctls_max` of them.
+        const length = parse_string(found.literal, room[0..sysctl_text_bytes_max]) orelse
+            return false;
+        if (knobs.parse_sysctl(room[0..length]) != .ok) return false;
+        room[length] = 0;
+        out.sysctls_len += @intCast(length + 1);
+        out.sysctls_count += 1;
+        const rest = value[found.next..];
+        if (std.mem.eql(u8, rest, " }")) break;
+        if (!std.mem.startsWith(u8, rest, ", ")) return false;
+        at = found.next + ", ".len;
+    }
+    return out.sysctls_count > 0; // Render writes no line for none.
+}
+
+/// The next string literal of `text` from `at`: its slice including the quotes, and where to go
+/// on. Null when there is none. A backslash escapes the next byte (the writer's only escapes).
+fn next_literal(text: []const u8, at: usize) ?struct { literal: []const u8, next: usize } {
+    assert(at <= text.len);
+    assert(text.len <= constants.record_bytes_max);
+    const open = std.mem.indexOfScalarPos(u8, text, at, '"') orelse return null;
+    var end = open + 1;
+    while (end < text.len) : (end += 1) {
+        if (text[end] == '\\') {
+            end += 1;
+            continue;
+        }
+        if (text[end] == '"') return .{ .literal = text[open .. end + 1], .next = end + 1 };
+    }
+    return null;
+}
+
+/// `.{ "word", "word" }`: the words of the command, kept NUL-separated (cut at the room).
+fn parse_command(value: []const u8, out: *Parsed) bool {
+    out.command_len = 0; // A repeated field: the later one wins.
+    out.command_words = 0;
+    var at: usize = 0;
+    while (next_literal(value, at)) |found| : (at = found.next) {
+        const room = out.command[out.command_len..];
+        if (room.len < 2) break;
+        const length = parse_string(found.literal, room[0 .. room.len - 1]) orelse return false;
+        room[length] = 0;
+        out.command_len += @intCast(length + 1);
+        out.command_words += 1;
+        if (out.command_words == constants.command_words_count_max) break;
+    }
+    return true;
+}
+
+/// `.{ "8080:80", ... }`: the forwards, each as `--publish` typed it.
+fn parse_publish_list(value: []const u8, out: *Parsed) bool {
+    out.publish_count = 0; // A repeated field: the later one wins.
+    var at: usize = 0;
+    while (next_literal(value, at)) |found| : (at = found.next) {
+        if (out.publish_count == constants.publish_count_max) return false;
+        var text: [spec_mod.publish_text_bytes_max + 1]u8 = undefined;
+        const length = parse_string(found.literal, &text) orelse return false;
+        const forward = switch (spec_mod.parse_publish(text[0..length])) {
+            .ok => |parsed| parsed,
+            .problem => return false,
+        };
+        out.publish[out.publish_count] = forward;
+        out.publish_count += 1;
+    }
+    return true;
+}
+
+/// `"NAME NAME"`: the names of the `-e` variables, kept NUL-separated.
+fn parse_env_names(value: []const u8, out: *Parsed) bool {
+    out.env_names_len = 0; // A repeated field: the later one wins.
+    out.env_names_count = 0;
+    var text: [env_names_bytes_max]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    if (length == 0) return true;
+    var names_split = std.mem.splitScalar(u8, text[0..length], ' ');
+    while (names_split.next()) |name| {
+        if (out.env_names_count == constants.run_env_count_max) return false;
+        const room = out.env_names[out.env_names_len..];
+        if (room.len < name.len + 1) return false;
+        @memcpy(room[0..name.len], name);
+        room[name.len] = 0;
+        out.env_names_len += @intCast(name.len + 1);
+        out.env_names_count += 1;
+    }
+    return true;
+}
+
+/// `"127.0.0.1:8080"`, or an empty string for no listener, as `write_listen` writes it.
+fn parse_listen_field(value: []const u8, out: *Parsed) bool {
+    assert(value.len <= constants.record_bytes_max);
+    var text: [spec_mod.listen_text_bytes_max + 1]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    out.listen = null;
+    if (length == 0) return true;
+    switch (spec_mod.parse_listen(text[0..length])) {
+        .ok => |found| {
+            var again: [spec_mod.listen_text_bytes_max]u8 = undefined;
+            // Only what render writes: the same text back.
+            if (!std.mem.eql(u8, found.text(&again), text[0..length])) return false;
+            out.listen = found;
+            return true;
+        },
+        .problem => return false,
+    }
+}
+
+/// `"/dev/a /dev/b"`: the paths `write_devices` writes. A list that `--device` would refuse is
+/// not a record this version wrote.
+fn parse_devices(value: []const u8, out: *Parsed) bool {
+    assert(value.len <= constants.record_bytes_max);
+    out.devices_len = 0; // A repeated field: the later one wins.
+    var text: [devices_mod.text_bytes_max]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    if (length == 0) return true;
+    var list: [constants.run_devices_max]devices_mod.Device = undefined;
+    var count: u32 = 0;
+    var parts = std.mem.splitScalar(u8, text[0..length], ' ');
+    while (parts.next()) |part| : (count += 1) {
+        if (count == constants.run_devices_max) return false;
+        list[count] = .{ .path = part };
+    }
+    if (devices_mod.list_problem(list[0..count]) != null) return false;
+    @memcpy(out.devices[0..length], text[0..length]);
+    out.devices_len = @intCast(length);
+    return true;
+}
+
+/// `"none"`, `"result:<64 hex>"` or `"manifest:<64 hex>"`, as `write_binding` writes it.
+fn parse_binding(value: []const u8, out: *Parsed) bool {
+    assert(value.len > 0);
+    assert(value.len <= constants.record_bytes_max);
+    var text: [80]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    const word = text[0..length];
+    assert(word.len <= text.len);
+    if (std.mem.eql(u8, word, "none")) {
+        out.binding = .none;
+        return true;
+    }
+    const colon = std.mem.indexOfScalar(u8, word, ':') orelse return false;
+    const hex = word[colon + 1 ..];
+    if (hex.len != 64) return false;
+    var bytes: [32]u8 = undefined;
+    const decoded = std.fmt.hexToBytes(&bytes, hex) catch return false;
+    if (decoded.len != 32) return false;
+    // Lowercase only, the one spelling the writer makes.
+    for (hex) |byte| {
+        if (std.ascii.isUpper(byte)) return false;
+    }
+    if (std.mem.eql(u8, word[0..colon], "result")) {
+        out.binding = .{ .result = bytes };
+    } else if (std.mem.eql(u8, word[0..colon], "manifest")) {
+        out.binding = .{ .manifest = bytes };
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// `.{ .sources = 2, .demand_bytes = 1, .fill_bytes = 0, .errors = 0, .local_percent = 38 }`,
+/// exactly as `write_lazy` writes it: every field, in order.
+fn parse_lazy(value: []const u8, out: *Parsed) bool {
+    assert(value.len > 0);
+    const inner = strip_affixes(value, ".{ ", " }") orelse return false;
+    const keys = [_][]const u8{
+        "sources", "demand_bytes", "fill_bytes", "errors", "local_percent",
+    };
+    var numbers: [keys.len]u64 = undefined;
+    var fields = std.mem.splitSequence(u8, inner, ", ");
+    for (keys, 0..) |name, at| {
+        const field = fields.next() orelse return false;
+        const rest = strip_affixes(field, ".", "") orelse return false;
+        const digits = strip_affixes(rest, name, "") orelse return false;
+        const number = strip_affixes(digits, " = ", "") orelse return false;
+        if (number.len == 0 or number.len > 20) return false;
+        if (number.len > 1 and number[0] == '0') return false;
+        for (number) |byte| {
+            if (byte < '0' or byte > '9') return false;
+        }
+        numbers[at] = std.fmt.parseInt(u64, number, 10) catch return false;
+    }
+    if (fields.next() != null) return false;
+    if (numbers[0] > constants.lazy_sources_max or numbers[4] > 100) return false;
+    out.lazy = .{
+        .sources = @intCast(numbers[0]),
+        .demand_bytes = numbers[1],
+        .fill_bytes = numbers[2],
+        .errors = numbers[3],
+        .local_percent = @intCast(numbers[4]),
+    };
+    return true;
+}
+
+fn strip_affixes(text: []const u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    if (!std.mem.endsWith(u8, text[prefix.len..], suffix)) return null;
+    return text[prefix.len .. text.len - suffix.len];
+}
+
+/// `"UID:GID"`: two numbers in one spelling each (no sign, no leading zero), as `render` writes.
+fn parse_user(value: []const u8, out: *Parsed) bool {
+    assert(value.len > 0);
+    assert(value.len <= constants.record_bytes_max);
+    var text: [24]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    const colon = std.mem.indexOfScalar(u8, text[0..length], ':') orelse return false;
+    const ids = [2][]const u8{ text[0..colon], text[colon + 1 .. length] };
+    var found: [2]u32 = undefined;
+    for (ids, 0..) |digits, at| {
+        if (digits.len == 0 or digits.len > 10) return false;
+        if (digits.len > 1 and digits[0] == '0') return false;
+        for (digits) |byte| {
+            if (byte < '0' or byte > '9') return false;
+        }
+        found[at] = std.fmt.parseInt(u32, digits, 10) catch return false;
+    }
+    out.user = .{ .uid = found[0], .gid = found[1] };
+    return true;
+}
+
+/// `"NAME:PATH NAME:PATH:ro"`: each a mount `--state` would take, and together a list a run may
+/// have (what `write_state` asserts), so that a record that reads can be written again.
+fn parse_state(value: []const u8, out: *Parsed) bool {
+    out.state_len = 0; // A repeated field: the later one wins.
+    out.state_count = 0;
+    var text: [state_text_bytes_max]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    if (length == 0) return true;
+    var mounts: [constants.state_volumes_max]volume.Mount = undefined;
+    var parts = std.mem.splitScalar(u8, text[0..length], ' ');
+    while (parts.next()) |part| {
+        if (out.state_count == constants.state_volumes_max) return false;
+        if (part.len > constants.state_value_bytes_max) return false;
+        const room = out.state[out.state_len..];
+        assert(room.len > part.len); // The room holds every value at its bound.
+        @memcpy(room[0..part.len], part);
+        room[part.len] = 0;
+        const parsed = volume.parse_mount(room[0..part.len]);
+        if (parsed != .ok) return false;
+        mounts[out.state_count] = parsed.ok;
+        out.state_len += @intCast(part.len + 1);
+        out.state_count += 1;
+    }
+    return volume.list_problem(mounts[0..out.state_count]) == null;
+}
+
+/// `"VALUE VALUE"`: each a mount `mounts.text` writes; whether they go together is `check_mounts`.
+fn parse_mounts(value: []const u8, out: *Parsed) bool {
+    out.mounts_len = 0; // A repeated field: the later one wins.
+    out.mounts_count = 0;
+    var text: [mounts_text_bytes_max]u8 = undefined;
+    const length = parse_string(value, &text) orelse return false;
+    if (length == 0) return true;
+    var parts = std.mem.splitScalar(u8, text[0..length], ' ');
+    while (parts.next()) |part| {
+        if (out.mounts_count == constants.mounts_max) return false;
+        if (mounts_mod.parse_text(part) == null) return false;
+        const room = out.mounts[out.mounts_len..];
+        assert(room.len > part.len); // The room holds every value at its bound.
+        @memcpy(room[0..part.len], part);
+        room[part.len] = 0;
+        out.mounts_len += @intCast(part.len + 1);
+        out.mounts_count += 1;
+    }
+    return true;
+}
+
+/// `.{ .{ "key", "value" }, ... }`: the labels as key and value, NUL-separated.
+fn parse_labels(value: []const u8, out: *Parsed) bool {
+    out.labels_len = 0; // A repeated field: the later one wins.
+    out.labels_count = 0;
+    var at: usize = 0;
+    while (next_literal(value, at)) |key| {
+        const second = next_literal(value, key.next) orelse return false;
+        at = second.next;
+        if (out.labels_count == constants.labels_count_max) return false;
+        for ([_][]const u8{ key.literal, second.literal }) |literal| {
+            const room = out.labels[out.labels_len..];
+            if (room.len < 2) return false;
+            const length = parse_string(literal, room[0 .. room.len - 1]) orelse return false;
+            room[length] = 0;
+            out.labels_len += @intCast(length + 1);
+        }
+        out.labels_count += 1;
+    }
+    return true;
+}
+
+/// `null` is no limit; a number is the limit. Anything else is not a limit at all, which the
+/// caller tells from "no limit" by the optional-of-optional.
+fn parse_limit(comptime Int: type, value: []const u8) ??Int {
+    assert(value.len > 0); // The line reader refused an empty value.
+    assert(@typeInfo(Int) == .int);
+    if (std.mem.eql(u8, value, "null")) return @as(?Int, null);
+    const number = std.fmt.parseInt(Int, value, 10) catch return null;
+    return @as(?Int, number);
+}
+
+// ---- Where records live --------------------------------------------------------------------
+
+/// The runs directory and the pieces needed to create it.
+pub const Dir = struct {
+    /// The path of the runs directory, NUL-terminated at `len`.
+    path: [constants.state_path_bytes_max + 1]u8,
+    len: u32,
+    /// Bytes of `path` that must already exist (HOME, or the state base): directories are made
+    /// from there on.
+    existing_len: u32,
+
+    pub fn text(dir: *const Dir) [:0]const u8 {
+        assert(dir.len > 0);
+        assert(dir.path[dir.len] == 0);
+        return dir.path[0..dir.len :0];
+    }
+};
+
+/// Finds the runs directory from the environment. False if neither XDG_STATE_HOME nor HOME gives
+/// an absolute path that fits.
+pub fn locate(host: Host, dir: *Dir) bool {
+    const suffix = "/zbx/runs";
+    const limit: u32 = constants.state_path_bytes_max - suffix.len;
+    var base: []const u8 = "";
+    var from_home = false;
+    if (host.environment("XDG_STATE_HOME", limit)) |state| {
+        if (state.len > 0 and state[0] == '/') base = state;
+    }
+    var home: []const u8 = "";
+    if (base.len == 0) {
+        const found = host.environment("HOME", limit - "/.local/state".len) orelse return false;
+        if (found.len == 0 or found[0] != '/') return false;
+        home = std.mem.trimEnd(u8, found, "/");
+        from_home = true;
+    }
+    const joined = if (from_home)
+        std.fmt.bufPrint(&dir.path, "{s}/.local/state{s}", .{ home, suffix })
+    else
+        std.fmt.bufPrint(&dir.path, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), suffix });
+    const text = joined catch return false;
+    dir.len = @intCast(text.len);
+    dir.path[dir.len] = 0;
+    dir.existing_len = if (from_home) @intCast(home.len) else @intCast(text.len - suffix.len);
+    assert(dir.existing_len <= dir.len);
+    return true;
+}
+
+/// Makes the runs directory and every directory above it that is missing.
+pub fn ensure(host: Host, dir: *const Dir) host_mod.Error!void {
+    assert(dir.len > dir.existing_len);
+    var at: u32 = dir.existing_len;
+    while (at < dir.len) {
+        // The next component ends at the next slash, or at the end of the path.
+        const next = std.mem.indexOfScalarPos(u8, dir.path[0..dir.len], at + 1, '/') orelse dir.len;
+        var prefix: [constants.state_path_bytes_max + 1]u8 = undefined;
+        @memcpy(prefix[0..next], dir.path[0..next]);
+        prefix[next] = 0;
+        try host.make_directory(prefix[0..next :0], true);
+        at = @intCast(next);
+    }
+    assert(at == dir.len);
+}
+
+/// `<runs>/<name>.zon`, or with `hidden` the temporary `<runs>/.<name>.tmp` it is written to.
+fn file_path(
+    dir: *const Dir,
+    name: []const u8,
+    hidden: bool,
+    buffer: *[constants.state_path_bytes_max + 80]u8,
+) [:0]const u8 {
+    assert(name.len > 0);
+    assert(name.len <= constants.container_name_bytes_max);
+    const runs = dir.path[0..dir.len];
+    // Cannot fail: the runs directory is at most state_path_bytes_max and the rest is 70 bytes.
+    const text = if (hidden)
+        // Cannot fail: the caller's buffer holds the longest path plus a suffix.
+        std.fmt.bufPrintSentinel(buffer, "{s}/.{s}.tmp", .{ runs, name }, 0) catch unreachable
+    else
+        // Cannot fail: as above.
+        std.fmt.bufPrintSentinel(buffer, "{s}/{s}.zon", .{ runs, name }, 0) catch unreachable;
+    return text; // Both branches have the same bound.
+}
+
+/// `<runs>/<name>.zon`.
+pub fn record_path(
+    dir: *const Dir,
+    name: []const u8,
+    buffer: *[constants.state_path_bytes_max + 80]u8,
+) [:0]const u8 {
+    assert(dir.len > 0);
+    assert(name.len > 0);
+    return file_path(dir, name, false, buffer);
+}
+
+/// The name of the record with the latest start time (ties go to the larger name), or null when
+/// the directory holds none that can be read. Unreadable records are passed over.
+pub fn newest(host: Host, dir: *const Dir, name_out: *[constants.container_name_bytes_max]u8) ?u8 {
+    var listing: host_mod.DirListing = undefined;
+    host.list_directory(dir.text(), &listing) catch return null;
+    var best: ?u32 = null;
+    var best_started: u64 = 0;
+    var ignored: Skipped = undefined;
+    ignored.reset();
+    for (0..listing.count) |at| {
+        const name = listing.name(@intCast(at));
+        if (!is_record_name(name)) continue;
+        if (name.len - constants.record_suffix.len > constants.container_name_bytes_max) continue;
+        const started = started_of(host, dir, name, &ignored);
+        if (started == 0) continue; // Unreadable, or without a time: not a candidate.
+        const better = best == null or started > best_started or
+            (started == best_started and std.mem.lessThan(u8, listing.name(best.?), name));
+        if (!better) continue;
+        best = @intCast(at);
+        best_started = started;
+    }
+    const found = best orelse return null;
+    const stem = listing.name(found);
+    const length = stem.len - constants.record_suffix.len;
+    @memcpy(name_out[0..length], stem[0..length]);
+    assert(length > 0);
+    return @intCast(length);
+}
+
+/// Writes the record atomically: a temporary file, then a rename over the final name.
+pub fn save(host: Host, dir: *const Dir, view: *const View) host_mod.Error!void {
+    var bytes: [constants.record_bytes_max]u8 = undefined;
+    const text = render(view, &bytes);
+    assert(text.len > 0);
+    assert(text.len <= bytes.len);
+    var temporary_storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    var final_storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    const temporary = file_path(dir, view.name, true, &temporary_storage);
+    const final = file_path(dir, view.name, false, &final_storage);
+    try host.write_file(temporary, text);
+    host.rename(temporary, final) catch |err| {
+        // The temporary file must not outlive a failed save; if it cannot go, nothing more to do.
+        host.remove_file(temporary) catch {};
+        return err;
+    };
+}
+
+/// What pruning found that the user should hear about.
+pub const Skipped = struct {
+    count: u32,
+    /// The first record skipped, and why.
+    first_name: [constants.dir_name_bytes_max]u8,
+    first_name_len: u8,
+    first_reason: Reason,
+
+    pub const Reason = enum { unreadable, damaged, newer };
+
+    pub fn reset(skipped: *Skipped) void {
+        skipped.count = 0;
+        skipped.first_name_len = 0;
+        skipped.first_reason = .unreadable;
+        assert(skipped.first_name.len == constants.dir_name_bytes_max);
+        assert(skipped.count == 0);
+    }
+
+    fn note(skipped: *Skipped, name: []const u8, reason: Reason) void {
+        assert(name.len <= constants.dir_name_bytes_max);
+        if (skipped.count == 0) {
+            @memcpy(skipped.first_name[0..name.len], name);
+            skipped.first_name_len = @intCast(name.len);
+            skipped.first_reason = reason;
+        }
+        skipped.count += 1;
+    }
+
+    pub fn first(skipped: *const Skipped) []const u8 {
+        return skipped.first_name[0..skipped.first_name_len];
+    }
+};
+
+/// The names of the runs whose records `prune` deleted, so that whoever kept something for
+/// them (a container's upper layer) can let it go.
+pub const Pruned = struct {
+    count: u32,
+    names: [constants.dir_entries_max][constants.container_name_bytes_max]u8,
+    lengths: [constants.dir_entries_max]u8,
+
+    fn add(pruned: *Pruned, stem: []const u8) void {
+        assert(stem.len > 0);
+        // Not a name we made (a stray `Notes.zon`): it owns no container directory.
+        if (spec_mod.name_problem(stem) != null) return;
+        if (pruned.count == pruned.names.len) return;
+        @memcpy(pruned.names[pruned.count][0..stem.len], stem);
+        pruned.lengths[pruned.count] = @intCast(stem.len);
+        pruned.count += 1;
+    }
+
+    /// One run's name, for a caller that removes that run itself (`run.discard`).
+    pub fn single(pruned: *Pruned, stem: []const u8) void {
+        assert(spec_mod.name_problem(stem) == null);
+        pruned.count = 0;
+        pruned.add(stem);
+        assert(pruned.count == 1);
+    }
+
+    pub fn name(pruned: *const Pruned, index: u32) []const u8 {
+        assert(index < pruned.count);
+        return pruned.names[index][0..pruned.lengths[index]];
+    }
+};
+
+const Entry = struct {
+    index: u32,
+    started: u64,
+    keep: bool,
+};
+
+fn is_record_name(name: []const u8) bool {
+    assert(name.len <= constants.dir_name_bytes_max);
+    if (name.len <= constants.record_suffix.len) return false;
+    if (name[0] == '.') return false;
+    return std.mem.endsWith(u8, name, constants.record_suffix);
+}
+
+/// Deletes the oldest records until at most `runs_max` remain. `keep` (the one just saved) is
+/// never deleted. Records that cannot be read count as the oldest and are noted in `skipped`.
+pub fn prune(
+    host: Host,
+    dir: *const Dir,
+    keep: []const u8,
+    skipped: *Skipped,
+    pruned: *Pruned,
+) host_mod.Error!void {
+    skipped.reset();
+    pruned.count = 0;
+    var listing: host_mod.DirListing = undefined;
+    try host.list_directory(dir.text(), &listing);
+    var records_listed: u32 = 0;
+    for (0..listing.count) |at| {
+        if (is_record_name(listing.name(@intCast(at)))) records_listed += 1;
+    }
+    // With room to spare nothing is deleted, so nothing is read: a run does not pay for the
+    // records, or hear about the ones it cannot read, until there are too many to keep.
+    if (records_listed <= constants.runs_max and !listing.truncated) return;
+    var entries: [constants.dir_entries_max]Entry = undefined;
+    var count: u32 = 0;
+    var index: u32 = 0;
+    while (index < listing.count) : (index += 1) {
+        const name = listing.name(index);
+        if (!is_record_name(name)) continue;
+        const stem = name[0 .. name.len - constants.record_suffix.len];
+        entries[count] = .{
+            .index = index,
+            .started = started_of(host, dir, name, skipped),
+            .keep = std.mem.eql(u8, stem, keep),
+        };
+        count += 1;
+    }
+    var remaining = count;
+    for (0..count) |_| {
+        if (remaining <= constants.runs_max) break;
+        const oldest = oldest_of(&listing, entries[0..count]) orelse break;
+        const gone = listing.name(entries[oldest].index);
+        try remove_record(host, dir, gone);
+        pruned.add(gone[0 .. gone.len - constants.record_suffix.len]);
+        entries[oldest].keep = true; // Gone: out of the running.
+        entries[oldest].started = std.math.maxInt(u64);
+        remaining -= 1;
+    }
+    assert(remaining <= count);
+}
+
+/// The index in `entries` of the oldest one that may still be deleted; ties go to the
+/// smaller name.
+fn oldest_of(listing: *const host_mod.DirListing, entries: []const Entry) ?usize {
+    var best: ?usize = null;
+    assert(entries.len <= constants.dir_entries_max);
+    for (entries, 0..) |entry, at| {
+        if (entry.keep) continue;
+        const current = best orelse {
+            best = at;
+            continue;
+        };
+        const older = entry.started < entries[current].started;
+        const same = entry.started == entries[current].started;
+        const name = listing.name(entry.index);
+        const smaller = std.mem.lessThan(u8, name, listing.name(entries[current].index));
+        if (older or (same and smaller)) best = at;
+    }
+    if (best) |at| assert(!entries[at].keep);
+    return best;
+}
+
+/// Deletes the record of the run called `name` (M7: a build step, which leaves none behind).
+pub fn remove(host: Host, dir: *const Dir, name: []const u8) host_mod.Error!void {
+    assert(spec_mod.name_problem(name) == null);
+    assert(dir.len > 0);
+    var storage: [constants.container_name_bytes_max + constants.record_suffix.len]u8 = undefined;
+    @memcpy(storage[0..name.len], name);
+    @memcpy(storage[name.len..][0..constants.record_suffix.len], constants.record_suffix);
+    try remove_record(host, dir, storage[0 .. name.len + constants.record_suffix.len]);
+}
+
+fn remove_record(host: Host, dir: *const Dir, file_name: []const u8) host_mod.Error!void {
+    assert(is_record_name(file_name));
+    assert(dir.len > 0);
+    var storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    const text = std.fmt.bufPrintSentinel(
+        &storage,
+        "{s}/{s}",
+        .{ dir.path[0..dir.len], file_name },
+        0,
+    ) catch
+        unreachable; // The directory is bounded and a listed name is at most 72 bytes.
+    try host.remove_file(text);
+}
+
+pub const LoadError = error{ NotFound, Unreadable, Damaged, Newer };
+
+/// Reads the record of the run called `name` into `out`.
+pub fn load(host: Host, dir: *const Dir, name: []const u8, out: *Parsed) LoadError!void {
+    // The name comes from a command line: one that is not a run name (a slash, say) names no
+    // record, and is never made into a path.
+    if (spec_mod.name_problem(name) != null) return error.NotFound;
+    var path_storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    const path = record_path(dir, name, &path_storage);
+    var bytes: [constants.record_bytes_max]u8 = undefined;
+    const content = host.read_record(path, &bytes) catch |err| {
+        return if (err == error.NotFound) error.NotFound else error.Unreadable;
+    };
+    parse(content, out) catch |err| return if (err == error.Newer) error.Newer else error.Damaged;
+    // A record under another name than its file's is not one of ours.
+    if (!std.mem.eql(u8, out.name_slice(), name)) return error.Damaged;
+    assert(out.name_len > 0);
+}
+
+/// The names of the records in the directory, in no order. The listing is the caller's.
+pub fn names(host: Host, dir: *const Dir, listing: *host_mod.DirListing) host_mod.Error!void {
+    assert(dir.len > 0);
+    try host.list_directory(dir.text(), listing);
+    assert(listing.count <= constants.dir_entries_max);
+}
+
+/// The run name in a listed file name ("web-1.zon" is "web-1"), or null if it is not a record's.
+pub fn name_of(file_name: []const u8) ?[]const u8 {
+    if (!is_record_name(file_name)) return null;
+    const stem = file_name[0 .. file_name.len - constants.record_suffix.len];
+    if (stem.len > constants.container_name_bytes_max) return null;
+    return stem;
+}
+
+/// The start time of the record in `file_name`, or 0 if it cannot be used (and noted).
+fn started_of(host: Host, dir: *const Dir, file_name: []const u8, skipped: *Skipped) u64 {
+    var path_storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    const format = "{s}/{s}";
+    const path = std.fmt.bufPrint(&path_storage, format, .{ dir.path[0..dir.len], file_name }) catch
+        return 0;
+    var bytes: [constants.record_bytes_max]u8 = undefined;
+    const content = host.read_record(path, &bytes) catch {
+        skipped.note(file_name, .unreadable);
+        return 0;
+    };
+    var parsed: Parsed = undefined;
+    parse(content, &parsed) catch |err| {
+        skipped.note(file_name, if (err == error.Newer) .newer else .damaged);
+        return 0;
+    };
+    return parsed.started;
+}
+
+const testing = std.testing;
+const HostSim = @import("../host_sim.zig").HostSim;
+
+fn sample_view() View {
+    return .{
+        .name = "web-1",
+        .rootfs = "/srv/alpine",
+        .command = &.{ "/bin/sh", "-c", "echo \"hi\"\n" },
+        .labels = &.{.{ .key = "app", .value = "web" }},
+        .started = 1_760_000_000,
+        .ended = null,
+        .exit = .running,
+        .ids = .full,
+        .zbx_version = "0.0.0",
+    };
+}
+
+test "a record is valid ZON in the shape the reader expects, and reads back" {
+    // Goal: render and parse are inverse for every exit form, and the text is a ZON tuple with
+    // the version first. Method: each exit, with an escaped command word.
+    const exits = [_]Exit{
+        .running,
+        .{ .exited = 0 },
+        .{ .exited = 255 },
+        .{ .signaled = 9 },
+        .{ .start_failed = .E0205 },
+        .lost,
+    };
+    for (exits) |exit| {
+        var view = sample_view();
+        view.exit = exit;
+        view.ended = if (exit == .running) null else 1_760_000_042;
+        var buffer: [constants.record_bytes_max]u8 = undefined;
+        const text = render(&view, &buffer);
+        try testing.expect(std.mem.startsWith(u8, text, ".{\n    .version = 9,\n"));
+        try testing.expect(std.mem.endsWith(u8, text, "}\n"));
+        var parsed: Parsed = undefined;
+        try parse(text, &parsed);
+        try testing.expectEqual(constants.record_version_plain, parsed.version);
+        try testing.expectEqualStrings("web-1", parsed.name_slice());
+        try testing.expectEqualStrings("/srv/alpine", parsed.rootfs_slice());
+        try testing.expectEqual(@as(u64, 1_760_000_000), parsed.started);
+        try testing.expectEqual(view.ended, parsed.ended);
+        try testing.expectEqual(exit, parsed.exit);
+        try testing.expectEqual(@as(?IdsMode, .full), parsed.ids);
+    }
+}
+
+const test_util = @import("../test_util.zig");
+
+test "the binding is written, read back, and absent from a version 8 record" {
+    // Goal: exec's gate can tell which run a container is. Method: each binding round trips; a
+    // record with no binding line reads null; a malformed binding is Malformed.
+    const bytes: [32]u8 = @splat(0xaa);
+    const hex = test_util.repeat('a', 64);
+    const bindings = [_]Binding{ .none, .{ .result = bytes }, .{ .manifest = bytes } };
+    for (bindings) |binding| {
+        var view = sample_view();
+        view.binding = binding;
+        var buffer: [constants.record_bytes_max]u8 = undefined;
+        const text = render(&view, &buffer);
+        var parsed: Parsed = undefined;
+        try parse(text, &parsed);
+        try testing.expectEqual(@as(?Binding, binding), parsed.binding);
+    }
+    var view = sample_view();
+    view.binding = .{ .result = bytes };
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    const line = "    .binding = \"result:" ++ hex ++ "\",\n";
+    try testing.expect(std.mem.indexOf(u8, text, line) != null);
+    var parsed: Parsed = undefined;
+    const old = ".{\n    .version = 8,\n    .name = \"x\",\n    .started = 5,\n}\n";
+    try parse(old, &parsed);
+    try testing.expectEqual(@as(?Binding, null), parsed.binding);
+    const head = ".{\n    .version = 9,\n    .name = \"x\",\n    .started = 5,\n";
+    inline for (.{
+        "\"result:ab\"",
+        "\"result:" ++ test_util.repeat('A', 64) ++ "\"",
+        "\"other:" ++ hex ++ "\"",
+        "\"none:" ++ hex ++ "\"",
+    }) |value| {
+        const record = head ++ "    .binding = " ++ value ++ ",\n}\n";
+        try testing.expectError(error.Malformed, parse(record, &parsed));
+    }
+}
+
+test "the command is cut at its bound and says so" {
+    // Goal: a huge command cannot make an unbounded record.
+    var view = sample_view();
+    const word = @import("../test_util.zig").repeat('w', 1000);
+    view.command = &.{ word, word, word };
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, ".command_truncated = true") != null);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+}
+
+test "older, newer and damaged records: the reader accepts, skips or refuses exactly" {
+    // Goal: the format rules. A record with no version field is version 0 and readable; a field
+    // this reader does not know is ignored; version 3 is Newer; anything that is not a record, a
+    // missing name or start, a bad name, and text after the closing brace are Malformed.
+    var parsed: Parsed = undefined;
+    const old = ".{\n    .name = \"old\",\n    .started = 5,\n}\n";
+    try parse(old, &parsed);
+    try testing.expectEqual(@as(u32, 0), parsed.version);
+    try testing.expect(parsed.ids == null);
+    const head = ".{\n    .version = 1,\n    .name = \"x\",\n    .started = 5,\n";
+    try parse(head ++ "    .future = .{ 1, 2 },\n}\n", &parsed);
+    // A repeated field: the later one wins, and the counts start again.
+    const twice = head ++ "    .command = .{ \"a\" },\n    .command = .{ \"b\", \"c\" },\n}\n";
+    try parse(twice, &parsed);
+    try testing.expectEqual(@as(u8, 2), parsed.command_words);
+    try testing.expectEqualStrings("c", parsed.command_word(1));
+    const newer = ".{\n    .version = 13,\n    .name = \"x\",\n    .started = 5,\n}\n";
+    try testing.expectError(error.Newer, parse(newer, &parsed));
+    const bad = [_][]const u8{
+        "",
+        "garbage",
+        ".{\n",
+        ".{\n    .version = 1,\n    .started = 5,\n}\n",
+        ".{\n    .version = 1,\n    .name = \"x\",\n}\n",
+        ".{\n    .name = \"X\",\n    .started = 5,\n}\n",
+        ".{\n    .name = \"x\",\n    .started = five,\n}\n",
+        ".{\n    .name = \"x\",\n    .started = 5,\n    .exit = .{ .exited = 999 },\n}\n",
+        ".{\n    .name = \"x\",\n    .started = 5,\n}\nextra\n",
+        ".{\n    .name = \"unterminated,\n    .started = 5,\n}\n",
+        ".{\n    .name = \"x\",\n    .started = 5\n}\n",
+        ".{\n    .name = \"x\",\n    .started = 5,\n    .scope = ,\n}\n",
+    };
+    for (bad) |text| try testing.expectError(error.Malformed, parse(text, &parsed));
+}
+
+test "string escapes round-trip, including bytes the writer escapes in hex" {
+    // Goal: a command word with a quote, a backslash, a newline and a control byte survives.
+    var view = sample_view();
+    view.rootfs = "/a\"b\\c\n\x01\xff";
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqualStrings(view.rootfs, parsed.rootfs_slice());
+}
+
+fn sim_with_home(sim: *HostSim) void {
+    sim.init(1, &.{});
+    sim.environment_variables = &.{.{ .name = "HOME", .value = "/home/alice" }};
+    sim.world.add_node("/home/alice", .dir);
+}
+
+test "the runs directory follows XDG_STATE_HOME, else HOME, and is made as needed" {
+    // Goal: where records go, and that a missing directory (the first run on a machine) is
+    // created, one level at a time, without failing.
+    var sim: HostSim = undefined;
+    sim_with_home(&sim);
+    var dir: Dir = undefined;
+    try testing.expect(locate(sim.interface(), &dir));
+    try testing.expectEqualStrings("/home/alice/.local/state/zbx/runs", dir.text());
+    try ensure(sim.interface(), &dir);
+    try ensure(sim.interface(), &dir); // Again: they exist now.
+    const kind = sim.world.node_kind("/home/alice/.local/state/zbx/runs");
+    try testing.expectEqual(@as(?@import("../sim_world.zig").NodeKind, .dir), kind);
+
+    const state = [_]@import("../host_sim.zig").EnvironmentVariable{
+        .{ .name = "XDG_STATE_HOME", .value = "/var/state/" },
+        .{ .name = "HOME", .value = "/home/alice" },
+    };
+    sim.environment_variables = &state;
+    try testing.expect(locate(sim.interface(), &dir));
+    try testing.expectEqualStrings("/var/state/zbx/runs", dir.text());
+
+    sim.environment_variables = &.{.{ .name = "XDG_STATE_HOME", .value = "relative" }};
+    try testing.expect(!locate(sim.interface(), &dir));
+    sim.environment_variables = &.{};
+    try testing.expect(!locate(sim.interface(), &dir));
+}
+
+test "saving is atomic, a failed rename leaves no temporary file, and a full disk is an error" {
+    // Goal: a reader sees a whole record or none, and failures are reported, not hidden.
+    var sim: HostSim = undefined;
+    sim_with_home(&sim);
+    var dir: Dir = undefined;
+    try testing.expect(locate(sim.interface(), &dir));
+    try ensure(sim.interface(), &dir);
+    const view = sample_view();
+    try save(sim.interface(), &dir, &view);
+    const final = "/home/alice/.local/state/zbx/runs/web-1.zon";
+    const temporary = "/home/alice/.local/state/zbx/runs/.web-1.tmp";
+    try testing.expect(sim.world.read_written(final) != null);
+    try testing.expect(sim.world.read_written(temporary) == null);
+
+    sim.world.disk_full = true;
+    try testing.expectError(error.NoSpace, save(sim.interface(), &dir, &view));
+    try testing.expect(sim.world.read_written(temporary) == null);
+    // The old record is still whole.
+    var parsed: Parsed = undefined;
+    try parse(sim.world.read_written(final).?, &parsed);
+    try testing.expectEqual(@as(u32, 0), sim.open_count());
+}
+
+test "pruning keeps the newest runs_max, deletes the oldest first, and counts what it cannot read" {
+    // Goal: the retention rule and the upgrade rules together. Method: 30 good records with
+    // distinct start times, one old-format record, one damaged, one newer-format and the one
+    // just saved: 34 in all. The two that cannot be read count as the oldest and go; the
+    // old-format one is a record like any other and stays.
+    var sim: HostSim = undefined;
+    sim_with_home(&sim);
+    var dir: Dir = undefined;
+    try testing.expect(locate(sim.interface(), &dir));
+    try ensure(sim.interface(), &dir);
+    var view = sample_view();
+    var name_buffer: [16]u8 = undefined;
+    for (0..30) |number| {
+        view.name = try std.fmt.bufPrint(&name_buffer, "run-{d:0>2}", .{number});
+        view.started = 1_000 + number;
+        try save(sim.interface(), &dir, &view);
+    }
+    const prefix = "/home/alice/.local/state/zbx/runs/";
+    const legacy = ".{\n    .name = \"legacy\",\n    .started = 500,\n}\n";
+    const future = ".{\n    .version = 13,\n    .name = \"future\",\n    .started = 600,\n}\n";
+    try testing.expect(sim.world.write_file(prefix ++ "legacy.zon", legacy) == null);
+    try testing.expect(sim.world.write_file(prefix ++ "damaged.zon", "not a record") == null);
+    try testing.expect(sim.world.write_file(prefix ++ "future.zon", future) == null);
+    view.name = "latest";
+    view.started = 2_000;
+    try save(sim.interface(), &dir, &view);
+    var skipped: Skipped = undefined;
+    var pruned: Pruned = undefined;
+    try prune(sim.interface(), &dir, "latest", &skipped, &pruned);
+    try testing.expectEqual(@as(u32, 2), skipped.count);
+    var listing: host_mod.DirListing = undefined;
+    try sim.interface().list_directory(dir.text(), &listing);
+    try testing.expectEqual(@as(u32, constants.runs_max), listing.count);
+    try testing.expect(sim.world.read_written(prefix ++ "latest.zon") != null);
+    try testing.expect(sim.world.read_written(prefix ++ "damaged.zon") == null);
+    try testing.expect(sim.world.read_written(prefix ++ "future.zon") == null);
+    try testing.expect(sim.world.read_written(prefix ++ "legacy.zon") != null);
+    try testing.expect(sim.world.read_written(prefix ++ "run-00.zon") != null);
+}
+
+test "a record file whose stem is not a container name owns no container directory" {
+    // Goal: pruning must not hand `Notes` or `my run` to the code that removes a container's
+    // directory (it asserts a valid name). Method: 31 good records, the one just saved and two
+    // strays that cannot be read make 34; the strays go as the oldest, and are not in `pruned`.
+    var sim: HostSim = undefined;
+    sim_with_home(&sim);
+    var dir: Dir = undefined;
+    try testing.expect(locate(sim.interface(), &dir));
+    try ensure(sim.interface(), &dir);
+    var view = sample_view();
+    var name_buffer: [16]u8 = undefined;
+    for (0..31) |number| {
+        view.name = try std.fmt.bufPrint(&name_buffer, "run-{d:0>2}", .{number});
+        view.started = 1_000 + number;
+        try save(sim.interface(), &dir, &view);
+    }
+    const prefix = "/home/alice/.local/state/zbx/runs/";
+    try testing.expect(sim.world.write_file(prefix ++ "Notes.zon", "notes") == null);
+    try testing.expect(sim.world.write_file(prefix ++ "my run.zon", "x") == null);
+    view.name = "latest";
+    view.started = 2_000;
+    try save(sim.interface(), &dir, &view);
+    var skipped: Skipped = undefined;
+    var pruned: Pruned = undefined;
+    try prune(sim.interface(), &dir, "latest", &skipped, &pruned);
+    try testing.expect(sim.world.read_written(prefix ++ "Notes.zon") == null);
+    try testing.expectEqual(@as(u32, 0), pruned.count);
+    try testing.expect(sim.world.read_written(prefix ++ "run-00.zon") != null);
+}
+
+test "version 4 keeps the tree and the upper layer, and an older record has neither" {
+    // Goal: the fields the store added read back, and version 3 records (written by the M2
+    // release) still read, with the two empty. Method: render with both, then cut them out.
+    var view: View = .{
+        .name = "web-1",
+        .rootfs = "/home/alice/.local/state/zbx/containers/web-1/merged",
+        .command = &.{"sh"},
+        .labels = &.{},
+        .started = 5,
+        .ended = null,
+        .exit = .running,
+        .ids = .full,
+        .zbx_version = "0.0.0",
+    };
+    view.tree = "b3:" ++ @import("../test_util.zig").repeat('a', 64);
+    view.upper = "/home/alice/.local/state/zbx/containers/web-1/upper";
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqualStrings(view.tree, parsed.tree_slice());
+    try testing.expectEqualStrings(view.upper, parsed.upper_slice());
+    // A version 3 record: no such lines, and the version says 3.
+    var old: [constants.record_bytes_max]u8 = undefined;
+    var length: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "    .tree = ")) continue;
+        if (std.mem.startsWith(u8, line, "    .upper = ")) continue;
+        const now = std.fmt.comptimePrint("    .version = {d},", .{constants.record_version_plain});
+        const fixed = if (std.mem.eql(u8, line, now)) "    .version = 3," else line;
+        @memcpy(old[length..][0..fixed.len], fixed);
+        old[length + fixed.len] = '\n';
+        length += fixed.len + 1;
+    }
+    try parse(old[0 .. length - 1], &parsed);
+    try testing.expectEqual(@as(u32, 3), parsed.version);
+    try testing.expectEqual(@as(usize, 0), parsed.tree_slice().len);
+    try testing.expectEqual(@as(usize, 0), parsed.upper_slice().len);
+    try testing.expectEqualStrings("web-1", parsed.name_slice());
+}
+
+/// A run record exactly as the M5 release wrote it (version 4), captured from that release's
+/// own writer (commit 1fb59e1, `records.render`), not from the code above.
+const record_written_by_m5 =
+    \\.{
+    \\    .version = 4,
+    \\    .name = "web-1",
+    \\    .rootfs = "/srv/alpine",
+    \\    .command = .{ "/bin/sh", "-c", "echo \\"hi\\"\\n" },
+    \\    .command_truncated = false,
+    \\    .labels = .{ .{ "app", "web" } },
+    \\    .started = 1760000000,
+    \\    .ended = 1760000042,
+    \\    .exit = .{ .exited = 3 },
+    \\    .ids = .full,
+    \\    .reason = .exited,
+    \\    .detached = false,
+    \\    .timed_out = false,
+    \\    .scope = "",
+    \\    .pid = 0,
+    \\    .supervisor = 0,
+    \\    .limit_memory = null,
+    \\    .limit_pids = null,
+    \\    .limit_cpu_millis = null,
+    \\    .tree = "b3:abababababababababababababababababababababababababababababababab",
+    \\    .upper = "",
+    \\    .zbx = "0.0.0",
+    \\}
+    \\
+;
+
+test "a version 4 record, as M5 wrote it, reads with no network, forwards or names" {
+    // Goal: the next release reads the last one's records (REVIEW.md). Method: the text M5's
+    // writer produced; the fields version 5 added are unknown, not zero.
+    var parsed: Parsed = undefined;
+    try parse(record_written_by_m5, &parsed);
+    try testing.expectEqual(@as(u32, 4), parsed.version);
+    try testing.expectEqualStrings("web-1", parsed.name_slice());
+    try testing.expect(parsed.network == null);
+    try testing.expectEqual(@as(usize, 0), parsed.publish_slice().len);
+    try testing.expectEqual(@as(u8, 0), parsed.env_names_count);
+    try testing.expectEqual(@as(usize, 1), @as(usize, parsed.labels_count));
+}
+
+test "a record without a network line still has its names checked" {
+    // Goal: the names of -e are refused when bad even where the record has no `.network` line, as
+    // M5's records do and a damaged one may (the record fuzzer, seed 8823082759703440891, found a
+    // bad name passing because the check sat after the early return for no network).
+    // Method: M5's real text with a name `-e` could never set added.
+    var text: [constants.record_bytes_max]u8 = undefined;
+    const end = std.mem.lastIndexOf(u8, record_written_by_m5, "}").?;
+    const damaged = try std.fmt.bufPrint(&text, "{s}    .env_names = \"9BAD\",\n}}\n", .{
+        record_written_by_m5[0..end],
+    });
+    var parsed: Parsed = undefined;
+    try testing.expectError(error.Malformed, parse(damaged, &parsed));
+    const good = try std.fmt.bufPrint(&text, "{s}    .env_names = \"GOOD\",\n}}\n", .{
+        record_written_by_m5[0..end],
+    });
+    try parse(good, &parsed);
+    try testing.expectEqual(@as(u8, 1), parsed.env_names_count);
+}
+
+test "version 5 keeps the network, the forwards and the names of -e, and never a value" {
+    // Goal: the new fields round-trip and nothing else about -e is in the text. Method: render
+    // with a forward and two names; parse back; search the text for a marker no field holds.
+    var view = sample_view();
+    const forward = [_]spec_mod.Publish{
+        .{ .host = 8080, .container = 80 },
+        .{ .host = 1, .container = 2 },
+    };
+    const variables = [_][]const u8{ "POSTGRES_PASSWORD", "_x9" };
+    view.network = .user;
+    view.publish = &forward;
+    view.env_names = &variables;
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "    .network = .user,\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, ".publish = .{ \"8080:80\", \"1:2\" },") != null);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqual(@as(?spec_mod.Network, .user), parsed.network);
+    try testing.expectEqual(@as(usize, 2), parsed.publish_slice().len);
+    try testing.expectEqual(@as(u16, 8080), parsed.publish_slice()[0].host);
+    try testing.expectEqual(@as(u8, 2), parsed.env_names_count);
+    try testing.expectEqualStrings("POSTGRES_PASSWORD", parsed.env_name(0));
+    try testing.expectEqualStrings("_x9", parsed.env_name(1));
+    // The record of a run with none of them says so.
+    const bare = render(&sample_view(), &buffer);
+    try parse(bare, &parsed);
+    try testing.expectEqual(@as(?spec_mod.Network, .none), parsed.network);
+    try testing.expectEqual(@as(u8, 0), parsed.env_names_count);
+}
+
+test "version 5 fields that render never writes are Malformed, not a crash later" {
+    // Goal: parse accepts only what render can write (REVIEW.md). Method: each damage of the
+    // three fields on top of a good record.
+    var view = sample_view();
+    const forward = [_]spec_mod.Publish{.{ .host = 8080, .container = 80 }};
+    view.network = .user;
+    view.publish = &forward;
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const good = render(&view, &buffer);
+    var parsed: Parsed = undefined;
+    try parse(good, &parsed);
+    const damages = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = ".network = .user", .to = ".network = .none" }, // A forward without `user`.
+        .{ .from = ".network = .user", .to = ".network = .other" },
+        .{ .from = "\"8080:80\"", .to = "\"8080:80\", \"8080:81\"" }, // A host port twice.
+        .{ .from = "\"8080:80\"", .to = "\"0:80\"" },
+        .{ .from = "\"8080:80\"", .to = "\"8080\"" },
+        .{ .from = ".env_names = \"\"", .to = ".env_names = \"A A\"" },
+        .{ .from = ".env_names = \"\"", .to = ".env_names = \"1x\"" },
+        .{ .from = ".env_names = \"\"", .to = ".env_names = \"a=b\"" },
+        .{ .from = ".env_names = \"\"", .to = ".env_names = \"A  B\"" },
+        .{ .from = ".env_names = \"\"", .to = ".env_names = \" A\"" },
+        .{ .from = ".env_names = \"\"", .to = ".env_names = .{ \"A\" }" },
+    };
+    for (damages) |damage| {
+        var copy: [constants.record_bytes_max]u8 = undefined;
+        const length = std.mem.replacementSize(u8, good, damage.from, damage.to);
+        _ = std.mem.replace(u8, good, damage.from, damage.to, &copy);
+        try testing.expectError(error.Malformed, parse(copy[0..length], &parsed));
+    }
+    // Too many names: one past the bound.
+    var many: [constants.run_env_count_max + 1][]const u8 = undefined;
+    var storage: [constants.run_env_count_max + 1][4]u8 = undefined;
+    for (&many, &storage, 0..) |*word, *bytes, index| {
+        word.* = std.fmt.bufPrint(bytes, "V{d}", .{index}) catch unreachable; // Short.
+    }
+    var text: [constants.record_bytes_max]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&text);
+    const head = ".{\n    .name = \"x\",\n    .started = 5,\n    .network = .none,\n" ++
+        "    .env_names = \"";
+    try writer.writeAll(head);
+    for (many, 0..) |word, index| {
+        try writer.print("{s}{s}", .{ if (index == 0) "" else " ", word });
+    }
+    try writer.writeAll("\",\n}\n");
+    try testing.expectError(error.Malformed, parse(writer.buffered(), &parsed));
+}
+
+/// A run record exactly as M6 slice 1 wrote it (version 5), captured from that commit's own
+/// writer (82c1f70, `records.render` of `sample_view` with a forward and an `-e` name), not from
+/// the code above.
+const record_written_by_m6_slice_1 =
+    \\.{
+    \\    .version = 5,
+    \\    .name = "web-1",
+    \\    .rootfs = "/srv/alpine",
+    \\    .command = .{ "/bin/sh", "-c", "echo \"hi\"\n" },
+    \\    .command_truncated = false,
+    \\    .labels = .{ .{ "app", "web" } },
+    \\    .started = 1760000000,
+    \\    .ended = null,
+    \\    .exit = .running,
+    \\    .ids = .full,
+    \\    .reason = .none,
+    \\    .detached = false,
+    \\    .timed_out = false,
+    \\    .scope = "",
+    \\    .pid = 0,
+    \\    .supervisor = 0,
+    \\    .limit_memory = null,
+    \\    .limit_pids = null,
+    \\    .limit_cpu_millis = null,
+    \\    .tree = "",
+    \\    .upper = "",
+    \\    .network = .user,
+    \\    .publish = .{ "5432:5432" },
+    \\    .env_names = "POSTGRES_PASSWORD",
+    \\    .zbx = "0.0.0",
+    \\}
+    \\
+;
+
+test "version 6 keeps the state volumes; versions 4 and 5, as written, read with none" {
+    // Goal: the field this version adds round-trips as one string (two strings in a row would
+    // read to the bundle's redactor as a secret's name and value), a list a run could not have
+    // is refused, and the records the two releases before wrote read. Method: render, parse;
+    // edits of the field; then the captured texts.
+    var view: View = sample_view();
+    const mounts = [_]volume.Mount{
+        .{ .name = "pgdata", .target = "/var/lib/postgresql/data", .read_only = false },
+        .{ .name = "cfg", .target = "/etc/app", .read_only = true },
+    };
+    view.state = &mounts;
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    const line = "    .state = \"pgdata:/var/lib/postgresql/data cfg:/etc/app:ro\",\n";
+    try testing.expect(std.mem.indexOf(u8, text, line) != null);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqual(constants.record_version_plain, parsed.version);
+    try testing.expectEqual(@as(u8, 2), parsed.state_count);
+    try testing.expectEqualStrings("pgdata", parsed.state_mount(0).name);
+    try testing.expectEqualStrings("/etc/app", parsed.state_mount(1).target);
+    try testing.expect(parsed.state_mount(1).read_only);
+    const bad = [_][]const u8{
+        "    .state = \"pgdata\",\n",
+        "    .state = \"a:/x a:/y\",\n",
+        "    .state = \"a:/x b:/x/y\",\n",
+        "    .state = \"Bad:/x\",\n",
+        "    .state = \"a:/x  b:/y\",\n",
+        "    .state = \"a:/x b:/y c:/z d:/w e:/v f:/u g:/t h:/s i:/r\",\n",
+    };
+    for (bad) |edit| {
+        var edited: [constants.record_bytes_max]u8 = undefined;
+        const size = std.mem.replacementSize(u8, text, line, edit);
+        _ = std.mem.replace(u8, text, line, edit, &edited);
+        try testing.expectError(error.Malformed, parse(edited[0..size], &parsed));
+    }
+    try parse(record_written_by_m6_slice_1, &parsed);
+    try testing.expectEqual(@as(u32, 5), parsed.version);
+    try testing.expectEqual(@as(u8, 0), parsed.state_count);
+    try testing.expectEqualStrings("POSTGRES_PASSWORD", parsed.env_name(0));
+    try parse(record_written_by_m5, &parsed);
+    try testing.expectEqual(@as(u32, 4), parsed.version);
+    try testing.expectEqual(@as(u8, 0), parsed.state_count);
+}
+
+/// The record version 6 (slice 2 of M6) wrote for a run with a state volume: the renderer then
+/// differed from this one in the version number and in having no `.mounts` line.
+const record_written_by_m6_slice_2 =
+    \\.{
+    \\    .version = 6,
+    \\    .name = "pg",
+    \\    .rootfs = "/srv/alpine",
+    \\    .command = .{ "/bin/sh" },
+    \\    .labels = .{},
+    \\    .started = 1700000000,
+    \\    .ended = null,
+    \\    .exit = .running,
+    \\    .ids = .full,
+    \\    .reason = .none,
+    \\    .detached = false,
+    \\    .timed_out = false,
+    \\    .scope = "",
+    \\    .pid = 0,
+    \\    .supervisor = 0,
+    \\    .limit_memory = null,
+    \\    .limit_pids = null,
+    \\    .limit_cpu_millis = null,
+    \\    .tree = "",
+    \\    .upper = "",
+    \\    .network = .none,
+    \\    .publish = .{ },
+    \\    .env_names = "",
+    \\    .state = "pgdata:/var/lib/postgresql/data",
+    \\    .zbx = "0.6.0",
+    \\}
+    \\
+;
+
+test "version 7 keeps the other mounts; a version 6 record reads with none" {
+    // Goal: the field this version adds round-trips as one string (the secret's path is in it,
+    // never its bytes), a list a run could not have is refused, and the record of the release
+    // before reads. Method: render, parse; edits of the field; then the version 6 text.
+    var view: View = sample_view();
+    const state = [_]volume.Mount{.{ .name = "pg", .target = "/data", .read_only = false }};
+    const extra = [_]mounts_mod.Mount{
+        .{ .kind = .tmpfs, .source = "", .target = "/scratch", .size_bytes = 8 << 20 },
+        .{ .kind = .bind, .source = "/srv/site", .target = "/site", .size_bytes = 0 },
+        .{ .kind = .secret, .source = "/run/key", .target = "/run/secrets/key", .size_bytes = 0 },
+    };
+    view.state = &state;
+    view.mounts = &extra;
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    const line = "    .mounts = \"tmpfs:/scratch:8388608 bind:/srv/site:/site " ++
+        "secret:/run/key:/run/secrets/key\",\n";
+    try testing.expect(std.mem.indexOf(u8, text, line) != null);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqual(@as(u8, 3), parsed.mounts_count);
+    try testing.expectEqual(mounts_mod.Kind.secret, parsed.mount_at(2).kind);
+    try testing.expectEqualStrings("/run/key", parsed.mount_at(2).source);
+    try testing.expectEqual(@as(u64, 8 << 20), parsed.mount_at(0).size_bytes);
+    const bad = [_][]const u8{
+        "    .mounts = \"tmpfs:/scratch\",\n",
+        "    .mounts = \"tmpfs:/scratch:100\",\n",
+        "    .mounts = \"bind:/a:/b bind:/c:/b\",\n",
+        "    .mounts = \"bind:/a:/b/c tmpfs:/b:4096\",\n",
+        "    .mounts = \"bind:/a:/data\",\n",
+        "    .mounts = \"bind:/a:/b  bind:/c:/d\",\n",
+        "    .mounts = \"other:/a:/b\",\n",
+        "    .mounts = \"bind:/a:/b:/c\",\n",
+        "    .mounts = \"tmpfs:/a:4096 tmpfs:/b:4096 tmpfs:/c:4096 tmpfs:/d:4096 tmpfs:/e:4096 " ++
+            "tmpfs:/f:4096 tmpfs:/g:4096 tmpfs:/h:4096 tmpfs:/i:4096\",\n",
+    };
+    for (bad) |edit| {
+        var edited: [constants.record_bytes_max]u8 = undefined;
+        const size = std.mem.replacementSize(u8, text, line, edit);
+        _ = std.mem.replace(u8, text, line, edit, &edited);
+        try testing.expectError(error.Malformed, parse(edited[0..size], &parsed));
+    }
+    try parse(record_written_by_m6_slice_2, &parsed);
+    try testing.expectEqual(@as(u32, 6), parsed.version);
+    try testing.expectEqual(@as(u8, 0), parsed.mounts_count);
+    try testing.expectEqual(@as(u8, 1), parsed.state_count);
+}
+
+/// The record version 7 (M6 as merged, commit 3a357b2) wrote, captured from that source's own
+/// renderer: no `.user` line, and no `mount:` kind among the mounts.
+const record_written_by_m6_merged =
+    \\.{
+    \\    .version = 7,
+    \\    .name = "web-1",
+    \\    .rootfs = "/srv/alpine",
+    \\    .command = .{ "/bin/sh", "-c", "echo \"hi\"\n" },
+    \\    .command_truncated = false,
+    \\    .labels = .{ .{ "app", "web" } },
+    \\    .started = 1760000000,
+    \\    .ended = 1760000042,
+    \\    .exit = .{ .exited = 3 },
+    \\    .ids = .full,
+    \\    .reason = .exited,
+    \\    .detached = false,
+    \\    .timed_out = false,
+    \\    .scope = "",
+    \\    .pid = 0,
+    \\    .supervisor = 0,
+    \\    .limit_memory = null,
+    \\    .limit_pids = null,
+    \\    .limit_cpu_millis = null,
+    \\    .tree = "",
+    \\    .upper = "",
+    \\    .network = .none,
+    \\    .publish = .{ },
+    \\    .env_names = "",
+    \\    .state = "pg:/data",
+    \\    .mounts = "tmpfs:/scratch:8388608 bind:/srv/site:/site",
+    \\    .zbx = "0.0.0",
+    \\}
+    \\
+;
+
+test "version 8 keeps the user and the writable mounts; a version 7 record reads with neither" {
+    // Goal: the fields this version adds round-trip, a user or a mount the writer could not have
+    // written is refused, and the record of the release before reads (REVIEW.md: real old text).
+    // Method: render and parse; edits of each field; then the version 7 text above.
+    var view: View = sample_view();
+    const extra = [_]mounts_mod.Mount{
+        .{ .kind = .mount, .source = "/home/a/proj/site", .target = "/srv", .size_bytes = 0 },
+        .{ .kind = .bind, .source = "/srv/ro", .target = "/ro", .size_bytes = 0 },
+    };
+    view.mounts = &extra;
+    view.user = .{ .uid = 0, .gid = 0 };
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    const mounts_line = "    .mounts = \"mount:/home/a/proj/site:/srv bind:/srv/ro:/ro\",\n";
+    try testing.expect(std.mem.indexOf(u8, text, mounts_line) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "    .user = \"0:0\",\n") != null);
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqual(mounts_mod.Kind.mount, parsed.mount_at(0).kind);
+    try testing.expectEqualStrings("/home/a/proj/site", parsed.mount_at(0).source);
+    try testing.expectEqual(@as(?spec_mod.User, .{ .uid = 0, .gid = 0 }), parsed.user);
+    const bad_mounts = [_][]const u8{
+        "    .mounts = \"mount:site:/srv\",\n",
+        "    .mounts = \"mount:/home/a/../b:/srv\",\n",
+        "    .mounts = \"mount:/home/a/proj/site:/srv/x bind:/srv/ro:/srv\",\n",
+        "    .mounts = \"mount:/a:/proc\",\n",
+    };
+    for (bad_mounts) |edit| {
+        var edited: [constants.record_bytes_max]u8 = undefined;
+        const size = std.mem.replacementSize(u8, text, mounts_line, edit);
+        _ = std.mem.replace(u8, text, mounts_line, edit, &edited);
+        try testing.expectError(error.Malformed, parse(edited[0..size], &parsed));
+    }
+    const user_line = "    .user = \"0:0\",\n";
+    const bad_users = [_][]const u8{
+        "    .user = \"\",\n",
+        "    .user = \"0\",\n",
+        "    .user = \"0:\",\n",
+        "    .user = \":0\",\n",
+        "    .user = \"00:0\",\n",
+        "    .user = \"-1:0\",\n",
+        "    .user = \"0:0:0\",\n",
+        "    .user = \"4294967296:0\",\n",
+        "    .user = 0,\n",
+    };
+    for (bad_users) |edit| {
+        var edited: [constants.record_bytes_max]u8 = undefined;
+        const size = std.mem.replacementSize(u8, text, user_line, edit);
+        _ = std.mem.replace(u8, text, user_line, edit, &edited);
+        try testing.expectError(error.Malformed, parse(edited[0..size], &parsed));
+    }
+    view.user = .{ .uid = 4294967295, .gid = 1000 };
+    const other = render(&view, &buffer);
+    try parse(other, &parsed);
+    try testing.expectEqual(@as(?spec_mod.User, .{ .uid = 4294967295, .gid = 1000 }), parsed.user);
+    try parse(record_written_by_m6_merged, &parsed);
+    try testing.expectEqual(@as(u32, 7), parsed.version);
+    try testing.expectEqual(@as(?spec_mod.User, null), parsed.user);
+    try testing.expectEqual(@as(u8, 2), parsed.mounts_count);
+    try testing.expectEqual(@as(u8, 1), parsed.state_count);
+}
+
+/// A version 11 record (a lazy run) as S2 wrote it: rendered by the version 11 path, which this
+/// version leaves as it was.
+const record_written_by_s2 =
+    \\.{
+    \\    .version = 11,
+    \\    .name = "lazy-1",
+    \\    .rootfs = "/srv/alpine",
+    \\    .command = .{ "/bin/sh", "-c", "sleep 60" },
+    \\    .command_truncated = false,
+    \\    .labels = .{ },
+    \\    .started = 1760000000,
+    \\    .ended = 1760000042,
+    \\    .exit = .{ .exited = 0 },
+    \\    .ids = .full,
+    \\    .reason = .exited,
+    \\    .detached = false,
+    \\    .timed_out = false,
+    \\    .scope = "",
+    \\    .pid = 0,
+    \\    .supervisor = 0,
+    \\    .limit_memory = null,
+    \\    .limit_pids = null,
+    \\    .limit_cpu_millis = null,
+    \\    .tree = "",
+    \\    .upper = "",
+    \\    .network = .user,
+    \\    .publish = .{ },
+    \\    .env_names = "",
+    \\    .state = "",
+    \\    .mounts = "",
+    \\    .user = "0:0",
+    \\    .binding = "none",
+    \\    .lazy = .{ .sources = 2, .demand_bytes = 1048576, .fill_bytes = 4194304, .errors = 0,
+++ " .local_percent = 87 },\n" ++
+    \\    .zbx = "0.6.0",
+    \\}
+    \\
+;
+
+test "version 12 keeps the knobs; a version 11 record, as S2 wrote it, reads with none" {
+    // Goal: `--shm-size`, `--ulimit` and `--sysctl` round-trip, only a record with a knob is
+    // version 12, the version before reads with no knob (REVIEW.md: real old text), and a knob
+    // line render could not have written is refused. Method: render and parse; then edits.
+    var parsed: Parsed = undefined;
+    try parse(record_written_by_s2, &parsed);
+    try testing.expectEqual(@as(u32, 11), parsed.version);
+    try testing.expectEqual(@as(u32, 0), parsed.rlimits.count());
+    try testing.expectEqual(@as(u8, 0), parsed.sysctls_count);
+    try testing.expectEqual(@as(?u64, null), parsed.limits.shm_bytes);
+    try testing.expectEqual(@as(u8, 87), parsed.lazy.?.local_percent);
+    var view: View = sample_view();
+    view.network = .user;
+    view.limits = .{ .memory_bytes = 1 << 30, .shm_bytes = 64 << 20 };
+    view.rlimits.set(.nofile, .{ .soft = 4096, .hard = 8192 });
+    view.rlimits.set(.stack, .{ .soft = 8 << 20, .hard = knobs.unlimited });
+    const sysctls = [_]spec_mod.Sysctl{
+        .{ .key = "net.core.somaxconn", .value = "8192" },
+        .{ .key = "kernel.sem", .value = "250 32000 \"32\" 128\\" },
+    };
+    view.sysctls = &sysctls;
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    const text = render(&view, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "    .version = 12,\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "    .limit_shm = 67108864,\n") != null);
+    const ulimits_line = "    .ulimits = \"nofile=4096:8192 stack=8388608:unlimited\",\n";
+    try testing.expect(std.mem.indexOf(u8, text, ulimits_line) != null);
+    const sysctls_line = "    .sysctls = .{ \"net.core.somaxconn=8192\", " ++
+        "\"kernel.sem=250 32000 \\\"32\\\" 128\\\\\" },\n";
+    try testing.expect(std.mem.indexOf(u8, text, sysctls_line) != null);
+    try parse(text, &parsed);
+    try testing.expectEqual(@as(u32, constants.record_version), parsed.version);
+    try testing.expectEqual(view.limits, parsed.limits);
+    try testing.expectEqual(view.rlimits, parsed.rlimits);
+    try testing.expectEqual(@as(u8, 2), parsed.sysctls_count);
+    try testing.expectEqualStrings("net.core.somaxconn", parsed.sysctl_at(0).key);
+    try testing.expectEqualStrings(sysctls[1].value, parsed.sysctl_at(1).value);
+    try expect_malformed_edits(text, ulimits_line, &bad_ulimits);
+    try expect_malformed_edits(text, sysctls_line, &bad_sysctls);
+    try expect_malformed_edits(text, "    .limit_shm = 67108864,\n", &bad_shm);
+    try expect_malformed_edits(text, "    .network = .user,\n", &.{"    .network = .host,\n"});
+    // A knob is written only at version 12: an older version with one was not written by zbx.
+    const older = [_][]const u8{ "    .version = 11,\n", "    .version = 9,\n" };
+    try expect_malformed_edits(text, "    .version = 12,\n", &older);
+    // Without a knob, a lazy run's record stays version 11, which a release before reads.
+    view.limits = .{};
+    view.rlimits = .{};
+    view.sysctls = &.{};
+    view.lazy = .{
+        .sources = 1,
+        .demand_bytes = 0,
+        .fill_bytes = 0,
+        .errors = 0,
+        .local_percent = 0,
+    };
+    const lazy_text = render(&view, &buffer);
+    try parse(lazy_text, &parsed);
+    try testing.expectEqual(@as(u32, constants.record_version_lazy), parsed.version);
+    // And version 12 is written only with a knob: one without any was not written by zbx.
+    const knobless = [_][]const u8{"    .version = 12,\n"};
+    try expect_malformed_edits(lazy_text, "    .version = 11,\n", &knobless);
+}
+
+const bad_ulimits = [_][]const u8{
+    "    .ulimits = \"\",\n",
+    "    .ulimits = \"nofile=4096\",\n",
+    "    .ulimits = \"nofile=8192:4096\",\n",
+    "    .ulimits = \"stack=8388608:unlimited nofile=4096:8192\",\n",
+    "    .ulimits = \"nofile=4096:8192 nofile=4096:8192\",\n",
+    "    .ulimits = \"nofile=4096:8192 stack=8m:unlimited\",\n",
+    "    .ulimits = \"nofile=4096:8192  stack=8388608:unlimited\",\n",
+    "    .ulimits = \"nofile=04096:8192\",\n",
+    "    .ulimits = \"nofile=4096:18446744073709551615\",\n",
+    "    .ulimits = \"nofile=4096:18446744073709551616\",\n",
+    "    .ulimits = \"core=1:1\",\n",
+    "    .ulimits = 4096,\n",
+    "    .ulimits = \"nofile=4096:unlimited\",\n",
+};
+
+const bad_sysctls = [_][]const u8{
+    "    .sysctls = .{ },\n",
+    "    .sysctls = .{ \"kernel.hostname=x\" },\n",
+    "    .sysctls = .{ \"net.core.somaxconn\" },\n",
+    "    .sysctls = .{ \"net.core.somaxconn=\" },\n",
+    "    .sysctls = .{ \"net.core.somaxconn=\\x01\" },\n",
+    "    .sysctls = .{ \"net.core.somaxconn=1\", \"net.core.somaxconn=2\" },\n",
+    "    .sysctls = \"net.core.somaxconn=1\",\n",
+    "    .sysctls = .{ \"kernel.shmmax=1\", \"kernel.shmall=1\", \"kernel.shmmni=1\", " ++
+        "\"kernel.shm_rmid_forced=1\", \"kernel.msgmax=1\", \"kernel.msgmnb=1\", " ++
+        "\"kernel.msgmni=1\", \"kernel.sem=1\", \"fs.mqueue.msg_max=1\", " ++
+        "\"fs.mqueue.msgsize_max=1\", \"fs.mqueue.queues_max=1\", " ++
+        "\"fs.mqueue.msg_default=1\", \"fs.mqueue.msgsize_default=1\", " ++
+        "\"net.core.somaxconn=1\", \"net.ipv4.tcp_syncookies=1\", " ++
+        "\"net.ipv4.tcp_fin_timeout=1\", \"net.ipv4.tcp_rmem=1\" },\n",
+};
+
+const bad_shm = [_][]const u8{
+    "    .limit_shm = 4095,\n",
+    "    .limit_shm = 1073741825,\n",
+    "    .limit_shm = null,\n",
+    "    .limit_shm = \"64m\",\n",
+    "    .limit_shm = +67108864,\n",
+    "    .limit_shm = 67_108_864,\n",
+    "    .limit_shm = 067108864,\n",
+    "    .limit_shm = 99999999999999999999,\n",
+};
+
+/// Each edit of `line` in `text` is refused as Malformed.
+fn expect_malformed_edits(text: []const u8, line: []const u8, edits: []const []const u8) !void {
+    assert(std.mem.indexOf(u8, text, line) != null);
+    assert(edits.len > 0);
+    for (edits) |edit| {
+        var edited: [constants.record_bytes_max]u8 = undefined;
+        const size = std.mem.replacementSize(u8, text, line, edit);
+        _ = std.mem.replace(u8, text, line, edit, &edited);
+        var parsed: Parsed = undefined;
+        parse(edited[0..size], &parsed) catch |err| {
+            try testing.expectEqual(error.Malformed, err);
+            continue;
+        };
+        std.debug.print("accepted: {s}\n", .{edit});
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// The longest of everything a record holds, in storage the caller keeps: strings of bytes the
+/// writer escapes to four (0xff), the most labels, forwards, names, volumes and mounts.
+const Worst = struct {
+    name: [constants.container_name_bytes_max]u8,
+    rootfs: [constants.rootfs_bytes_max]u8,
+    word: [constants.record_command_bytes_max / 4]u8,
+    command: [5][]const u8,
+    key: [constants.label_key_bytes_max]u8,
+    value: [constants.label_value_bytes_max]u8,
+    labels: [constants.labels_count_max]Label,
+    publish: [constants.publish_count_max]spec_mod.Publish,
+    env_storage: [constants.run_env_count_max][constants.env_name_bytes_max]u8,
+    env_names: [constants.run_env_count_max][]const u8,
+    targets: [constants.mounts_max + constants.state_volumes_max][constants.mount_path_bytes_max]u8,
+    sources: [constants.mounts_max][constants.mount_path_bytes_max]u8,
+    state_names: [constants.state_volumes_max][constants.state_name_bytes_max]u8,
+    state: [constants.state_volumes_max]volume.Mount,
+    extra: [constants.mounts_max]mounts_mod.Mount,
+    diagnostic: [constants.diag_json_bytes_max]u8,
+    version: [64]u8,
+    scope: [constants.scope_name_bytes_max]u8,
+    tree: [constants.store_digest_text_bytes]u8,
+    upper: [constants.containers_path_bytes_max]u8,
+    /// The longest keys on the list, each with a value of quotes, which the writer escapes to two.
+    sysctl_values: [constants.sysctls_max][constants.sysctl_value_bytes_max]u8,
+    sysctls: [constants.sysctls_max]spec_mod.Sysctl,
+
+    fn fill(worst: *Worst) void {
+        worst.name = @splat('n');
+        worst.rootfs = @splat(0xff);
+        worst.word = @splat(0xff);
+        worst.command = @splat(&worst.word);
+        worst.key = @splat('k');
+        worst.value = @splat(0xff);
+        for (&worst.labels) |*label| label.* = .{ .key = &worst.key, .value = &worst.value };
+        for (&worst.publish, 0..) |*forward, at| {
+            forward.* = .{ .host = @intCast(65535 - at), .container = @intCast(65535 - at) };
+        }
+        for (&worst.env_names, 0..) |*name, at| {
+            worst.env_storage[at] = @splat('E');
+            worst.env_storage[at][0] = 'A' + @as(u8, @intCast(at));
+            name.* = &worst.env_storage[at];
+        }
+        // Paths of 256 bytes made of 0xff parts, apart from each other by their first part.
+        for (&worst.targets, 0..) |*target, at| {
+            target.* = @splat(0xff);
+            target[0] = '/';
+            target[1] = 'a' + @as(u8, @intCast(at));
+            target[2] = '/';
+        }
+        for (&worst.sources) |*source| {
+            source.* = @splat(0xff);
+            source[0] = '/';
+        }
+        for (&worst.state, 0..) |*mount, at| {
+            worst.state_names[at] = @splat('v');
+            worst.state_names[at][0] = 'a' + @as(u8, @intCast(at));
+            const target = &worst.targets[at];
+            mount.* = .{ .name = &worst.state_names[at], .target = target, .read_only = true };
+        }
+        for (&worst.extra, 0..) |*mount, at| {
+            mount.* = .{
+                .kind = .mount,
+                .source = &worst.sources[at],
+                .target = &worst.targets[constants.state_volumes_max + at],
+                .size_bytes = 0,
+            };
+        }
+        worst.diagnostic = @splat(0xff);
+        worst.version = @splat(0xff);
+        worst.scope = @splat('s');
+        worst.tree = @splat(0xff);
+        worst.upper = @splat(0xff);
+        worst.fill_sysctls();
+    }
+
+    fn fill_sysctls(worst: *Worst) void {
+        var entries = knobs.allowlist;
+        const longer = struct {
+            fn than(_: void, a: knobs.Entry, b: knobs.Entry) bool {
+                return a.key.len > b.key.len;
+            }
+        }.than;
+        std.mem.sort(knobs.Entry, &entries, {}, longer);
+        assert(entries.len >= constants.sysctls_max);
+        assert(entries[0].key.len == knobs.key_bytes_max);
+        for (&worst.sysctls, &worst.sysctl_values, entries[0..constants.sysctls_max]) |
+            *sysctl,
+            *value,
+            entry,
+        | {
+            value.* = @splat('"');
+            sysctl.* = .{ .key = entry.key, .value = value };
+        }
+    }
+
+    fn view(worst: *const Worst) View {
+        const most: u32 = std.math.maxInt(u32);
+        return .{
+            .name = &worst.name,
+            .rootfs = &worst.rootfs,
+            .command = &worst.command,
+            .labels = &worst.labels,
+            .started = std.math.maxInt(u64),
+            .ended = std.math.maxInt(u64),
+            .exit = .{ .start_failed = .E0205 },
+            .ids = .full,
+            .zbx_version = &worst.version,
+            .diagnostic = &worst.diagnostic,
+            .limits = .{
+                .memory_bytes = std.math.maxInt(u64),
+                .pids = most,
+                .cpu_millis = most,
+                .shm_bytes = std.math.maxInt(u64),
+            },
+            .rlimits = .{
+                .nofile = .{ .soft = knobs.unlimited - 1, .hard = knobs.unlimited - 1 },
+                .nproc = .{ .soft = knobs.unlimited - 1, .hard = knobs.unlimited - 1 },
+                .memlock = .{ .soft = knobs.unlimited - 1, .hard = knobs.unlimited - 1 },
+                .stack = .{ .soft = knobs.unlimited - 1, .hard = knobs.unlimited - 1 },
+            },
+            .sysctls = &worst.sysctls,
+            .scope = &worst.scope,
+            .detached = true,
+            .timed_out = true,
+            .pid = most,
+            .supervisor = most,
+            .tree = &worst.tree,
+            .upper = &worst.upper,
+            .network = .user,
+            .publish = &worst.publish,
+            .env_names = &worst.env_names,
+            .state = &worst.state,
+            .mounts = &worst.extra,
+            .user = .{ .uid = most, .gid = most },
+        };
+    }
+};
+
+var worst_record: Worst = undefined;
+
+test "a record with every field at its bound renders whole and reads back" {
+    // Goal: `record_bytes_max` holds the largest record (REVIEW.md: every bound is tested at the
+    // bound). Method: `Worst`, the longest of every string made of bytes the writer escapes to
+    // four, with every list full and the largest ids; the text must fit the buffer, end whole,
+    // and parse back with every list full.
+    worst_record.fill();
+    const view = worst_record.view();
+    var buffer: [constants.record_bytes_max]u8 = undefined;
+    @memset(&buffer, 0xAA); // Not undefined: a stale byte must not pass for a result.
+    const text = render(&view, &buffer);
+    try testing.expect(text.len < constants.record_bytes_max);
+    try testing.expect(std.mem.endsWith(u8, text, "}\n"));
+    var parsed: Parsed = undefined;
+    try parse(text, &parsed);
+    try testing.expectEqual(@as(u8, constants.mounts_max), parsed.mounts_count);
+    try testing.expectEqual(@as(u8, constants.state_volumes_max), parsed.state_count);
+    try testing.expectEqual(@as(u8, constants.labels_count_max), parsed.labels_count);
+    try testing.expectEqual(@as(u8, constants.publish_count_max), parsed.publish_count);
+    try testing.expectEqual(@as(u8, constants.run_env_count_max), parsed.env_names_count);
+    try testing.expectEqual(@as(?spec_mod.User, view.user), parsed.user);
+    try testing.expectEqual(@as(u8, constants.sysctls_max), parsed.sysctls_count);
+    try testing.expectEqual(view.rlimits, parsed.rlimits);
+}
+
+var bound_host: @import("../host_real.zig").HostReal = .{};
+
+/// A runs directory in /tmp for the test below, NUL-terminated.
+fn bound_dir(dir: *Dir) !void {
+    dir.path = @splat(0);
+    const pid = std.os.linux.getpid();
+    const text = try std.fmt.bufPrint(&dir.path, "/tmp/zbx-record-bound-{d}", .{pid});
+    dir.len = @intCast(text.len);
+    dir.existing_len = dir.len;
+    const made = std.os.linux.mkdir(dir.text(), 0o700);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(made));
+}
+
+/// Writes `length` bytes of `x` as the record of `name`, then loads it.
+fn load_sized(dir: *const Dir, name: []const u8, length: u32, out: *Parsed) LoadError!void {
+    assert(length <= constants.record_bytes_max + 1);
+    const host = bound_host.interface();
+    const filler = struct {
+        var bytes: [constants.record_bytes_max + 1]u8 = @splat('x');
+    };
+    var path_storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    // Cannot fail: the test's names are short and its directory is in /tmp.
+    host.write_file(record_path(dir, name, &path_storage), filler.bytes[0..length]) catch
+        unreachable;
+    return load(host, dir, name, out);
+}
+
+test "a run record is read whole up to record_bytes_max, on a real kernel, and refused past it" {
+    // Goal: run records are read through their own path (`Host.read_record`), sized for the
+    // largest record, while every other file keeps `file_bytes_max` (REVIEW.md: a bound is
+    // tested at the bound and one byte past it). Method: save the worst record to /tmp and load
+    // it back; then a file of exactly `record_bytes_max` bytes is read (and is no record), and
+    // one byte more is unreadable.
+    var dir: Dir = undefined;
+    try bound_dir(&dir);
+    defer _ = std.os.linux.rmdir(dir.text());
+    const host = bound_host.interface();
+    worst_record.fill();
+    const view = worst_record.view();
+    // Both files are removed before the directory, even when a step below fails.
+    var storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    defer _ = std.os.linux.unlink(record_path(&dir, view.name, &storage));
+    var at_storage: [constants.state_path_bytes_max + 80]u8 = undefined;
+    defer _ = std.os.linux.unlink(record_path(&dir, "at-bound", &at_storage));
+    try save(host, &dir, &view);
+    var parsed: Parsed = undefined;
+    try load(host, &dir, view.name, &parsed);
+    try testing.expectEqual(@as(u8, constants.sysctls_max), parsed.sysctls_count);
+    var bytes: [constants.record_bytes_max]u8 = undefined;
+    // The worst record is larger than any other file the host reads: it needs its own path.
+    try testing.expect(render(&view, &bytes).len > constants.file_bytes_max);
+
+    const at = load_sized(&dir, "at-bound", constants.record_bytes_max, &parsed);
+    try testing.expectError(error.Damaged, at);
+    const past = load_sized(&dir, "at-bound", constants.record_bytes_max + 1, &parsed);
+    try testing.expectError(error.Unreadable, past);
+}

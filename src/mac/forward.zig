@@ -1,0 +1,791 @@
+//! Forwarding a command into the VM. The macOS `zbx` is a forwarder: it makes sure the machine
+//! runs (lazily booting it), gets a vsock connection to `zbx guest serve` through the host
+//! process (the descriptor is handed over the control socket, so the data never passes through
+//! the host), sends the command line, working directory, the environment that matters and the
+//! terminal's size, and then relays standard input, output and error, the signals and window
+//! changes, until the guest says how the command ended. Its exit code is the command's.
+//!
+//! When this process dies, by any signal, the connection closes and the guest treats that as a
+//! hangup of the command. When the connection dies first, this process says so (E1009) and ends
+//! with 125 if the command was a `run` or an `exec`.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const c = std.c;
+const commands = @import("commands.zig");
+const control = @import("control.zig");
+const constants = @import("../constants.zig");
+const diagnose = @import("diagnose.zig");
+const files = @import("files.zig");
+const forward_commands = @import("../forward_commands.zig");
+const lock_file = @import("../lock_file.zig");
+const manifest = @import("../registry/manifest.zig");
+const ports = @import("../vm_ports.zig");
+const protocol = @import("../forward_protocol.zig");
+const text_util = @import("../text.zig");
+const vz = @import("vz.zig");
+const Diag = @import("../diag/diag.zig").Diag;
+
+pub const Error = error{Failed};
+
+extern "c" fn ioctl(descriptor: i32, request: c_ulong, ...) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn cfmakeraw(attributes: *c.termios) void;
+
+const tiocgwinsz: c_ulong = 0x40087468;
+
+/// Environment variables that change how the command behaves and that the guest cannot know.
+const forwarded_names = [_][:0]const u8{
+    "TERM",       "NO_COLOR",    "LANG",     "LC_ALL",     "ZBX_REGISTRY_MIRRORS",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
+    "no_proxy",
+};
+
+/// Where the signal handler leaves what it caught, for the relay loop to send.
+var signal_pipe: [2]i32 = .{ -1, -1 };
+
+fn on_signal(signal: c.SIG) callconv(.c) void {
+    const byte: u8 = @intCast(@backingInt(signal));
+    _ = c.write(signal_pipe[1], @ptrCast(&byte), 1);
+}
+
+const caught = [_]c.SIG{ .INT, .TERM, .HUP, .QUIT, .WINCH };
+
+fn catch_signals() Error!void {
+    if (c.pipe(&signal_pipe) != 0) return error.Failed;
+    for (signal_pipe) |descriptor| {
+        const flags = c.fcntl(descriptor, c.F.GETFL);
+        _ = c.fcntl(descriptor, c.F.SETFL, flags | @as(c_int, @bitCast(c.O{ .NONBLOCK = true })));
+    }
+    const action: c.Sigaction = .{
+        .handler = .{ .handler = on_signal },
+        .mask = std.mem.zeroes(c.sigset_t),
+        .flags = 0,
+    };
+    for (caught) |signal| _ = c.sigaction(signal, &action, null);
+}
+
+/// The Linux number of a signal this process caught, or null for the window change.
+fn guest_signal(number: u8) ?u8 {
+    return switch (number) {
+        @backingInt(c.SIG.INT) => 2,
+        @backingInt(c.SIG.TERM) => 15,
+        @backingInt(c.SIG.HUP) => 1,
+        @backingInt(c.SIG.QUIT) => 3,
+        else => null,
+    };
+}
+
+const Size = struct { rows: u16, columns: u16 };
+
+fn terminal_size() Size {
+    var size: c.winsize = undefined;
+    for ([_]i32{ 1, 0, 2 }) |descriptor| {
+        if (ioctl(descriptor, tiocgwinsz, &size) == 0 and size.col > 0) {
+            return .{ .rows = size.row, .columns = size.col };
+        }
+    }
+    return .{ .rows = 24, .columns = 80 };
+}
+
+/// What the relay needs to give back to the terminal when it ends.
+const Terminal = struct {
+    saved: c.termios,
+    raw: bool,
+
+    fn enter(pty: bool) Terminal {
+        var saved: c.termios = undefined;
+        // Raw mode only with a pty: otherwise the Mac's terminal keeps its line editing.
+        const raw_wanted = pty and c.tcgetattr(0, &saved) == 0;
+        if (!raw_wanted) return .{ .saved = saved, .raw = false };
+        var raw = saved;
+        cfmakeraw(&raw);
+        // Output is processed by the guest's terminal, not twice.
+        _ = c.tcsetattr(0, .FLUSH, &raw);
+        return .{ .saved = saved, .raw = true };
+    }
+
+    fn leave(terminal: *const Terminal) void {
+        // NOW, not a drain: a terminal that has stopped reading (flow control) must not keep
+        // this process from ending.
+        if (terminal.raw) _ = c.tcsetattr(0, .NOW, &terminal.saved);
+    }
+};
+
+// ---- The connection ----------------------------------------------------------------------------
+
+/// A vsock connection to the guest's command service, from the host process.
+fn open_connection(ctx: *const commands.Context, diag: *Diag) Error!i32 {
+    assert(ctx.paths.socket.length > 0);
+    assert(diag.code == null);
+    var attempts: u32 = 0;
+    while (attempts < 2) : (attempts += 1) {
+        _ = try commands.ensure_running(ctx, diag);
+        assert(attempts < 2); // One retry, for a machine that stopped between the two requests.
+        if (ask_host(ctx)) |descriptor| {
+            assert(descriptor >= 0);
+            return descriptor;
+        }
+        // The machine may have been stopped for being idle between the check and the request:
+        // once more, which boots a fresh one.
+    }
+    diagnose.service_silent(diag, ctx.paths.console_log.slice());
+    return error.Failed;
+}
+
+fn ask_host(ctx: *const commands.Context) ?i32 {
+    assert(ctx.paths.socket.length > 0);
+    const socket = files.connect_unix(ctx.paths.socket.slice()) catch return null;
+    defer files.close(socket);
+    files.write_all(socket, control.connect_request) catch return null;
+    var line: [constants.vm_line_bytes_max]u8 = undefined;
+    const received = files.receive_with_descriptors(socket, &line) catch return null;
+    if (!std.mem.eql(u8, line[0..received.length], control.connect_ok)) return null;
+    if (received.descriptor_count != 2) return null;
+    assert(received.descriptors[0] >= 0); // The vsock connection.
+    assert(received.descriptors[1] >= 0); // The host's watch.
+    // The second descriptor is left open for as long as this process lives: the host watches it
+    // to learn that this command's client ended, and then lets the connection go.
+    watch_descriptor = received.descriptors[1];
+    return received.descriptors[0];
+}
+
+// ---- The command ---------------------------------------------------------------------------
+
+/// The command line as given, after the program name, with how the run is to be reported.
+pub const Command = struct {
+    words: []const []const u8,
+    json: bool,
+    /// A `run` or an `exec` ends with 125 when this process loses the connection; else with 2.
+    is_run: bool,
+    /// False for a command that could ask for a passphrase: the guest then sees no terminal and
+    /// refuses with its own one-line ZBX-E0911, rather than reading a passphrase through the relay.
+    terminal: bool,
+};
+
+const Frames = struct {
+    payload: [constants.forward_start_bytes_max]u8 = undefined,
+    arguments: [constants.args_count_max][]const u8 = undefined,
+    environment: [constants.forward_env_count_max][]const u8 = undefined,
+    names: [constants.forward_env_count_max][constants.env_name_bytes_max + 1:0]u8 = undefined,
+    values: [constants.forward_env_count_max][1024]u8 = undefined,
+    directory: [constants.path_bytes_max + 1]u8 = undefined,
+    /// `--publish=HOST:CONTAINER` made from `--publish=ADDRESS:HOST:CONTAINER`.
+    publish_text: [constants.publish_count_max][64]u8 = undefined,
+};
+
+var frames: Frames = undefined;
+
+/// What the guest said about the store disk before the command ended, if it did.
+/// Where the command's standard output goes: ours, unless the doctor collects the guest's report.
+pub var stdout_descriptor: i32 = 1;
+
+var disk_note: ?protocol.DiskFull = null;
+
+/// The write end of the pipe the host watches (see `ask_host`); never closed before exit.
+var watch_descriptor: i32 = -1;
+
+fn send_frame(descriptor: i32, kind: protocol.Kind, payload: []const u8) bool {
+    assert(descriptor >= 0);
+    assert(payload.len <= constants.forward_start_bytes_max);
+    var header: [constants.forward_header_bytes]u8 = undefined;
+    protocol.render_header(&header, kind, @intCast(payload.len));
+    files.write_all(descriptor, &header) catch return false;
+    if (payload.len == 0) return true;
+    files.write_all(descriptor, payload) catch return false;
+    return true;
+}
+
+/// Adds `NAME=value` for a name this process has set, if there is room.
+fn add_environment(count: *usize, name: []const u8) void {
+    assert(count.* <= constants.forward_env_count_max);
+    if (count.* == constants.forward_env_count_max) return;
+    if (!protocol.environment_name_allowed(name)) return;
+    if (name.len > constants.env_name_bytes_max) return;
+    @memcpy(frames.names[count.*][0..name.len], name);
+    frames.names[count.*][name.len] = 0;
+    const value = c.getenv(&frames.names[count.*]) orelse return;
+    const text = std.mem.span(value);
+    var entry = std.fmt.bufPrint(&frames.values[count.*], "{s}={s}", .{ name, text }) catch return;
+    if (std.mem.indexOfScalar(u8, entry, 0) != null) entry = entry[0..0];
+    if (entry.len == 0) return;
+    frames.environment[count.*] = entry;
+    count.* += 1;
+    assert(count.* <= constants.forward_env_count_max);
+}
+
+/// `ZBX_PLATFORM=<value>` for the Linux zbx in the machine; room is always kept for it.
+fn add_platform(count: *usize, value: []const u8) void {
+    assert(manifest.architecture_of_platform(value) != null);
+    assert(count.* <= constants.forward_env_count_max);
+    // The platform wins over a forwarded name when the list is full.
+    if (count.* == constants.forward_env_count_max) count.* -= 1;
+    const slot = &frames.values[count.*];
+    const entry = std.fmt.bufPrint(slot, "ZBX_PLATFORM={s}", .{value}) catch return;
+    frames.environment[count.*] = entry;
+    count.* += 1;
+}
+
+/// The names the command line asks for: `-e NAME` and `--env NAME` without a value take the
+/// variable from the environment of the process that runs `zbx`, which is this one.
+fn add_named_environment(count: *usize, words: []const []const u8) void {
+    assert(count.* <= constants.forward_env_count_max);
+    var index: usize = 0;
+    while (index + 1 < words.len) : (index += 1) {
+        const word = words[index];
+        if (!std.mem.eql(u8, word, "-e") and !std.mem.eql(u8, word, "--env")) continue;
+        const next = words[index + 1];
+        if (std.mem.indexOfScalar(u8, next, '=') == null) add_environment(count, next);
+    }
+}
+
+/// Which of the command's streams are terminals, as the Mac has them: a pty only when standard
+/// input and output both are (a redirected one must stay a pipe, as it is on Linux), and standard
+/// error a pipe of its own unless it is a terminal beside a pty.
+const Streams = struct {
+    pty: bool,
+    stderr_pipe: bool,
+
+    /// What a command with `terminal` false sees: pipes only, whatever this process has.
+    const pipes: Streams = .{ .pty = false, .stderr_pipe = true };
+
+    fn of_this_process() Streams {
+        const pty = c.isatty(0) == 1 and c.isatty(1) == 1;
+        return .{ .pty = pty, .stderr_pipe = !pty or c.isatty(2) != 1 };
+    }
+};
+
+fn start_frame(command: *const Command, streams: Streams, platform: ?[]const u8) ?[]const u8 {
+    assert(command.words.len > 0);
+    assert(command.words.len <= constants.args_count_max);
+    var count: usize = 0;
+    for (forwarded_names) |name| add_environment(&count, name);
+    add_named_environment(&count, command.words);
+    if (platform) |value| add_platform(&count, value);
+    assert(count <= constants.forward_env_count_max);
+    var directory: []const u8 = "";
+    if (c.getcwd(&frames.directory, frames.directory.len)) |_| {
+        directory = std.mem.sliceTo(&frames.directory, 0);
+    }
+    const size = terminal_size();
+    return protocol.render_start(&frames.payload, &.{
+        .pty = streams.pty,
+        .stderr_pipe = streams.stderr_pipe,
+        .rows = size.rows,
+        .columns = size.columns,
+        .working_directory = directory,
+        .arguments = command.words,
+        .environment = frames.environment[0..count],
+    });
+}
+
+/// Runs `command` in the VM. Returns the command's exit code; a failure is in `diag`.
+pub fn run(ctx: *const commands.Context, given: *const Command, diag: *Diag) Error!u8 {
+    assert(given.words.len > 0);
+    assert(diag.code == null);
+    try check_directory(diag);
+    try check_project(given, diag);
+    var platform: ?[]const u8 = null;
+    var command = try take_platform(given, &platform, diag);
+    var reserved: ports.PortSet = .{};
+    defer if (reserved.count > 0) release_ports(ctx, &reserved);
+    try reserve_ports(ctx, &command, &reserved, diag);
+    const streams = if (command.terminal) Streams.of_this_process() else Streams.pipes;
+    const payload = start_frame(&command, streams, platform) orelse {
+        diag.raise(.E0008);
+        diag.while_("reading the command line", .{});
+        diag.cause("the command line and environment are more than {d} bytes", .{
+            constants.forward_start_bytes_max,
+        });
+        diag.fix(.{ .sentence = "pass fewer or shorter arguments" });
+        return error.Failed;
+    };
+    if (!streams.pty) assert(streams.stderr_pipe); // Every stream is a pipe without a pty.
+    assert(payload.len > 0);
+    const connection = try open_connection(ctx, diag);
+    defer files.close(connection);
+    try catch_signals();
+    if (!send_frame(connection, .start, payload)) {
+        return lost(&command, diag, "the guest did not take the command");
+    }
+    const screen = Terminal.enter(streams.pty);
+    defer screen.leave();
+    return relay(connection, &command, diag);
+}
+
+/// A `--publish` value with the Mac address it names, if it names one.
+pub const Publication = struct {
+    address: control.Address,
+    port: u16,
+    /// The value for the Linux zbx: `HOST:CONTAINER`.
+    rest: []const u8,
+    /// The address as the user wrote it (for the message), or "127.0.0.1" when none.
+    shown: []const u8,
+};
+
+/// Reads `[ADDRESS:]HOST:CONTAINER`. Null for anything else, which is left for the Linux zbx to
+/// accept or refuse (`ZBX-E0600`) as it does on Linux.
+pub fn read_publication(value: []const u8) ?Publication {
+    assert(value.len <= constants.arg_bytes_max);
+    const first = std.mem.indexOfScalar(u8, value, ':') orelse return null;
+    const host = ports.port_of(value[0..first]) orelse blk: {
+        break :blk null;
+    };
+    if (host) |port| {
+        // `HOST:CONTAINER`, and a third part would be left to the Linux zbx to refuse.
+        if (std.mem.indexOfScalarPos(u8, value, first + 1, ':') != null) return null;
+        return .{
+            .address = .{ .kind = .loopback },
+            .port = port,
+            .rest = value,
+            .shown = "127.0.0.1",
+        };
+    }
+    const second = std.mem.indexOfScalarPos(u8, value, first + 1, ':') orelse return null;
+    if (std.mem.indexOfScalarPos(u8, value, second + 1, ':') != null) return null;
+    const port = ports.port_of(value[first + 1 .. second]) orelse return null;
+    const address = read_address(value[0..first]) orelse return null;
+    return .{
+        .address = address,
+        .port = port,
+        .rest = value[first + 1 ..],
+        .shown = value[0..first],
+    };
+}
+
+fn read_address(text: []const u8) ?control.Address {
+    assert(text.len < constants.arg_bytes_max);
+    if (std.mem.eql(u8, text, "localhost")) return .{ .kind = .loopback };
+    var parts = std.mem.splitScalar(u8, text, '.');
+    var value: u32 = 0;
+    var count: u32 = 0;
+    while (parts.next()) |part| : (count += 1) {
+        if (count == 4) return null;
+        if (part.len == 0 or part.len > 3) return null;
+        if (part.len > 1 and part[0] == '0') return null;
+        const octet = std.fmt.parseInt(u8, part, 10) catch return null;
+        value = (value << 8) | octet;
+    }
+    if (count != 4) return null;
+    if (value == 0) return .{ .kind = .any };
+    if (value == 0x7f000001) return .{ .kind = .loopback };
+    return .{ .kind = .v4, .v4 = value };
+}
+
+/// Reserves, on the Mac, every port the command publishes, and takes a Mac address out of the
+/// `--publish` values (the Linux zbx knows only `HOST:CONTAINER`). A port that cannot be
+/// listened on is `ZBX-E1017`, before the container exists.
+fn reserve_ports(
+    ctx: *const commands.Context,
+    command: *Command,
+    reserved: *ports.PortSet,
+    diag: *Diag,
+) Error!void {
+    assert(command.words.len <= constants.args_count_max);
+    assert(reserved.count == 0);
+    var past_separator = false;
+    var index: usize = 0;
+    var rewritten: usize = 0;
+    while (index < command.words.len) : (index += 1) {
+        const word = command.words[index];
+        if (std.mem.eql(u8, word, "--")) past_separator = true;
+        if (past_separator) break;
+        const joined = std.mem.startsWith(u8, word, "--publish=");
+        if (!joined and !std.mem.eql(u8, word, "--publish")) continue;
+        const slot = if (joined) index else index + 1;
+        if (slot >= command.words.len) break;
+        const value = if (joined) word["--publish=".len..] else command.words[slot];
+        const found = read_publication(value) orelse continue;
+        if (rewritten < constants.publish_count_max) {
+            const text = if (joined)
+                std.fmt.bufPrint(&frames.publish_text[rewritten], "--publish={s}", .{found.rest})
+            else
+                std.fmt.bufPrint(&frames.publish_text[rewritten], "{s}", .{found.rest});
+            frames.arguments[slot] = text catch continue;
+            rewritten += 1;
+        }
+        try reserve_one(ctx, found, reserved, diag);
+        if (!joined) index += 1;
+    }
+}
+
+fn reserve_one(
+    ctx: *const commands.Context,
+    found: Publication,
+    reserved: *ports.PortSet,
+    diag: *Diag,
+) Error!void {
+    assert(found.shown.len > 0);
+    assert(found.port > 0);
+    _ = try commands.ensure_running(ctx, diag);
+    var line: [64]u8 = undefined;
+    const wanted: control.Publish = .{ .address = found.address, .port = found.port };
+    const request = control.render_publish(&line, wanted);
+    var reply: [constants.vm_line_bytes_max]u8 = undefined;
+    const answer = ask_control(ctx, request, &reply) orelse {
+        diagnose.service_silent(diag, ctx.paths.console_log.slice());
+        return error.Failed;
+    };
+    if (std.mem.eql(u8, answer, control.reply_ok)) {
+        _ = reserved.add(found.port);
+        return;
+    }
+    var why: []const u8 = "";
+    if (std.mem.eql(u8, answer, control.reply_full)) why = "full";
+    const failed_prefix = "failed ";
+    if (std.mem.startsWith(u8, answer, failed_prefix)) {
+        why = std.mem.trimEnd(u8, answer[failed_prefix.len..], "\n");
+    }
+    diagnose.port_unavailable(diag, found.port, found.shown, why);
+    return error.Failed;
+}
+
+/// One request line to the host process and its one-line answer.
+fn ask_control(ctx: *const commands.Context, request: []const u8, reply: []u8) ?[]const u8 {
+    assert(reply.len >= 16);
+    assert(request.len > 0);
+    const socket = files.connect_unix(ctx.paths.socket.slice()) catch return null;
+    defer files.close(socket);
+    files.write_all(socket, request) catch return null;
+    return files.read_line(socket, reply, constants.vm_control_timeout_ms * 2) catch null;
+}
+
+/// The command is over: the host closes the ports it never saw published, and keeps the others
+/// for as long as the guest reports them.
+fn release_ports(ctx: *const commands.Context, reserved: *const ports.PortSet) void {
+    assert(reserved.count > 0); // Only a command that reserved a port syncs.
+    var line: [constants.vm_line_bytes_max]u8 = undefined;
+    var reply: [constants.vm_line_bytes_max]u8 = undefined;
+    assert(reserved.count <= constants.vm_ports_max);
+    _ = ask_control(ctx, control.render_sync(&line, reserved), &reply);
+}
+
+/// The machine shares the home directory and nothing else: a command whose working directory is
+/// elsewhere would run somewhere other than where it was asked to, so it is refused (and the
+/// machine is not even started for it).
+fn check_directory(diag: *Diag) Error!void {
+    assert(diag.code == null);
+    var home_storage: [constants.vm_path_bytes_max:0]u8 = undefined;
+    const home = files.shared_home(&home_storage) orelse return; // `forward_command` said so.
+    if (c.getcwd(&frames.directory, frames.directory.len) == null) return;
+    const directory = std.mem.sliceTo(&frames.directory, 0);
+    assert(directory.len > 0); // `getcwd` succeeded: at least "/".
+    if (files.is_inside(directory, home)) return;
+    var shown: [constants.path_bytes_max + 1]u8 = undefined;
+    diagnose.directory_not_shared(diag, text_util.sanitise(&shown, directory), home);
+    return error.Failed;
+}
+
+/// The text of the project's lock, read on the Mac for `project_pins_amd64`.
+var lock_text: [constants.lock_file_bytes_max + 1]u8 = undefined;
+
+/// A `build` or an `import` reads the project on the Mac first. A path it names outside the home
+/// is not in the machine (E1013), and a lock that pins linux/amd64 needs Rosetta (E1016), as
+/// `run --platform linux/amd64` does. Both are refused before the machine is asked.
+fn check_project(command: *const Command, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    if (!forward_commands.reads_project(command.words)) return;
+    var home_storage: [constants.vm_path_bytes_max:0]u8 = undefined;
+    const home = files.shared_home(&home_storage) orelse return; // `forward_command` said so.
+    if (c.getcwd(&frames.directory, frames.directory.len) == null) return;
+    const directory = std.mem.sliceTo(&frames.directory, 0);
+    var paths = forward_commands.project_paths(command.words);
+    while (paths.next()) |path| {
+        var resolved: [constants.path_bytes_max + 1]u8 = undefined;
+        // Too long to read: the Linux zbx refuses it in its own words.
+        const full = forward_commands.resolve(directory, path, &resolved) orelse continue;
+        if (files.is_inside(full, home)) continue;
+        var shown: [constants.path_bytes_max + 1]u8 = undefined;
+        diagnose.path_not_shared(diag, text_util.sanitise(&shown, full), home);
+        return error.Failed;
+    }
+    if (rosetta_refused("linux/amd64", vz.rosetta_state()) and project_pins_amd64(directory)) {
+        diagnose.rosetta_missing(diag);
+        return error.Failed;
+    }
+}
+
+/// True if the project's lock pins linux/amd64. The lock is the nearest `zbx.lock` from
+/// `directory` up, as the Linux zbx finds it (`lock_file.locate`); a lock that cannot be read
+/// counts as none here, and the Linux zbx says why.
+fn project_pins_amd64(directory: []const u8) bool {
+    assert(directory.len > 0);
+    assert(directory[0] == '/'); // From `getcwd`.
+    var path: [constants.vm_path_bytes_max]u8 = undefined;
+    var current = directory;
+    while (true) {
+        const parent = std.mem.trimEnd(u8, current, "/");
+        const lock_path = std.fmt.bufPrint(&path, "{s}/{s}\x00", .{
+            parent, lock_file.file_name,
+        }) catch return false;
+        if (files.exists(lock_path[0 .. lock_path.len - 1 :0])) {
+            const text = files.read_file(lock_path[0 .. lock_path.len - 1], &lock_text) catch {
+                return false;
+            };
+            return forward_commands.pins_amd64(text);
+        }
+        if (current.len <= 1) return false;
+        const slash = std.mem.lastIndexOfScalar(u8, current, '/') orelse return false;
+        current = if (slash == 0) "/" else current[0..slash];
+    }
+}
+
+/// Takes `--platform <linux/amd64|linux/arm64>` (before the `--` of a `run`) out of the command
+/// line: the Linux zbx in the machine does not know the option, and gets `ZBX_PLATFORM` instead.
+/// Refuses a platform Rosetta would be needed for when this Mac has none. A `build`, an `import`
+/// and an `inspect` keep the option, so that the Linux zbx refuses it as it does on Linux.
+fn take_platform(given: *const Command, platform: *?[]const u8, diag: *Diag) Error!Command {
+    assert(given.words.len <= constants.args_count_max);
+    assert(platform.* == null);
+    if (!forward_commands.takes_platform(given.words)) return given.*;
+    var kept: usize = 0;
+    var index: usize = 0;
+    var past_separator = false;
+    while (index < given.words.len) : (index += 1) {
+        const word = given.words[index];
+        if (!past_separator and std.mem.eql(u8, word, "--")) past_separator = true;
+        const is_option = !past_separator and std.mem.eql(u8, word, "--platform");
+        const joined = !past_separator and std.mem.startsWith(u8, word, "--platform=");
+        if (!is_option and !joined) {
+            frames.arguments[kept] = word;
+            kept += 1;
+            continue;
+        }
+        const value = if (joined) word["--platform=".len..] else blk: {
+            index += 1;
+            break :blk if (index < given.words.len) given.words[index] else "";
+        };
+        if (manifest.architecture_of_platform(value) == null) return bad_platform(diag, value);
+        platform.* = value;
+    }
+    if (platform.*) |value| {
+        if (rosetta_refused(value, vz.rosetta_state())) {
+            diagnose.rosetta_missing(diag);
+            return error.Failed;
+        }
+    }
+    assert(kept <= given.words.len);
+    return .{
+        .words = frames.arguments[0..kept],
+        .json = given.json,
+        .is_run = given.is_run,
+        .terminal = given.terminal,
+    };
+}
+
+/// A linux/amd64 command needs Rosetta in the machine; any other platform does not.
+fn rosetta_refused(platform: []const u8, state: vz.RosettaState) bool {
+    assert(platform.len <= constants.arg_bytes_max);
+    const architecture = manifest.architecture_of_platform(platform) orelse return false;
+    return architecture == .amd64 and state != .installed;
+}
+
+fn bad_platform(diag: *Diag, value: []const u8) Error {
+    assert(diag.code == null);
+    assert(manifest.architecture_of_platform(value) == null); // Only a value that failed gets here.
+    var shown: [constants.arg_echo_bytes_max]u8 = undefined;
+    diag.raise(.E0005);
+    diag.while_("reading the command line", .{});
+    diag.cause("--platform takes linux/amd64 or linux/arm64, not '{s}'", .{
+        text_util.sanitise(&shown, value),
+    });
+    diag.fix(.{ .sentence = "see the options:", .command = "zbx help" });
+    return error.Failed;
+}
+
+fn lost(command: *const Command, diag: *Diag, what: []const u8) Error {
+    assert(command.words.len > 0);
+    assert(what.len > 0);
+    diagnose.connection_lost(diag, what);
+    return error.Failed;
+}
+
+/// Standard input to the guest, its output and error to ours, signals both ways, until the exit
+/// frame (the command's code) or the end of the connection (a failure).
+fn relay(connection: i32, command: *const Command, diag: *Diag) Error!u8 {
+    assert(connection >= 0);
+    assert(signal_pipe[0] >= 0);
+    var data: [constants.forward_data_bytes_max]u8 = undefined;
+    var stdin_open = true;
+    var turns: u64 = 0;
+    const turns_max: u64 = 1 << 40; // A command that lives long still makes progress.
+    while (turns < turns_max) : (turns += 1) {
+        var entries = [3]c.pollfd{
+            .{ .fd = connection, .events = c.POLL.IN, .revents = 0 },
+            .{ .fd = signal_pipe[0], .events = c.POLL.IN, .revents = 0 },
+            .{ .fd = if (stdin_open) 0 else -1, .events = c.POLL.IN, .revents = 0 },
+        };
+        const ready = c.poll(&entries, entries.len, -1);
+        if (ready < 0) {
+            if (c.errno(ready) == .INTR) continue;
+            return lost(command, diag, "waiting for the guest failed");
+        }
+        assert(ready >= 1); // Without a timeout, poll returns for a reason.
+        assert(ready <= entries.len);
+        if (entries[1].revents != 0) send_signals(connection);
+        if (entries[2].revents != 0) stdin_open = forward_input(connection, &data);
+        if (entries[0].revents != 0) {
+            if (try take_frame(connection, command, diag)) |code| return code;
+        }
+    }
+    unreachable; // The loop returns from inside; its bound is only a guard.
+}
+
+fn send_signals(connection: i32) void {
+    assert(connection >= 0);
+    assert(signal_pipe[0] >= 0);
+    var bytes: [8]u8 = undefined;
+    const count = c.read(signal_pipe[0], &bytes, bytes.len);
+    if (count <= 0) return;
+    assert(count <= bytes.len);
+    for (bytes[0..@intCast(count)]) |number| {
+        if (number == @backingInt(c.SIG.WINCH)) {
+            var payload: [4]u8 = undefined;
+            const size = terminal_size();
+            protocol.render_window(&payload, size.rows, size.columns);
+            _ = send_frame(connection, .window, &payload);
+        } else if (guest_signal(number)) |linux_number| {
+            _ = send_frame(connection, .signal, &.{linux_number});
+        }
+    }
+}
+
+/// True while standard input has more.
+fn forward_input(connection: i32, data: []u8) bool {
+    assert(connection >= 0);
+    assert(data.len == constants.forward_data_bytes_max);
+    const count = c.read(0, data.ptr, data.len);
+    if (count < 0) return c.errno(count) == .INTR;
+    assert(count <= data.len);
+    if (count == 0) {
+        _ = send_frame(connection, .stdin_eof, &.{});
+        return false;
+    }
+    _ = send_frame(connection, .stdin, data[0..@intCast(count)]);
+    return true;
+}
+
+/// Reads one frame of the guest's; the command's exit code if it was the exit frame.
+fn take_frame(connection: i32, command: *const Command, diag: *Diag) Error!?u8 {
+    assert(connection >= 0);
+    assert(command.words.len > 0);
+    var header_bytes: [constants.forward_header_bytes]u8 = undefined;
+    if (!read_exact(connection, &header_bytes)) return lost(command, diag, "the guest hung up");
+    const header = protocol.parse_header(&header_bytes) orelse {
+        return lost(command, diag, "the guest sent something that is not a frame");
+    };
+    var payload: [constants.forward_data_bytes_max]u8 = undefined;
+    if (header.length > payload.len) {
+        return lost(command, diag, "the guest sent a frame that is too big");
+    }
+    assert(header.length <= constants.forward_data_bytes_max);
+    if (!read_exact(connection, payload[0..header.length])) {
+        return lost(command, diag, "the guest hung up");
+    }
+    switch (header.kind) {
+        .stdout => files.write_all(stdout_descriptor, payload[0..header.length]) catch {},
+        .stderr => files.write_all(2, payload[0..header.length]) catch {},
+        .disk_full => {
+            assert(header.length == 8); // parse_header fixed the size of the note.
+            disk_note = protocol.parse_disk_full(payload[0..8]);
+        },
+        .exit => {
+            assert(header.length == 2); // parse_header fixed the size of an exit frame.
+            if (disk_note) |note| {
+                const total = @as(u64, note.total_mib) << 20;
+                diagnose.store_disk_full(diag, total, @as(u64, note.free_mib) << 20);
+                return error.Failed;
+            }
+            const exit = protocol.parse_exit(payload[0..2]).?; // The header fixed the size at 2.
+            return if (exit.signaled) 128 +| exit.value else exit.value;
+        },
+        else => return lost(command, diag, "the guest sent a frame meant for the other side"),
+    }
+    return null;
+}
+
+fn read_exact(descriptor: i32, buffer: []u8) bool {
+    assert(descriptor >= 0);
+    var done: usize = 0;
+    while (done < buffer.len) {
+        const count = c.read(descriptor, buffer[done..].ptr, buffer.len - done);
+        if (count < 0 and c.errno(count) == .INTR) continue;
+        if (count <= 0) return false;
+        done += @intCast(count);
+    }
+    return true;
+}
+
+test "a command without a terminal is all pipes, and take_platform keeps the field" {
+    try std.testing.expect(!Streams.pipes.pty);
+    try std.testing.expect(Streams.pipes.stderr_pipe);
+    const given: Command = .{
+        .words = &.{"key"},
+        .json = false,
+        .is_run = false,
+        .terminal = false,
+    };
+    var platform: ?[]const u8 = null;
+    var diag: Diag = undefined;
+    diag.reset();
+    const kept = try take_platform(&given, &platform, &diag);
+    try std.testing.expect(!kept.terminal);
+}
+
+test "a Linux signal number is given for the signals zbx forwards, and none for the others" {
+    // Goal: macOS and Linux number SIGHUP, SIGINT, SIGQUIT and SIGTERM alike, but the table must
+    // not rely on it. Method: each caught signal.
+    try std.testing.expectEqual(@as(?u8, 2), guest_signal(@backingInt(c.SIG.INT)));
+    try std.testing.expectEqual(@as(?u8, 15), guest_signal(@backingInt(c.SIG.TERM)));
+    try std.testing.expectEqual(@as(?u8, 1), guest_signal(@backingInt(c.SIG.HUP)));
+    try std.testing.expectEqual(@as(?u8, 3), guest_signal(@backingInt(c.SIG.QUIT)));
+    try std.testing.expectEqual(@as(?u8, null), guest_signal(@backingInt(c.SIG.WINCH)));
+    try std.testing.expectEqual(@as(?u8, null), guest_signal(0));
+}
+
+test "a --publish value names a Mac address only when it has three parts" {
+    // Goal: the default is the loopback, 0.0.0.0 is only what the user wrote, and a form the
+    // Linux zbx refuses is left for it to refuse. Method: each form.
+    const plain = read_publication("8080:80").?;
+    try std.testing.expectEqual(control.Address.Kind.loopback, plain.address.kind);
+    try std.testing.expectEqual(@as(u16, 8080), plain.port);
+    try std.testing.expectEqualStrings("8080:80", plain.rest);
+    const all = read_publication("0.0.0.0:8080:80").?;
+    try std.testing.expectEqual(control.Address.Kind.any, all.address.kind);
+    try std.testing.expectEqualStrings("8080:80", all.rest);
+    const local = read_publication("127.0.0.1:8080:80").?;
+    try std.testing.expectEqual(control.Address.Kind.loopback, local.address.kind);
+    const named = read_publication("localhost:1:2").?;
+    try std.testing.expectEqual(control.Address.Kind.loopback, named.address.kind);
+    const one = read_publication("192.168.1.5:9000:90").?;
+    try std.testing.expectEqual(control.Address.Kind.v4, one.address.kind);
+    try std.testing.expectEqual(@as(u32, 0xc0a80105), one.address.v4);
+    const refused = [_][]const u8{
+        "",                  "80",                "a:b",
+        "8080:80:1",         "300.1.1.1:8080:80", "1.2.3:8080:80",
+        "1.2.3.4.5:8080:80", "01.2.3.4:8080:80",  "0.0.0.0:0:80",
+        "0.0.0.0:99999:80",  "host:8080:80",      "[::1]:8080:80",
+    };
+    for (refused) |value| try std.testing.expect(read_publication(value) == null);
+}
+
+test "only linux/amd64 needs Rosetta, and only when it is not installed" {
+    // Goal: the refusal for a Mac without Rosetta (which cannot be provoked on one that has it).
+    // Method: every platform against every state of Rosetta.
+    const states = [_]vz.RosettaState{ .not_supported, .not_installed, .installed };
+    for (states) |state| {
+        try std.testing.expectEqual(state != .installed, rosetta_refused("linux/amd64", state));
+        try std.testing.expect(!rosetta_refused("linux/arm64", state));
+        try std.testing.expect(!rosetta_refused("windows/amd64", state));
+    }
+}
+
+test "named environment: only -e NAME without a value, only allowed names" {
+    // Goal: `-e NAME` takes the Mac's variable; `-e NAME=value` and names the guest owns do not.
+    // Method: set a variable for this process and ask for it three ways.
+    _ = setenv("ZBX_TEST_FORWARD", "kept", 1);
+    var count: usize = 0;
+    add_named_environment(&count, &.{ "run", "-e", "ZBX_TEST_FORWARD", "-e", "A=b", "-e", "PATH" });
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings("ZBX_TEST_FORWARD=kept", frames.environment[0]);
+}

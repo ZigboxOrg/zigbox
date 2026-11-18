@@ -1,0 +1,5557 @@
+//! The diagnostic registry: every code zbx can show, declared once (DIAGNOSTICS.md, "Codes").
+//!
+//! A code is an enum tag, so naming one that is not declared does not compile. The `comptime`
+//! block below fails the build if the registry and the enum disagree, if a tag has the wrong
+//! prefix or kind letter for its severity, if a summary or explanation is missing or malformed,
+//! or if blame and severity contradict each other. The long explanations are what
+//! `zbx explain` prints offline.
+//!
+//! Numbering: `00xx` CLI and general, `01xx` host and doctor (one code per doctor check),
+//! `02xx` runtime and isolation, `03xx` limits, `04xx` store, `05xx` registry and pull,
+//! `06xx` network, `07xx` state, `08xx` build, `09xx` trust and policy, `10xx` the macOS VM. A
+//! code is never reused
+//! or renumbered.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const constants = @import("../constants.zig");
+const text_util = @import("../text.zig");
+
+pub const Severity = enum { @"error", warning, note, bug };
+
+/// Whose problem it is. This decides the exit code (see `exit_code`).
+pub const Blame = enum { user, environment, external, internal };
+
+/// Every code, in registry order: `registry[i].code` is the i-th tag. The tag is the part of the
+/// code after "ZBX-": a kind letter (E error, W warning, B bug) and four digits.
+pub const Code = enum(u16) {
+    E0001,
+    E0002,
+    E0003,
+    E0004,
+    E0005,
+    E0006,
+    E0007,
+    E0008,
+    E0009,
+    E0010,
+    E0011,
+    E0012,
+    E0013,
+    E0014,
+    E0015,
+    E0101,
+    E0102,
+    E0103,
+    E0104,
+    E0105,
+    E0106,
+    W0101,
+    W0102,
+    E0201,
+    E0202,
+    E0203,
+    E0204,
+    E0205,
+    E0206,
+    E0207,
+    E0208,
+    E0209,
+    E0210,
+    E0211,
+    E0212,
+    E0213,
+    E0214,
+    E0215,
+    E0216,
+    E0217,
+    E0218,
+    E0219,
+    E0220,
+    E0221,
+    E0222,
+    E0223,
+    E0224,
+    E0225,
+    E0226,
+    E0227,
+    E0228,
+    E0229,
+    E0230,
+    W0201,
+    W0202,
+    W0203,
+    W0204,
+    W0205,
+    W0206,
+    W0207,
+    W0208,
+    W0209,
+    E0301,
+    E0302,
+    E0303,
+    E0304,
+    E0305,
+    E0306,
+    E0307,
+    E0308,
+    E0309,
+    E0310,
+    E0311,
+    E0312,
+    E0313,
+    E0314,
+    E0315,
+    E0316,
+    E0317,
+    E0318,
+    E0319,
+    E0320,
+    E0321,
+    E0322,
+    E0323,
+    W0301,
+    W0302,
+    E0401,
+    E0402,
+    E0403,
+    E0404,
+    E0405,
+    E0406,
+    E0410,
+    E0411,
+    E0412,
+    E0413,
+    E0414,
+    E0415,
+    E0416,
+    E0417,
+    E0418,
+    E0419,
+    E0420,
+    E0421,
+    E0422,
+    E0423,
+    E0424,
+    E0425,
+    E0426,
+    E0427,
+    E0428,
+    E0429,
+    E0430,
+    E0431,
+    E0432,
+    E0433,
+    E0434,
+    E0435,
+    E0436,
+    E0437,
+    W0410,
+    W0411,
+    W0412,
+    W0413,
+    E0501,
+    E0502,
+    E0503,
+    E0504,
+    E0505,
+    E0506,
+    E0507,
+    E0508,
+    E0509,
+    E0510,
+    E0511,
+    E0512,
+    E0513,
+    E0514,
+    E0515,
+    E0516,
+    E0517,
+    E0518,
+    E0519,
+    E0520,
+    E0521,
+    E0522,
+    E0523,
+    E0524,
+    E0525,
+    E0526,
+    E0527,
+    E0528,
+    E0529,
+    E0530,
+    E0531,
+    E0532,
+    E0533,
+    E0534,
+    E0535,
+    E0550,
+    E0551,
+    E0552,
+    E0553,
+    E0554,
+    E0555,
+    E0556,
+    E0557,
+    E0558,
+    E0560,
+    E0561,
+    E0562,
+    E0563,
+    E0564,
+    E0565,
+    E0566,
+    E0567,
+    E0568,
+    E0569,
+    E0570,
+    E0571,
+    E0572,
+    W0501,
+    W0502,
+    W0503,
+    W0504,
+    W0551,
+    W0552,
+    E0600,
+    E0601,
+    E0602,
+    E0603,
+    E0604,
+    E0605,
+    E0606,
+    E0607,
+    E0608,
+    E0609,
+    E0610,
+    E0611,
+    E0612,
+    E0701,
+    E0702,
+    E0703,
+    E0704,
+    E0705,
+    E0706,
+    E0707,
+    E0708,
+    E0709,
+    E0710,
+    E0711,
+    E0712,
+    E0713,
+    E0714,
+    E0715,
+    E0716,
+    W0701,
+    W0702,
+    W0703,
+    E0801,
+    E0802,
+    E0803,
+    E0804,
+    E0805,
+    E0806,
+    E0807,
+    E0808,
+    W0801,
+    E0817,
+    E0818,
+    E0820,
+    E0821,
+    W0802,
+    E0810,
+    E0811,
+    E0812,
+    E0813,
+    E0814,
+    E0815,
+    E0816,
+    W0810,
+    W0811,
+    // M9 slice 3c (output pins). Slice 3b adds its fetch codes here too, without reordering.
+    E0822,
+    W0803,
+    E0901,
+    E0902,
+    E0903,
+    E0904,
+    E0905,
+    E0906,
+    E0907,
+    E0908,
+    E0909,
+    E0910,
+    E0911,
+    W0901,
+    W0902,
+    W0903,
+    E1001,
+    E1002,
+    E1003,
+    E1004,
+    E1005,
+    E1006,
+    E1007,
+    E1008,
+    W1001,
+    E1009,
+    E1010,
+    E1011,
+    W1002,
+    E1012,
+    E1013,
+    E1014,
+    E1015,
+    E1016,
+    E1017,
+    W1003,
+    W1201,
+    E1201,
+    E1202,
+    W1202,
+    E1203,
+    E1206,
+    E1207,
+    E1208,
+    W1203,
+    B0001,
+};
+
+pub const Entry = struct {
+    code: Code,
+    severity: Severity,
+    blame: Blame,
+    /// One line, present tense, no trailing period. Fixed per code: what varies goes in causes.
+    summary: []const u8,
+    /// Printed by `zbx explain`: what it means, why it happens, what to do. Hard-wrapped.
+    explanation: []const u8,
+};
+
+pub const registry = [_]Entry{
+    .{
+        .code = .E0001,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "unknown command",
+        .explanation =
+        \\zbx was given a first word that is not one of its commands. Command names
+        \\are matched exactly: "Help" and "version" are not "help" and "--version".
+        \\
+        \\Run "zbx help" for the list of commands. Options such as --verbose may come
+        \\before or after the command.
+        ,
+    },
+    .{
+        .code = .E0002,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no command given",
+        .explanation =
+        \\zbx needs a command and was given none, only options or nothing at all.
+        \\
+        \\Run "zbx help" for the list of commands, or "zbx doctor" to check whether
+        \\this machine can run zbx.
+        ,
+    },
+    .{
+        .code = .E0003,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "unexpected arguments",
+        .explanation =
+        \\The command takes fewer arguments than it was given. "doctor", "help" and
+        \\"--version" take none; "explain" takes exactly one code; "run" takes its
+        \\command only after "--".
+        \\
+        \\Some options of "run" exclude each other: --rootfs and a tree, and
+        \\--publish with --net none or --net host (a forward needs the network of
+        \\its own that pasta gives, --net user, which --publish implies).
+        \\
+        \\Remove the extra arguments. The message names the first one zbx ignored.
+        ,
+    },
+    .{
+        .code = .E0004,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "unknown option",
+        .explanation =
+        \\An argument starting with a dash is not an option zbx knows. The options are
+        \\-v and --verbose, and --output text or --output json (also written
+        \\--output=json); "run" also takes --rootfs and --name. "--help" and
+        \\"--version" are commands, not options.
+        \\
+        \\Run "zbx help" for the full list.
+        ,
+    },
+    .{
+        .code = .E0005,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "option has a missing or invalid value",
+        .explanation =
+        \\--output needs a value, and the only values are "text" and "json".
+        \\--net takes none, host or user. --rootfs and --name need one too, a
+        \\directory and a name; --publish takes HOST:CONTAINER (ZBX-E0600 says
+        \\what is wrong with one). Either the value is missing (the option was
+        \\last, or empty) or it is wrong.
+        \\
+        \\Write --output json or --output=json. With json, every failure is written
+        \\to stderr as one JSON object per line, for scripts and CI.
+        ,
+    },
+    .{
+        .code = .E0006,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "missing argument",
+        .explanation =
+        \\The command needs an argument and was given none. "zbx explain" needs the
+        \\code of a diagnostic, for example E0001 or ZBX-E0001; "zbx run" needs
+        \\--rootfs <dir> and, after "--", the command to run.
+        \\
+        \\The code is printed in the first line of every diagnostic, between
+        \\"error[" and "]".
+        ,
+    },
+    .{
+        .code = .E0007,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "unknown diagnostic code",
+        .explanation =
+        \\"zbx explain" was given a code that zbx does not have. Codes are a letter
+        \\and four digits, optionally with the "ZBX-" prefix: E0001, ZBX-E0001. Codes
+        \\that start with "ZC-" belong to Zigcube, and "zcube explain" shows those.
+        \\
+        \\Copy the code from the first line of the diagnostic you saw.
+        ,
+    },
+    .{
+        .code = .E0008,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "command line exceeds the supported limits",
+        .explanation =
+        \\zbx accepts at most 64 arguments of at most 4096 bytes each, and refuses
+        \\more instead of cutting them, so that a command is never silently
+        \\misread. The command after "run --" has its own limits: 48 words of at
+        \\most 4000 bytes, 32 KiB with the environment. A working directory is an
+        \\absolute path without "..".
+        \\
+        \\Pass fewer or shorter arguments. For long lists, use a file when the
+        \\command supports one.
+        ,
+    },
+    .{
+        .code = .E0009,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't write output",
+        .explanation =
+        \\zbx could not write to its standard output or standard error. The usual
+        \\causes are a full disk behind a redirect, a closed pipe, or a terminal that
+        \\has gone away. The command itself may have worked.
+        \\
+        \\Free space or fix the redirect, then run the command again. If stderr is
+        \\what failed, this message could not be shown, and only the exit code (2)
+        \\tells you.
+        ,
+    },
+    .{
+        .code = .E0010,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "can't use this -e option",
+        .explanation =
+        \\"zbx run -e NAME=VALUE" sets a variable in the container, and "-e NAME"
+        \\copies it from zbx's own environment. The option you gave is neither: the
+        \\name must be a letter or underscore followed by letters, digits and
+        \\underscores (at most 64 of them), a name may be set once, and a run takes
+        \\at most 16 of them. The image's own variables and yours together are at
+        \\most 64.
+        \\
+        \\zbx never prints or stores a value, so the message names the variable only.
+        \\The run record, "zbx ps" and a bundle list the names that -e set, never
+        \\what they were set to. Remember that your shell, and the process list of
+        \\this machine while zbx runs, can still show the command line: "-e NAME"
+        \\with the value in the environment keeps it off both.
+        ,
+    },
+    .{
+        .code = .E0011,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "-e names a variable that is not set",
+        .explanation =
+        \\"-e NAME", with no "=", copies the variable NAME from the environment of
+        \\the zbx command into the container. NAME is not set there (or its value is
+        \\longer than 4096 bytes, more than a container can take), so there is
+        \\nothing to copy and zbx did not start the container.
+        \\
+        \\Give the value on the command line ("-e NAME=VALUE"), or set the variable
+        \\for this one command: NAME=VALUE zbx run -e NAME ... A value is never
+        \\printed or stored by zbx.
+        ,
+    },
+    .{
+        .code = .E0012,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not a valid --tmpfs, --bind or --secret value",
+        .explanation =
+        \\--tmpfs takes PATH or PATH:SIZE, an empty tmpfs gone at exit (64 MiB
+        \\without a size; SIZE is bytes, or a number with k, m or g, from 4096
+        \\bytes to 1 TiB). --bind takes HOST:PATH, a host directory or file
+        \\mounted read-only. --secret takes HOST_FILE:PATH, a host file copied
+        \\into the container's memory, mode 0400, read-only, owned by the
+        \\container's root.
+        \\
+        \\Every path is absolute, with parts that are names (no empty, "." or ".."
+        \\part), at most 256 bytes, and holds no ':', space or control character.
+        \\A path in the container may not be "/", nor /proc, /sys, /dev or below
+        \\them, nor /etc/hosts, /etc/hostname or /etc/resolv.conf: zbx mounts
+        \\those itself. The cause names the part that is wrong.
+        \\
+        \\    zbx run --tmpfs /scratch:128m --bind /srv/site:/srv nginx
+        ,
+    },
+    .{
+        .code = .E0013,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "mounts that cannot go together",
+        .explanation =
+        \\One run's mounts (--state, --tmpfs, --bind, --mount, --secret) each have a
+        \\path in the container, and no path may be the same as another's, inside
+        \\it, or hold it: a mount inside another would be made in the outer one.
+        \\At most 8 of --tmpfs, --bind, --mount and --secret may be given in one
+        \\run, and 8 --state.
+        \\
+        \\Give each mount its own place, or drop one.
+        ,
+    },
+    .{
+        .code = .E0014,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not a valid --mount value",
+        .explanation =
+        \\--mount takes HOST:PATH: a directory or file on the host, mounted
+        \\writable at PATH in the container. HOST may be relative to the working
+        \\directory, and may hold "." and ".." parts, since where it lands is judged
+        \\after every symbolic link is followed (see ZBX-E0212). It holds no ':',
+        \\space or control character and is at most 256 bytes.
+        \\
+        \\PATH is absolute, with parts that are names, at most 256 bytes. It may not
+        \\be "/", nor /proc, /sys, /dev or below them, nor /etc/hosts, /etc/hostname
+        \\or /etc/resolv.conf: zbx mounts those itself. The cause names the part that
+        \\is wrong.
+        \\
+        \\    zbx run --mount ./site:/srv python:3.12-slim
+        ,
+    },
+    .{
+        .code = .E0015,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not a valid --user value",
+        .explanation =
+        \\--user takes USER or USER:GROUP, each a name or a number, and replaces the
+        \\user the image says it runs as. Names are looked up in the image's own
+        \\/etc/passwd and /etc/group, so --user needs an image (a name that zbx pull
+        \\made); a --rootfs directory or a bare tree has no image configuration to
+        \\replace. The value is at most 256 bytes, with no space or control character
+        \\and no empty part.
+        \\
+        \\    zbx run --user 0 --mount ./site:/srv python:3.12-slim
+        ,
+    },
+    .{
+        .code = .E0101,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't create a user namespace",
+        .explanation =
+        \\zbx runs containers without root, and that needs user namespaces. The kernel
+        \\refused to create one for this user, or a setting forbids it.
+        \\
+        \\Common causes: user.max_user_namespaces is 0;
+        \\kernel.unprivileged_userns_clone is 0 (Debian);
+        \\kernel.apparmor_restrict_unprivileged_userns is 1 (the Ubuntu 24.04
+        \\default), which blocks unconfined programs; or a security policy or a
+        \\seccomp filter denies the call although the settings allow it.
+        \\
+        \\The diagnostic names the cause that applies and prints the command that
+        \\fixes it. If the check could not run at all (an unreadable file, a probe
+        \\that timed out or was killed), the cause says so; fix that first. Then run
+        \\"zbx doctor".
+        ,
+    },
+    .{
+        .code = .E0102,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "kernel version is unsupported or unknown",
+        .explanation =
+        \\zbx needs Linux 5.15 or newer. Overlayfs mounts inside user namespaces
+        \\arrived in 5.11, and 5.15 is the oldest long-term kernel that has them.
+        \\
+        \\This is also reported when the kernel release cannot be read or is not a
+        \\version number zbx can parse, because zbx does not guess. The cause says
+        \\which of the three happened.
+        \\
+        \\Upgrade the kernel, or run zbx on a host with a supported one. Containers
+        \\share the host's kernel, so inside a container the host's version counts.
+        ,
+    },
+    .{
+        .code = .E0103,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "cgroup v2 is not set up for this user",
+        .explanation =
+        \\zbx limits a container's cpu, memory and process count through cgroup v2,
+        \\and asks systemd to create the container's cgroup under the user's own
+        \\manager, user@UID.service. That needs cgroup v2 mounted at /sys/fs/cgroup, a
+        \\systemd user manager for the user, and the cpu, memory and pids controllers
+        \\delegated to it.
+        \\
+        \\The diagnostic says which of these is missing. A cgroup v1 or hybrid host
+        \\needs systemd.unified_cgroup_hierarchy=1 on the kernel command line. Missing
+        \\controllers are fixed with a Delegate= drop-in for user@.service, a daemon-
+        \\reload and a fresh login. If the check could not run, the cause says why.
+        \\
+        \\The check also asks the user's D-Bus for the manager's version: zbx makes
+        \\each container's scope there, so a missing bus socket, a bus that refuses
+        \\the user, or a bus with no systemd on it fails the check too (ZBX-E0301
+        \\to ZBX-E0304 are what a run reports for the same causes).
+        ,
+    },
+    .{
+        .code = .E0104,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't mount overlayfs in a user namespace",
+        .explanation =
+        \\zbx builds a container's root file system with overlayfs, mounted by an
+        \\unprivileged user inside a user and mount namespace. The doctor tried
+        \\exactly that in a scratch directory and it failed.
+        \\
+        \\Causes: the overlay module is not loaded or not built in, the kernel is
+        \\older than 5.11, a security policy forbids the mount, or the user namespace
+        \\itself could not be created (fix ZBX-E0101 first: the same permission is
+        \\needed).
+        \\
+        \\Try "sudo modprobe overlay", then run "zbx doctor" again. If the check could
+        \\not run, the cause says why.
+        ,
+    },
+    .{
+        .code = .E0105,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "uid and gid mapping is not set up",
+        .explanation =
+        \\A rootless container maps its users onto a range of ids that the host user
+        \\owns. That needs a range of at least 65536 subordinate ids for the user in
+        \\both /etc/subuid and /etc/subgid, and the setuid helpers newuidmap and
+        \\newgidmap (package uidmap, or shadow-utils on Fedora), which write the maps.
+        \\
+        \\The diagnostic lists what is missing. Ranges are matched by user name or by
+        \\numeric uid. The root user normally has no range, so run zbx as an ordinary
+        \\user. If a file could not be read, the cause says so.
+        ,
+    },
+    .{
+        .code = .E0106,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "seccomp is not available",
+        .explanation =
+        \\zbx confines container processes with a seccomp filter. The kernel must be
+        \\built with CONFIG_SECCOMP and CONFIG_SECCOMP_FILTER, and must report it the
+        \\same way in the Seccomp: line of /proc/self/status and through
+        \\prctl(PR_GET_SECCOMP).
+        \\
+        \\Use a kernel with seccomp enabled; every mainstream distribution kernel has
+        \\it. If the two answers disagree, run "zbx doctor" again, and report it if it
+        \\repeats. If a file could not be read, the cause says so.
+        ,
+    },
+    .{
+        .code = .W0101,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "user namespaces work, but only for unconfined users",
+        .explanation =
+        \\zbx doctor created a user namespace, so zbx works for this process. The host
+        \\also sets kernel.apparmor_restrict_unprivileged_userns = 1, which refuses
+        \\the same call to processes that no AppArmor profile confines. The check
+        \\passed because this process runs under a profile that allows it.
+        \\
+        \\Run from a terminal or another service, zbx may meet the refusal as
+        \\ZBX-E0101. To allow user namespaces system-wide, set the sysctl to 0 as
+        \\root; "zbx doctor" shows the same host as a failure when this process is
+        \\not confined by a permissive profile.
+        ,
+    },
+    .{
+        .code = .W0102,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "--net user is not available",
+        .explanation =
+        \\--net user and --publish connect a container to the network through pasta
+        \\(from the passt project), and the net check of zbx doctor found it missing,
+        \\unable to report its version, or older than zbx can use. Nothing else
+        \\depends on it: --net none (the default) and --net host run without pasta,
+        \\so this is a warning and "zbx doctor" still exits 0.
+        \\
+        \\Install a current passt (Debian and Ubuntu: apt install passt; Fedora:
+        \\dnf install passt). A run that asks for --net user without it is refused
+        \\as ZBX-E0601 (missing) or ZBX-E0602 (too old) before anything starts.
+        ,
+    },
+    .{
+        .code = .E0201,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the rootfs is missing or not a directory",
+        .explanation =
+        \\"zbx run" needs a directory to use as the container's root file system,
+        \\and the path given to --rootfs is not one: it does not exist, it is a
+        \\file, or it cannot be read.
+        \\
+        \\In this version the root file system is a directory that you unpack
+        \\yourself. An Alpine minirootfs works:
+        \\
+        \\  mkdir alpine
+        \\  tar -xzf alpine-minirootfs-3.20.10-x86_64.tar.gz -C alpine
+        \\  zbx run --rootfs ./alpine -- /bin/sh
+        \\
+        \\The container reads and writes this directory in place, so what it
+        \\changes stays there. Unpack it as the user who runs zbx.
+        ,
+    },
+    .{
+        .code = .E0202,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "can't run the command in the rootfs",
+        .explanation =
+        \\The container was set up, but its command could not be run inside the
+        \\root file system. The cause says which: the file is not there, it is not
+        \\executable, or it is not a program for this machine's CPU.
+        \\
+        \\A command without a slash is looked up in the container's PATH, which is
+        \\/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin inside the
+        \\rootfs, not in the host's. The host's environment is not passed on.
+        \\A dynamically linked program also needs its libc and loader inside the
+        \\rootfs; a missing loader is reported as a missing file.
+        \\
+        \\Give the program's full path inside the rootfs after the "--", for
+        \\example /bin/sh.
+        ,
+    },
+    .{
+        .code = .E0203,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't create the container's namespaces",
+        .explanation =
+        \\zbx runs a container in new user, mount, PID, UTS, IPC and network
+        \\namespaces and writes the id maps of the user namespace. The kernel
+        \\refused one of these, or a setting forbids it, so the container was not
+        \\started.
+        \\
+        \\The cause names what failed. The usual reason is a restriction on
+        \\unprivileged user namespaces: user.max_user_namespaces is 0,
+        \\kernel.unprivileged_userns_clone is 0 (Debian), AppArmor restricts them
+        \\(the Ubuntu 24.04 default), or a seccomp filter around zbx, as inside
+        \\another container, blocks clone3. "zbx doctor" runs the same check and
+        \\prints the command that fixes the setting (ZBX-E0101).
+        \\
+        \\A refused id map means the user namespace exists but could not be mapped.
+        \\Without the helper newuidmap only the user's own id can be mapped.
+        ,
+    },
+    .{
+        .code = .E0204,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "writing the id maps failed",
+        .explanation =
+        \\A container with a full range of ids has its uid and gid maps written by
+        \\the setuid helpers newuidmap and newgidmap, because only they may map ids
+        \\the user does not own. A helper could not be run, or refused the map.
+        \\
+        \\The cause names the helper and how it ended, with what it printed. A
+        \\refusal usually means the range in /etc/subuid or /etc/subgid does not
+        \\cover the ids zbx asked for, or the helper is not setuid root. "zbx doctor"
+        \\checks both (ZBX-E0105).
+        \\
+        \\zbx does not fall back to a single-id map here: it falls back only when
+        \\the helpers or ranges are missing before the container starts, and says so
+        \\(ZBX-W0201).
+        ,
+    },
+    .{
+        .code = .E0205,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a container setup step failed",
+        .explanation =
+        \\zbx sets a container up in steps: the mounts, the minimal /dev, moving
+        \\into the new root with pivot_root, the hostname. The kernel refused one
+        \\of them, so the container was not started and nothing it mounted is
+        \\left on the host.
+        \\
+        \\The cause names the step and the kernel's reason. Mounts inside a user
+        \\namespace are refused when the host forbids them: a security policy
+        \\(AppArmor, SELinux, seccomp), or running zbx inside another container,
+        \\which hides parts of /proc. "zbx doctor" checks what this host allows.
+        \\
+        \\Rerun with --verbose to see the step's place in the plan. If the reason
+        \\fits none of these, report it with the output.
+        ,
+    },
+    .{
+        .code = .E0206,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "invalid container name",
+        .explanation =
+        \\A container's name is also its hostname, so it must be a valid hostname
+        \\label: one to 63 characters, lowercase letters, digits and '-', and not
+        \\starting or ending with '-'.
+        \\
+        \\Leave --name out and zbx picks one: zbx- and six hex digits.
+        ,
+    },
+    .{
+        .code = .E0207,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't restrict the container's capabilities",
+        .explanation =
+        \\Just before the command starts, zbx drops every capability the container
+        \\does not keep: from the bounding set, then from the effective, permitted
+        \\and inheritable sets, and it empties the ambient set. The list that is
+        \\kept is Docker's default without NET_RAW and MKNOD, and has no SYS_ADMIN
+        \\(src/runtime/policy/capabilities.zon). The kernel refused one of those
+        \\calls, so the container was not started: a container with more rights
+        \\than intended is never run.
+        \\
+        \\The cause names the step and the kernel's reason. This is unusual: the
+        \\child is root of its own user namespace and holds these capabilities
+        \\there. A security module that restricts capability changes, or a very
+        \\old kernel, is the likely reason.
+        ,
+    },
+    .{
+        .code = .E0208,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't install the container's seccomp filter",
+        .explanation =
+        \\The last thing zbx does before the command starts is set no_new_privs and
+        \\install a seccomp filter (src/runtime/policy/seccomp.zon): a list of the
+        \\system calls the container may make, which fails every other with EPERM.
+        \\The kernel refused one of the two calls, so the container was not
+        \\started: a container without its filter is never run.
+        \\
+        \\The cause names the step and the kernel's reason. The kernel may lack
+        \\seccomp filters (CONFIG_SECCOMP_FILTER), or a policy may forbid
+        \\installing one. "zbx doctor" checks that this host has seccomp (ZBX-E0106).
+        ,
+    },
+    .{
+        .code = .E0209,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't set up the read-only rootfs",
+        .explanation =
+        \\--read-only mounts a tmpfs on the rootfs's /tmp and /run, then remounts
+        \\the rootfs read-only. One of those steps failed, so the container was not
+        \\started.
+        \\
+        \\When the cause says /tmp or /run could not be made, the rootfs does not
+        \\have the directory and is not writable by this user, so zbx cannot make
+        \\the mount point: make both directories as the rootfs's owner (mkdir -p
+        \\<rootfs>/tmp <rootfs>/run) and run again. Otherwise the kernel refused the
+        \\mount or the remount; the cause says why.
+        ,
+    },
+    .{
+        .code = .E0210,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --bind or --secret source can't be used",
+        .explanation =
+        \\A --bind source is a directory or a regular file on the host, and a
+        \\--secret source is one regular file. The cause says what is wrong with
+        \\the path you gave: it does not exist, cannot be looked at, or is another
+        \\kind of file (a socket, a device). zbx never makes a source: a bind is
+        \\read-only, and what a container writes belongs in a state volume
+        \\(--state).
+        \\
+        \\Check the path, or make the file first, then run again.
+        ,
+    },
+    .{
+        .code = .E0211,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't set up a --tmpfs, --bind or --secret mount",
+        .explanation =
+        \\A mount is made before the container's command starts. A bind or a
+        \\secret is staged in the container's own /dev, made read-only, and moved
+        \\onto its path once the container's root is entered (so the path is read
+        \\as the container reads it); a tmpfs is mounted on its path. One of those
+        \\steps failed; the cause names it and what the kernel said.
+        \\
+        \\A secret is copied by the container's root, so the file must be readable
+        \\by you and at most 65536 bytes. With --read-only the path must already
+        \\exist in the image: nothing can be made in a read-only root. zbx doctor
+        \\shows what this host allows.
+        ,
+    },
+    .{
+        .code = .E0212,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --mount source is outside the project",
+        .explanation =
+        \\A writable mount is allowed only for the project directory and what is
+        \\inside it, so that a container you run in a project cannot write anywhere
+        \\else. The project directory is the one that holds the nearest zbx.lock up
+        \\from the working directory, else the working directory itself.
+        \\
+        \\The source is resolved first, with every symbolic link followed, and the
+        \\result is what is compared: "../other" is outside, and so is a link inside
+        \\the project that points out of it, and so is "/". When the project
+        \\directory is "/" (zbx run from the root of the file system) no writable
+        \\mount is allowed.
+        \\
+        \\Run zbx from the project's directory, or move what you need into it. For a
+        \\directory outside the project that the container only reads, use --bind.
+        ,
+    },
+    .{
+        .code = .E0213,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --mount needs the container to run as root",
+        .explanation =
+        \\The container's root is you: its user namespace maps root to your user id.
+        \\What it writes through a --mount is therefore yours. Any other user of the
+        \\container is mapped to an id from your subordinate range, and a file it
+        \\wrote in your project would belong to an id that is not yours, which you
+        \\could not then edit or remove. So zbx refuses a --mount when the run's user
+        \\(the image's user, or --user) is not root, user and group both 0, and makes
+        \\nothing.
+        \\
+        \\Run the image as root with --user 0, or give the container the directory
+        \\read-only with --bind.
+        ,
+    },
+    .{
+        .code = .E0214,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --mount source can't be used",
+        .explanation =
+        \\A --mount source is a directory or a regular file on the host, below the
+        \\project directory. The cause says what is wrong with the path you gave: it
+        \\does not exist, cannot be looked at, goes through too many symbolic links,
+        \\is another kind of file (a socket, a device), or, once its links are
+        \\followed, is longer than 256 bytes or holds a ':', space or control
+        \\character. It can also say the project directory itself could not be found.
+        \\zbx never makes a source: make it first, then run again.
+        ,
+    },
+    .{
+        .code = .E0215,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't set up a --mount",
+        .explanation =
+        \\A --mount is made before the container's command starts: the host path is
+        \\bound in the container's own /dev, and moved onto its path once the
+        \\container's root is entered (so the path is read as the container reads
+        \\it). One of those steps failed; the cause names it and what the kernel
+        \\said.
+        \\
+        \\With --read-only the path must already exist in the image: nothing can be
+        \\made in a read-only root. zbx doctor shows what this host allows.
+        ,
+    },
+    .{
+        .code = .E0216,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the --user is not in the image",
+        .explanation =
+        \\--user names a user or a group, and the image's own /etc/passwd or
+        \\/etc/group has no such name. A number needs no lookup and is used as it is.
+        \\The message names the image and the file looked in.
+        \\
+        \\Use a name the image has, or a number. Nothing was started.
+        ,
+    },
+    .{
+        .code = .E0217,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the container has no log",
+        .explanation =
+        \\zbx logs reads the file zbx keeps of what a container wrote to its standard
+        \\output and error (<state>/zbx/logs/<name>.log). The container has a run
+        \\record and no log. It ran before logs were kept (zbx 0.1 to M6), its log
+        \\could not be written (a warning, ZBX-W0204, said so when it started), or the
+        \\log was removed.
+        \\
+        \\Nothing it wrote can be shown. Runs started from now on keep their logs.
+        ,
+    },
+    .{
+        .code = .E0218,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't read the container's log",
+        .explanation =
+        \\The log of the container exists and zbx cannot use it: the file cannot be
+        \\opened or read, it is not a zbx log, or it was written by a newer zbx than
+        \\this one.
+        \\
+        \\The cause says which. A log from a newer zbx is read by that zbx, or left
+        \\alone; one that is not a log was not written by zbx, and "zbx logs" does not
+        \\guess at it. The path is in the message.
+        ,
+    },
+    .{
+        .code = .E0219,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "bad value for a logs option",
+        .explanation =
+        \\--tail takes a whole number of lines from 0 to one million, and --stream
+        \\takes stdout or stderr. The message names the option and the value it was
+        \\given. Nothing was read.
+        ,
+    },
+    .{
+        .code = .E0220,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the container is not running",
+        .explanation =
+        \\zbx exec runs a command inside a container that is running: it joins the
+        \\container's namespaces, which exist only while its first process lives. The
+        \\container named has a run record and is not running: it ended (the message
+        \\says how), or it was lost (zbx lost track of it).
+        \\
+        \\Start it again with zbx run, then exec into it. "zbx ps --all" lists every
+        \\container and its state.
+        ,
+    },
+    .{
+        .code = .E0221,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't join the running container",
+        .explanation =
+        \\zbx exec reads the container's environment from its first process, opens its
+        \\namespaces (/proc/<pid>/ns), and in a child joins them with setns: the user
+        \\namespace first (zbx made it, so this needs no privilege), then the IPC,
+        \\UTS, network, PID and mount namespaces, and forks the command into the PID
+        \\namespace. One of these was refused.
+        \\
+        \\The cause names the step and the kernel's reason. A container that ended at
+        \\that moment is the usual one (try again: zbx ps shows it). A security policy
+        \\that forbids setns, or a /proc that hides other processes (hidepid), is the
+        \\other. Nothing was started.
+        ,
+    },
+    .{
+        .code = .E0222,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't put the command in the container's cgroup",
+        .explanation =
+        \\The command zbx exec starts is put in the container's cgroup before it runs,
+        \\so that it counts against the container's memory and process limits. With
+        \\systemd, the user manager moves it into the container's scope
+        \\(AttachProcessesToUnit, systemd 238 and later); without, zbx writes its pid
+        \\to the container's cgroup.procs. That was refused.
+        \\
+        \\zbx never runs the command outside the container's limits: nothing was
+        \\started. The cause says what the manager or the kernel answered; zbx doctor
+        \\shows the cgroup setup.
+        ,
+    },
+    .{
+        .code = .E0223,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the working directory is not in the container",
+        .explanation =
+        \\zbx exec starts the command in the container's working directory, or in the
+        \\one --workdir names. That directory is not there in the container (or is not
+        \\a directory, or cannot be entered). Unlike zbx run, exec makes nothing in a
+        \\running container.
+        \\
+        \\Name a directory the container has, or make it first:
+        \\  zbx exec web -- mkdir -p /work
+        ,
+    },
+    .{
+        .code = .E0224,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't give the command a terminal",
+        .explanation =
+        \\When zbx's standard input and output are both a terminal, zbx exec gives the
+        \\command a pseudo-terminal of its own (/dev/ptmx), with the size of zbx's,
+        \\and puts zbx's terminal in raw mode so that every key reaches the command.
+        \\One of these steps failed.
+        \\
+        \\Run without a terminal instead: give zbx exec a pipe or a file as its input
+        \\(zbx exec web -- cmd < /dev/null), and the command's streams are zbx's own.
+        ,
+    },
+    .{
+        .code = .E0225,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "can't bind that device into the container",
+        .explanation =
+        \\--device /dev/<path> binds a device node of the host into the container's
+        \\/dev at the same path. zbx takes a character device below /dev that you can
+        \\open for reading and writing, given once; at most 16 per run, and never one
+        \\of the devices every container has (null, zero, full, random, urandom, tty).
+        \\
+        \\A rootless container has no device cgroup: the host's file permissions alone
+        \\decide who may open a node. zbx therefore looks at the node first, and
+        \\refuses one it cannot open, naming its mode and group, rather than letting
+        \\the workload fail later. It never changes a node's mode or group.
+        \\
+        \\A run with devices keeps your supplementary groups, so a node that is 0660
+        \\root:render opens for a member of "render".
+        \\
+        \\--gpu takes "all" or "dri" and nothing else; "--device gpu=all" is not an
+        \\alias for it. A --gpu dri that finds more render nodes than a run takes is
+        \\refused with this code too: name the nodes you want instead.
+        ,
+    },
+    .{
+        .code = .E0226,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't use a CDI spec",
+        .explanation =
+        \\--device vendor.com/class=name asks for a device that a CDI spec describes.
+        \\zbx reads the JSON specs in $XDG_CONFIG_HOME/cdi (or ~/.config/cdi),
+        \\/var/run/cdi and /etc/cdi, in that order; the first directory that has a
+        \\device wins. The specs are cdiVersion 0.3.0 to 0.9.x, each at most 64 KiB,
+        \\at most 64 files in all. zbx refuses one it cannot use: unreadable, not
+        \\valid JSON, over a bound of the parser, with a field of the wrong type or
+        \\a missing one, or in YAML, which zbx does not read. It also refuses a spec
+        \\that names a mount source or a device node this host does not have, or one
+        \\you cannot open.
+        \\
+        \\The cause names the file and the field. Write the spec again for this host:
+        \\nvidia-ctk cdi generate --format=json --output=/etc/cdi/nvidia.json
+        \\A spec is read again each time a container starts, so a fixed file works at
+        \\the next start.
+        ,
+    },
+    .{
+        .code = .E0227,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a CDI device needs an edit or a combination zbx does not apply",
+        .explanation =
+        \\zbx applies the parts of a CDI device it can honour without a privileged
+        \\helper: character device nodes, bind mounts, environment variables, and the
+        \\hook "nvidia-cdi-hook update-ldcache", which it does itself. A device whose
+        \\spec has anything else is refused by name rather than started without it:
+        \\another hook, intelRdt, additionalGids, a mount that is not a bind, a node
+        \\that is not a character device at its own path, or two mounts at one path
+        \\from different host paths. zbx never runs a hook from a spec.
+        \\
+        \\With --read-only, a device whose spec has mounts is refused too: the mount
+        \\targets cannot be made in a read-only root. The spec is fine; drop
+        \\--read-only, or ask for the nodes alone.
+        \\
+        \\The cause names the device and the edit. Ask for the nodes as paths
+        \\(--device /dev/nvidia0) if the workload needs only those.
+        ,
+    },
+    .{
+        .code = .E0228,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--gpu found no GPU device to give",
+        .explanation =
+        \\--gpu all gives every nvidia.com/gpu device of a CDI spec when a spec has
+        \\them, and otherwise every /dev/dri/renderD* node you can open, plus
+        \\/dev/kfd when it is there. --gpu dri gives the render nodes and /dev/kfd
+        \\only. When there is none of these, the run is refused rather than started
+        \\without a GPU.
+        \\
+        \\The cause names what was looked for and what was there but not usable: a
+        \\render node whose group you are not in, or a CDI spec that could not be
+        \\read. zbx doctor lists the specs, the nodes, their modes and groups, and
+        \\the one-line fix for each gap. zbx never changes a mode or a group.
+        ,
+    },
+    .{
+        .code = .E0229,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "devices are not available on this platform",
+        .explanation =
+        \\--device and --gpu give a container the device nodes of the machine zbx
+        \\runs on. On macOS the container runs in a Linux guest, and Apple's
+        \\virtualization gives a Linux guest no GPU compute, so there is nothing to
+        \\give. The run is refused before the guest is started.
+        \\
+        \\Run on a Linux host with a GPU, or leave the option out.
+        ,
+    },
+    .{
+        .code = .E0230,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no CDI spec has that device",
+        .explanation =
+        \\The name given to --device (vendor.com/class=name) is in none of the specs
+        \\in $XDG_CONFIG_HOME/cdi (or ~/.config/cdi), /var/run/cdi and /etc/cdi. The
+        \\cause lists the names the specs do have (the first 16).
+        \\"vendor.com/class=all" means every device of that vendor's spec, or a
+        \\device the spec calls "all".
+        \\
+        \\Without any spec, generate one: nvidia-ctk cdi generate --format=json
+        \\--output=/etc/cdi/nvidia.json. A spec that could not be read is E0226.
+        ,
+    },
+    .{
+        .code = .W0201,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "mapping only your own id into the container",
+        .explanation =
+        \\A rootless container can map a full range of ids (root, and 65536 more
+        \\for its other users), which needs a range in /etc/subuid and /etc/subgid
+        \\and the setuid helpers newuidmap and newgidmap. This host lacks one of
+        \\them, so zbx mapped only the container's root, to your own id, and went on.
+        \\
+        \\Everything runs, but a program in the container that switches to another
+        \\user, or owns files as one, fails: only id 0 exists inside. The warning
+        \\names what is missing and the command that fixes it; "zbx doctor" shows
+        \\the same under ZBX-E0105.
+        ,
+    },
+    .{
+        .code = .W0202,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "can't save the run record",
+        .explanation =
+        \\zbx keeps a small record of each run in its state directory
+        \\($XDG_STATE_HOME/zbx/runs, or ~/.local/state/zbx/runs): the name, the
+        \\command, the times and how it ended. This one could not be written, for
+        \\example because the disk is full, so the run goes on without it.
+        \\
+        \\"zbx bundle" and tools that look up a run by name will not find this
+        \\one. Free space, or point XDG_STATE_HOME at a directory with room.
+        ,
+    },
+    .{
+        .code = .W0203,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "skipped a run record that can't be read",
+        .explanation =
+        \\Among the records in the state directory one could not be used: it is
+        \\damaged, it was written by a newer zbx than this one, or it cannot be
+        \\read. zbx skips it and goes on; a record it cannot read never stops a run.
+        \\
+        \\The oldest records are deleted when there are more than 32, so a record
+        \\that stays unreadable goes away on its own. To keep it, move it out of
+        \\the runs directory, or run the zbx that wrote it.
+        ,
+    },
+    .{
+        .code = .W0204,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the container's output is not being kept",
+        .explanation =
+        \\zbx keeps what each container writes to its standard output and error in a
+        \\log (<state>/zbx/logs/<name>.log), up to 5 MiB, for "zbx logs". That log
+        \\could not be made or written, for example because the disk is full or the
+        \\state directory cannot be written, so the run goes on without it.
+        \\
+        \\A foreground run still shows its output on the terminal. "zbx logs" will
+        \\show what was written before the failure, if anything. Free space, or point
+        \\XDG_STATE_HOME at a directory with room.
+        ,
+    },
+    .{
+        .code = .W0205,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "older output of the container was dropped",
+        .explanation =
+        \\A container's log keeps at most 5 MiB. When it is full the oldest records
+        \\are dropped, whole, so what "zbx logs" shows starts after output that
+        \\is gone.
+        \\The message says how many bytes of output were dropped.
+        \\
+        \\Nothing is wrong with the container. To see more, have the program write
+        \\less, or send its output somewhere that keeps it: a --state volume or a
+        \\--mount of the project.
+        ,
+    },
+    .{
+        .code = .W0206,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "the terminal was not logged",
+        .explanation =
+        \\A foreground "zbx run" at a terminal gives the container the terminal itself
+        \\for each of standard output and error that is one, so that editors, pagers,
+        \\colours and job control work. What goes to the terminal does not pass
+        \\through zbx, so it is not in the log. The log of such a run holds only the
+        \\stream that was a pipe or a file, and this warning says which is missing.
+        \\
+        \\To have the output in the log, run the container detached ("zbx run -d") or
+        \\send its output to a file or a pipe.
+        ,
+    },
+    .{
+        .code = .W0207,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the exec was not noted in the container's history",
+        .explanation =
+        \\zbx keeps a short list of the recent execs of each container beside its log
+        \\(<state>/zbx/logs/<name>.exec): the command and how it ended, never the
+        \\environment, so that "zbx bundle" can show them. This exec's entry could not
+        \\be written; the cause says why. The command itself ran as reported.
+        ,
+    },
+    .{
+        .code = .W0208,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "driver libraries found through LD_LIBRARY_PATH",
+        .explanation =
+        \\A CDI device (an NVIDIA GPU) mounts the host's driver libraries and asks for
+        \\the library cache to be updated ("nvidia-cdi-hook update-ldcache"). zbx
+        \\runs the image's own ldconfig for it. An image without ldconfig, or one
+        \\whose ldconfig fails or runs past its 10 seconds (and is killed), has no
+        \\cache updated: zbx puts the libraries' directories on LD_LIBRARY_PATH
+        \\instead and says so once per run. A musl image such as Alpine cannot
+        \\load glibc driver libraries either way; use a glibc image.
+        ,
+    },
+    .{
+        .code = .W0209,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "groups show as nogroup inside the container",
+        .explanation =
+        \\A run with --device keeps your supplementary groups, so that a device node
+        \\owned by a group you belong to can be opened. The container's user namespace
+        \\does not map those groups' ids, so inside it they show as "nogroup" (65534).
+        \\The groups still count: the host's file permissions decide, and ls -l inside
+        \\the container shows the group as nogroup. zbx says so once per run.
+        ,
+    },
+    .{
+        .code = .E0301,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't reach the systemd user manager over D-Bus",
+        .explanation =
+        \\zbx puts each container in its own cgroup, a transient systemd "scope" of
+        \\the user's systemd manager, and asks for it over the user's D-Bus socket
+        \\($DBUS_SESSION_BUS_ADDRESS, or $XDG_RUNTIME_DIR/bus). It could not get
+        \\there: nothing set the address, the socket is missing or refuses
+        \\connections, the address is not a unix:path= one, or the bus has no
+        \\systemd on it.
+        \\
+        \\The cause says which. The usual one is a login with no systemd user
+        \\session: ssh without PAM's systemd module, su, or sudo -u. Log in through
+        \\a systemd session, or keep the manager running with
+        \\"loginctl enable-linger $USER". "zbx doctor" runs the same probe.
+        ,
+    },
+    .{
+        .code = .E0302,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the user bus refused to authenticate this user",
+        .explanation =
+        \\zbx proves who it is to the user's D-Bus socket with the SASL mechanism
+        \\EXTERNAL, which sends only the user id and relies on the socket's
+        \\credentials. The bus rejected that, or answered something else, or
+        \\refused the Hello that follows.
+        \\
+        \\This usually means the socket belongs to another user: an address
+        \\inherited through su or sudo points at the previous user's bus. Unset
+        \\DBUS_SESSION_BUS_ADDRESS, or run zbx from the user's own login session.
+        \\The cause shows what the bus answered.
+        ,
+    },
+    .{
+        .code = .E0303,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the user bus answered in a way zbx can't use",
+        .explanation =
+        \\The conversation with the user bus broke: a reply was malformed or too
+        \\big, the connection closed in the middle, a call got no answer in time,
+        \\or reading or writing the socket failed.
+        \\
+        \\The cause names the step and what went wrong. A bus that stops answering
+        \\is overloaded or stuck; "systemctl --user status" and
+        \\"journalctl --user -u dbus" show why. A malformed reply from a real bus is
+        \\a bug worth reporting with the output of "zbx bundle --last".
+        ,
+    },
+    .{
+        .code = .E0304,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "systemd refused the container's scope, or its job failed",
+        .explanation =
+        \\zbx asked the user's systemd manager to start the scope that holds the
+        \\container, and systemd either refused the request or started a job that
+        \\did not end well. The cause gives systemd's own error name and message,
+        \\or the job's result.
+        \\
+        \\Typical reasons: the user manager is shutting down, a property is not
+        \\accepted by this systemd version, or the user has no cgroup to delegate.
+        \\"journalctl --user" shows what the manager logged.
+        ,
+    },
+    .{
+        .code = .E0305,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a scope with this container's name already exists",
+        .explanation =
+        \\Each container runs in a systemd scope named zbx-<name>.scope, and a
+        \\unit of that name is already there: another container with the same name
+        \\is running, or one that ended has not been cleaned up yet. zbx never
+        \\reuses a scope, so the run was refused.
+        \\
+        \\Choose another name with --name, or stop the other container. The unit
+        \\can be listed with "systemctl --user list-units 'zbx-*'".
+        ,
+    },
+    .{
+        .code = .E0306,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "invalid resource limit",
+        .explanation =
+        \\A resource limit has to be a sensible number. --memory takes a size with
+        \\a binary unit (k, m or g; 128m is 128 MiB) between 4 MiB and 1 TiB.
+        \\--pids takes a count from 1 to 4194304. --cpus takes a number of CPUs
+        \\with up to three decimals (0.5 is half of one) from 0.01 to 1024.
+        \\
+        \\A zero, a number out of range, or text that is not a number is refused
+        \\before anything starts.
+        ,
+    },
+    .{
+        .code = .E0307,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a limit needs a cgroup scope, and none can be made",
+        .explanation =
+        \\--memory, --pids and --cpus are enforced by the container's cgroup, which
+        \\zbx gets from the user's systemd manager. That manager is not reachable,
+        \\so the limit cannot be enforced, and zbx refuses to run the container as
+        \\though it were: a limit that is silently ignored is worse than none.
+        \\
+        \\The cause says why the manager is not reachable (see ZBX-E0301 and the
+        \\codes after it). Fix that, or run without the limit flags: a run with no
+        \\limits still works without a scope, with a warning (ZBX-W0301).
+        ,
+    },
+    .{
+        .code = .E0308,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't write a limit to the container's cgroup",
+        .explanation =
+        \\This systemd is too old to take one of the limits as a unit property, so
+        \\zbx writes it to the scope's own cgroup files (memory.max, pids.max,
+        \\cpu.max). Finding the scope's cgroup or writing the file failed.
+        \\
+        \\The cause names the file and the kernel's reason. The controller may not
+        \\be delegated to the user: "zbx doctor" shows which are (ZBX-E0103).
+        ,
+    },
+    .{
+        .code = .E0309,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't make the container's cgroup",
+        .explanation =
+        \\Where there is no systemd user manager (the macOS virtual machine), zbx
+        \\makes the container's cgroup itself: one directory per container in the
+        \\delegated cgroup v2 directory that ZBX_CGROUP_ROOT names, as runc and
+        \\Podman do. It moves the container in before it can run, and writes the
+        \\limits (memory.max, pids.max, cpu.max) there. Making the directory,
+        \\moving the container in or writing a limit failed.
+        \\
+        \\The cause names the step, the path and the kernel's reason. The directory
+        \\must belong to this user, with the controllers enabled for its children
+        \\(cgroup.subtree_control). Inside the virtual machine, zbx vm stop, and
+        \\the next command starts a fresh one.
+        ,
+    },
+    .{
+        .code = .E0310,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --ulimit is not valid",
+        .explanation =
+        \\--ulimit sets a resource limit of the container's processes, as ulimit
+        \\does: --ulimit name=soft[:hard], once per name. One value sets both the
+        \\soft and the hard limit. The names are nofile (open files), nproc
+        \\(processes of the user), memlock (locked memory) and stack. nofile and
+        \\nproc take counts; memlock and stack take sizes in --memory's syntax
+        \\(k, m or g, binary units). Any value may be unlimited, except nofile's:
+        \\the kernel caps open files at fs.nr_open and refuses unlimited. The
+        \\soft limit can't be above the hard one.
+        \\
+        \\Without --ulimit, the container keeps the limits zbx was started with.
+        \\nproc counts every process of the user who runs zbx, inside the
+        \\container and out, because the container's root is that user.
+        ,
+    },
+    .{
+        .code = .E0311,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "--ulimit is above your own hard limit",
+        .explanation =
+        \\A rootless run can lower a hard limit but never raise it: raising one
+        \\needs CAP_SYS_RESOURCE in the host's user namespace. zbx checks each
+        \\--ulimit against the hard limit it was started with and refuses one
+        \\above it, rather than set a lower value than was asked.
+        \\
+        \\The limits come from the login session (/etc/security/limits.conf) or,
+        \\for a process started by the systemd user manager, from its unit,
+        \\user@<uid>.service (LimitNOFILE=, LimitNPROC=, LimitMEMLOCK=,
+        \\LimitSTACK=). Raise the one that applies, log in again, and check with
+        \\ulimit -H -a. The user manager's memlock is often 8 MiB.
+        \\
+        \\limits.conf reads memlock and stack in KiB, and systemd's LimitMEMLOCK=
+        \\and LimitSTACK= read bytes, so the two fixes show different numbers for
+        \\the same limit.
+        ,
+    },
+    .{
+        .code = .E0312,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't check or set a --ulimit",
+        .explanation =
+        \\Before anything starts, zbx reads its own limit for each --ulimit
+        \\(prlimit64) to check the value against it; a run whose limit can't be
+        \\read is refused, since it can't be checked. The container then sets each
+        \\--ulimit on itself (setrlimit) before it drops its capabilities. After
+        \\the check that should not fail: a security policy, or limits that
+        \\changed since the check, is the usual reason.
+        \\
+        \\The limits apply to everything in the container, including the steps zbx
+        \\runs there before the command (ldconfig for --device), and they are set
+        \\before --user switches to the image's user. nproc counts that user's
+        \\processes on the whole host, so a low nproc can make the command's own
+        \\start fail with EAGAIN when that user already runs as many.
+        \\
+        \\The cause names the call, the resource and the kernel's reason.
+        ,
+    },
+    .{
+        .code = .E0313,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --shm-size is not valid",
+        .explanation =
+        \\--shm-size sets the size of the container's /dev/shm, a tmpfs, in
+        \\--memory's syntax (k, m or g, binary units). The default is 64 MiB. It
+        \\must be at least one page. Without --memory it can't be larger than the
+        \\host's memory (MemTotal in /proc/meminfo): tmpfs pages are memory, and
+        \\a /dev/shm larger than the host is a mistake, not a limit.
+        ,
+    },
+    .{
+        .code = .E0314,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--shm-size is larger than --memory",
+        .explanation =
+        \\The pages of /dev/shm are charged to the memory limit of the
+        \\container that touches them, so /dev/shm already counts against
+        \\--memory. A /dev/shm larger than the limit can never be filled: the
+        \\container is stopped for lack of memory first. zbx refuses the
+        \\combination rather than let it fail later. Equal is allowed.
+        \\
+        \\Raise --memory, or lower --shm-size to at most it.
+        ,
+    },
+    .{
+        .code = .E0315,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --sysctl is not valid",
+        .explanation =
+        \\--sysctl sets a kernel setting of the container's own namespaces:
+        \\--sysctl key=value, with the key in dot form (net.core.somaxconn). A
+        \\value is printable ASCII, with no newline, of at most 256 bytes. A run
+        \\takes at most 16 of them, each key at most once.
+        ,
+    },
+    .{
+        .code = .E0316,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --sysctl is a host setting",
+        .explanation =
+        \\A container can set only the sysctls of the namespaces it has of its
+        \\own: its ipc namespace, and its network namespace unless it runs with
+        \\--net host. zbx keeps a reviewed list of them (Kubernetes' safe set,
+        \\and the namespaced keys databases ask for):
+        \\
+        \\  kernel.shm*, kernel.msg*, kernel.sem, fs.mqueue.*  (ipc)
+        \\  net.core.somaxconn, net.ipv4.ip_local_port_range,
+        \\  net.ipv4.tcp_* and the other net.* keys on the list  (net)
+        \\
+        \\Every other key, vm.max_map_count among them, is the host's: a
+        \\container that set it would change it for every process on the host.
+        \\Set it on the host with sysctl -w, as its administrator.
+        ,
+    },
+    .{
+        .code = .E0317,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --sysctl net.* key with --net host",
+        .explanation =
+        \\With --net host the container shares the host's network namespace, so
+        \\a net.* sysctl would change the host's network, not the container's.
+        \\zbx refuses it. Drop --net host to give the container a network of its
+        \\own (the default, or --net user), where net.* keys are its own.
+        ,
+    },
+    .{
+        .code = .E0318,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the kernel refused a --sysctl",
+        .explanation =
+        \\The container writes each --sysctl beneath its own /proc/sys before it
+        \\drops its capabilities. The kernel refused the value, or the write
+        \\failed. A value the key does not take (EINVAL) is the usual reason:
+        \\read the key on the host (sysctl <key>) for its form.
+        \\
+        \\net.ipv4.ping_group_range takes two group ids, which must both be ones
+        \\the container has: within its id map.
+        ,
+    },
+    .{
+        .code = .E0319,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a host setting is not what --require-host asks",
+        .explanation =
+        \\--require-host checks a setting of the host before anything of the
+        \\container starts. The host's value does not meet the requirement, so
+        \\the run is refused. zbx only checks: it never writes the setting.
+        \\
+        \\The host's administrator sets it, with sysctl -w for the vm.* and fs.*
+        \\settings, or by writing /sys/kernel/mm/transparent_hugepage/enabled.
+        \\Either is lost at the next boot: a file in /etc/sysctl.d/ keeps a
+        \\sysctl, and a kernel command line option (transparent_hugepage=) or a
+        \\boot-time unit keeps the hugepage setting.
+        \\
+        \\"zbx doctor --require-host ..." runs the same check without a run.
+        ,
+    },
+    .{
+        .code = .E0320,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a --require-host is not a requirement zbx knows",
+        .explanation =
+        \\A requirement names one of four settings, an operator and a value:
+        \\
+        \\  vm.max_map_count>=<count>
+        \\  fs.aio-max-nr>=<count>
+        \\  vm.overcommit_memory=<0, 1 or 2, or a comma list>
+        \\  transparent_hugepage=<always, madvise or never, or a comma list>
+        \\
+        \\Each setting takes the one operator shown, and is given at most once.
+        \\Quote a >= requirement in the shell, or the shell reads > as a
+        \\redirection.
+        ,
+    },
+    .{
+        .code = .E0321,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a host setting --require-host asks for can't be read",
+        .explanation =
+        \\--require-host reads the setting from /proc/sys, or for
+        \\transparent_hugepage from /sys/kernel/mm/transparent_hugepage/enabled.
+        \\The file is not there (a kernel built without transparent hugepages
+        \\has none) or could not be read, so the requirement can't be checked
+        \\and the run is refused.
+        ,
+    },
+    .{
+        .code = .E0322,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the container could not take a cgroup namespace",
+        .explanation =
+        \\A container with a cgroup scope takes a cgroup namespace of its own
+        \\once it is in the scope, so that it sees its scope as the root of the
+        \\cgroup tree (/proc/self/cgroup reads 0::/). The kernel refused the
+        \\namespace. Kernels since 4.6 have cgroup namespaces; one built without
+        \\them, or a sandbox that denies unshare, refuses it.
+        ,
+    },
+    .{
+        .code = .E0323,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the container's cgroup view could not be mounted",
+        .explanation =
+        \\A container with a cgroup scope gets a read-only cgroup2 on
+        \\/sys/fs/cgroup, rooted at its scope, so runtimes such as Java, .NET,
+        \\Go and Node size themselves to its limits. The kernel refused the
+        \\mount. Inside, pids.max reads one more than --pids: the scope also
+        \\holds zbx's keeper process.
+        ,
+    },
+    .{
+        .code = .W0301,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "running without a cgroup scope",
+        .explanation =
+        \\The user's systemd manager could not be reached, so this container has
+        \\no cgroup scope of its own. It runs, as in M1, but nothing limits or
+        \\accounts for what it uses, and tools that look for the scope will not
+        \\find it. The warning names why the manager is out of reach.
+        \\
+        \\"zbx doctor" runs the same probe and prints the fix. A run that asks for
+        \\a limit does not get this far: it is refused (ZBX-E0307).
+        ,
+    },
+    .{
+        .code = .W0302,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the container's cgroup scope was left behind",
+        .explanation =
+        \\The container has ended, and zbx made sure its systemd scope went away:
+        \\the scope goes by itself when its last process exits, and zbx asks the
+        \\user's systemd manager to stop it if it does not. That did not work, so
+        \\the scope, with its cgroup under /sys/fs/cgroup, may still be there. It
+        \\holds no process of the container, but a new run with the same name will
+        \\be refused until it is gone (ZBX-E0305).
+        \\
+        \\The cause says what went wrong. "systemctl --user stop zbx-<name>.scope"
+        \\removes the scope by hand.
+        ,
+    },
+    .{
+        .code = .E0401,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a time is not a number of milliseconds",
+        .explanation =
+        \\--timeout and --grace take a number of milliseconds: a whole number
+        \\from 1 to 86400000 (a day) for --timeout, and from 0 for --grace, which is
+        \\how long a container gets between SIGTERM and SIGKILL. Anything else is
+        \\refused before anything starts.
+        ,
+    },
+    .{
+        .code = .E0402,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no container with that name",
+        .explanation =
+        \\No run record has that name, so there is no container to stop. "zbx ps
+        \\--all" lists the containers zbx knows, running or not; the newest 32 are
+        \\kept. A container that ended is found, and "zbx stop" on it says it was
+        \\already stopped.
+        ,
+    },
+    .{
+        .code = .E0403,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't signal the container",
+        .explanation =
+        \\zbx found the container's PID 1 but the kernel refused to signal it.
+        \\That is unusual: the container belongs to the user who runs zbx. The
+        \\record may be another user's, or the pid was reused by a process that is
+        \\not ours. The cause names the kernel's reason.
+        ,
+    },
+    .{
+        .code = .E0404,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the container did not stop in time",
+        .explanation =
+        \\zbx sent the container SIGTERM, and SIGKILL after the grace period, and
+        \\it was still there when --timeout ran out (or a few seconds after SIGKILL).
+        \\A process in uninterruptible sleep (a stuck mount, a hung disk) cannot be
+        \\killed until the kernel lets it go.
+        \\
+        \\Look at what it is doing with "ps -o pid,stat,wchan -p <pid>" and try
+        \\again; the pid is in "zbx ps".
+        ,
+    },
+    .{
+        .code = .E0405,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't start the supervisor of a detached run",
+        .explanation =
+        \\A detached run ("zbx run -d") hands the container to a supervisor
+        \\process that stays to wait for it and to finish its record. The kernel
+        \\refused to create that process (a process limit, or no memory), so
+        \\nothing was started.
+        \\
+        \\The cause names the kernel's reason. Check the process limits with
+        \\"ulimit -u".
+        ,
+    },
+    .{
+        .code = .E0406,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no schema for that command",
+        .explanation =
+        \\zbx publishes a JSON schema for the output of run, bundle, ps, stop and
+        \\doctor ("zbx schema ps"), of commit, and of the store commands, named
+        \\store-import, store-ls, store-du, store-rm, store-diff, store-verify,
+        \\store-gc, store-trash (gc --trash) and store-restore, and of explain and
+        \\"lock show" (lock-show). Other commands have no machine-readable output
+        \\that needs one: help prints text, version prints a line.
+        ,
+    },
+    .{
+        .code = .E0410,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no tree with that digest",
+        .explanation =
+        \\The store has no tree whose digest starts with what was given. A tree's
+        \\digest is printed by "zbx store import" (and by "zbx commit"), and
+        \\"zbx store ls" lists the trees the store keeps as roots. A tree that
+        \\was dropped with "zbx store rm" stays until "zbx store gc" collects it.
+        \\
+        \\A running container started from a digest the store does not have fails
+        \\with this code before anything is created.
+        ,
+    },
+    .{
+        .code = .E0411,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "that digest prefix matches more than one tree",
+        .explanation =
+        \\A digest may be shortened to a prefix of at least 12 hex digits, but
+        \\only while the prefix names one tree. zbx never picks one of several:
+        \\a wrong guess here could delete or run the wrong tree.
+        \\
+        \\The message names the first two matches. Give more digits, or the whole
+        \\digest from "zbx store ls".
+        ,
+    },
+    .{
+        .code = .E0412,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not a digest",
+        .explanation =
+        \\A digest is "b3:" and 64 lowercase hex digits (BLAKE3). It may be
+        \\shortened to a prefix of at least 12 hex digits, with or without the
+        \\"b3:". Anything else is refused, as are uppercase digits: a digest has
+        \\one spelling.
+        \\
+        \\"zbx store ls" prints the digests the store keeps.
+        ,
+    },
+    .{
+        .code = .E0413,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't use the store: its format is unknown",
+        .explanation =
+        \\The store's store.zon is missing a readable format version, or names one
+        \\this zbx does not know. A newer zbx wrote it, or something else changed
+        \\the file. zbx does not touch a store it cannot read: it could damage
+        \\what a newer version put there.
+        \\
+        \\Run the zbx that wrote the store, or move the store directory away to
+        \\start a new one. The cause names the file.
+        ,
+    },
+    .{
+        .code = .E0414,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "can't read the directory to import",
+        .explanation =
+        \\"zbx store import" reads the directory it is given from inside your user
+        \\namespace, with the same ids a container would see. The path, or
+        \\something below it, is missing, is not what it should be (the source
+        \\must be a directory), or cannot be read by you.
+        \\
+        \\The cause names the path and the kernel's reason. Files that only you
+        \\cannot read (mode 0600 and owned by a subordinate id) are readable
+        \\inside the namespace; files owned by an id outside it are not.
+        ,
+    },
+    .{
+        .code = .E0415,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the directory tree is bigger than an import limit",
+        .explanation =
+        \\zbx holds a bounded amount in memory while it imports: at most 16384
+        \\entries in one directory, names up to 255 bytes, 64 levels of nesting,
+        \\a symlink target up to 4095 bytes, files up to 4 GiB, and 16 MiB for the
+        \\names and entries of all the directories being read at once.
+        \\
+        \\The cause names the limit and the path where it was passed. Split the
+        \\directory, or leave out what is not part of the root filesystem.
+        ,
+    },
+    .{
+        .code = .E0416,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the disk is full while writing the store",
+        .explanation =
+        \\The file system that holds the store has no room left. Everything zbx
+        \\wrote before is complete and stays: every write is a temporary file
+        \\that is renamed into place only when it is whole, so there is no half
+        \\file under any digest. The message says how much was written.
+        \\
+        \\Free space (or point XDG_DATA_HOME at a bigger disk) and run the same
+        \\command again: objects already stored are skipped, so it carries on.
+        ,
+    },
+    .{
+        .code = .E0417,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't write the store",
+        .explanation =
+        \\The kernel refused a write to the store directory (permissions, a
+        \\read-only file system, an I/O error). Nothing partial is left under a
+        \\digest: a failed write leaves at most a temporary file in the store's
+        \\tmp directory, which "zbx store gc" removes. The same code covers a
+        \\failed write of an export directory: it is written beside its name and
+        \\renamed into place, so nothing partial is left under the name.
+        \\
+        \\The cause names the path and the kernel's reason. The store is in
+        \\$XDG_DATA_HOME/zbx/store, or ~/.local/share/zbx/store.
+        ,
+    },
+    .{
+        .code = .E0418,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a file changed while it was being imported",
+        .explanation =
+        \\zbx reads each file twice, once to learn its digest and once to copy
+        \\it, and the two reads did not agree: something wrote to the file in
+        \\between. Importing a tree that is being written would store a mixture,
+        \\so zbx stops.
+        \\
+        \\Stop whatever writes to the directory (a running container using it as
+        \\its root, a build), or import a copy, and run the command again.
+        ,
+    },
+    .{
+        .code = .E0419,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't run the store worker",
+        .explanation =
+        \\Store work runs in a short-lived child process inside your user
+        \\namespace. This one could not be created or set up (the same causes as
+        \\a container that will not start: see "zbx doctor"), or it was killed by
+        \\a signal before it finished. Nothing partial is left under a digest.
+        \\
+        \\The cause says which. Run the command again once it is fixed.
+        ,
+    },
+    .{
+        .code = .E0420,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "that tree is not a root",
+        .explanation =
+        \\"zbx store rm" drops a root: the record that keeps a tree in the store.
+        \\The digest names a tree the store has, but no root keeps it (it is only
+        \\part of another tree, or was already dropped), so there is nothing to
+        \\remove.
+        \\
+        \\"zbx store ls" lists the roots.
+        ,
+    },
+    .{
+        .code = .E0421,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "no data directory to keep the store in",
+        .explanation =
+        \\zbx keeps its store under $XDG_DATA_HOME/zbx/store, or
+        \\~/.local/share/zbx/store when that is not set. Neither variable names an
+        \\absolute directory here, so there is nowhere to put the store.
+        \\
+        \\Set HOME, or point XDG_DATA_HOME at a directory you can write to.
+        ,
+    },
+    .{
+        .code = .E0422,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a tree in the store is missing or damaged",
+        .explanation =
+        \\zbx followed a tree down through its subtrees and found one that is not
+        \\in the store, does not hash to its name, or cannot be decoded. A tree
+        \\object is a file named by the hash of its bytes, so this means the
+        \\store was changed or damaged outside zbx (a disk error, a file removed
+        \\by hand), or an earlier zbx wrote it wrongly.
+        \\
+        \\The cause names the tree. Nothing was changed. Importing the directory
+        \\again writes the trees it needs; objects that are already stored are
+        \\reused.
+        ,
+    },
+    .{
+        .code = .E0423,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't read the store",
+        .explanation =
+        \\The kernel refused to read something in the store directory, or the
+        \\store has more entries in one place than zbx can count at once. The
+        \\store is in $XDG_DATA_HOME/zbx/store, or ~/.local/share/zbx/store.
+        \\
+        \\The cause names the step and the kernel's reason. Check that the
+        \\directory belongs to you, and that the disk is healthy.
+        ,
+    },
+    .{
+        .code = .E0424,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a file name in the store has too many links",
+        .explanation =
+        \\Building the directory a container runs on makes a hard link from every
+        \\file of the tree to its object. The file system refused one because the
+        \\object already has as many names as the file system allows (ext4: about
+        \\65,000). A file that appears under many names in one tree, or in many
+        \\trees that are all in use, can reach it.
+        \\
+        \\Nothing was changed: the half-built directory was removed. The usual
+        \\ways out are to import a tree in which that file is not repeated so
+        \\often, or to move the store to a file system with a higher limit (xfs
+        \\and btrfs allow far more).
+        ,
+    },
+    .{
+        .code = .E0425,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "overlayfs can't be mounted for this container",
+        .explanation =
+        \\A container started from a tree digest runs on an overlayfs mount: the
+        \\tree is the read-only lower layer and the container's own writes go to
+        \\an upper layer under the state directory. The kernel refused to mount
+        \\it in the container's user and mount namespaces.
+        \\
+        \\Unprivileged overlayfs needs Linux 5.11 or newer with the overlay
+        \\module, and an upper layer on a file system that keeps user.* extended
+        \\attributes. A security policy can also deny the mount. "zbx doctor"
+        \\runs the same mount in a scratch directory and says which of these it
+        \\is. A path that contains a comma, a colon or a backslash can not be
+        \\given to the mount and is refused with this code too.
+        \\
+        \\A container can still run on a plain directory: "zbx run --rootfs".
+        ,
+    },
+    .{
+        .code = .E0426,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the container has no layer to commit",
+        .explanation =
+        \\"zbx commit" turns what a container changed into a new tree. That needs
+        \\a container that was started from a tree digest ("zbx run <digest>"),
+        \\because its writes are in an upper layer of their own. A container run
+        \\on a directory ("zbx run --rootfs") wrote into that directory, a
+        \\container run with --read-only had no upper layer, and the upper layer
+        \\of an old container is removed with its record (the newest 32 are kept).
+        \\
+        \\The cause says which of these it is. To keep a directory's contents,
+        \\import it: "zbx store import <dir>".
+        ,
+    },
+    .{
+        .code = .E0427,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the container is still running",
+        .explanation =
+        \\A commit reads the container's upper layer while nothing writes to it, so
+        \\that the new tree is one the container really had. The container is
+        \\still running, and zbx does not freeze a running container (a
+        \\"--pause" option is not part of this version).
+        \\
+        \\Stop it with "zbx stop <name>", then commit. Nothing was changed.
+        ,
+    },
+    .{
+        .code = .E0428,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the upper layer uses an overlayfs feature a commit can't follow",
+        .explanation =
+        \\A commit reads a container's upper layer file by file. Overlayfs can
+        \\also keep a change as a redirect (a renamed directory,
+        \\"user.overlay.redirect") or as metadata only ("user.overlay.metacopy"),
+        \\and the upper layer alone
+        \\does not say what the change was then. zbx mounts without those
+        \\features, so this means the layer was made by something else, or by a
+        \\kernel whose defaults turn them on.
+        \\
+        \\The cause names the file. Nothing was changed.
+        ,
+    },
+    .{
+        .code = .E0429,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a file in the store is damaged",
+        .explanation =
+        \\"zbx store verify" read every object, tree and root record in the store
+        \\and checked it against its name. This one does not match: its bytes (or,
+        \\for a file object, its mode, owner or attributes) are not what its id
+        \\says, or its chunk list disagrees with it, or it can not be read, or a
+        \\tree names something that is not in the store.
+        \\
+        \\The message names the id and the file, and the first path in the trees of
+        \\the roots that reach it, with how many more there are, so you know which
+        \\images are affected. --verbose lists three; --output json lists up to 16
+        \\for each damaged thing, with the root of each.
+        \\
+        \\Nothing was changed. A damaged file can not be repaired in place: delete
+        \\it and import the directory it came from again (the import writes what is
+        \\missing), or drop the roots that reach it with "zbx store rm". A disk
+        \\that damages files needs looking at; "zbx store verify" again afterwards.
+        ,
+    },
+    .{
+        .code = .E0430,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the store failed verification",
+        .explanation =
+        \\"zbx store verify" found damage; this is the summary after one
+        \\ZBX-E0429 for each damaged thing (the first 256, then a count). The exit
+        \\code is 2, because the store is part of the environment: zbx did not
+        \\do wrong, and neither did the command.
+        \\
+        \\Nothing was changed. See the diagnostics above this one.
+        ,
+    },
+    .{
+        .code = .E0431,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store changed since that gc plan was made",
+        .explanation =
+        \\"zbx store gc --confirm <hash>" acts only on the plan the hash names. A plan
+        \\hash covers the ids of everything the plan would move and a counter that
+        \\every write to the store raises, so a plan can not be applied after an
+        \\import, a commit, a "store rm", a restore or another gc, even one that
+        \\changed nothing the plan holds.
+        \\
+        \\Nothing was moved. The message gives the hash of the plan as the store
+        \\is now: run "zbx store gc" to read it, and confirm that one if it is what
+        \\you want.
+        ,
+    },
+    .{
+        .code = .E0432,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a restore would overwrite something that is back in the store",
+        .explanation =
+        \\"zbx store restore" puts back what a gc moved to the trash. Something in
+        \\that trash is in the store again (an import or a commit wrote the same
+        \\object, tree or materialized directory in the meantime), and restore
+        \\does not decide which copy is right.
+        \\
+        \\Nothing was moved. The message names the first one and how many there
+        \\are. Drop the roots that brought them back with "zbx store rm" and gc
+        \\again, or leave the trash to expire.
+        ,
+    },
+    .{
+        .code = .E0433,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no trash with that id",
+        .explanation =
+        \\A gc id is the 12 hex digits of the plan hash a gc ran with. "zbx store
+        \\gc --trash" lists the trash that is still there. Trash is emptied by the
+        \\first gc after its time is up (seven days), and a restore removes the
+        \\trash it restored.
+        ,
+    },
+    .{
+        .code = .E0434,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the trash is missing things the gc moved into it",
+        .explanation =
+        \\The trash holds fewer objects, trees or materialized directories than
+        \\the gc that made it recorded, so putting it back would give a store
+        \\with holes. Something removed files from the trash directory by hand.
+        \\
+        \\Nothing was moved. The message says how many were recorded and how many
+        \\are there. What is missing can be imported again from its source.
+        ,
+    },
+    .{
+        .code = .E0435,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a root record can't be used",
+        .explanation =
+        \\A gc keeps what the roots reach, and a root's record in the store can not
+        \\be read or is from a newer zbx, so what it keeps is not known. gc
+        \\refuses rather than guess: a wrong guess deletes a tree somebody needs.
+        \\
+        \\The message names the root. "zbx store verify" says more. Delete the
+        \\record if the tree is not wanted, or import the directory again to
+        \\write it afresh.
+        ,
+    },
+    .{
+        .code = .E0436,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store is in use by another zbx command",
+        .explanation =
+        \\A store has one lock file. Every command that writes to the store and may
+        \\reuse what is in it (an import, a commit, building a directory to run on,
+        \\writing an object chunk by chunk) holds it shared while it works. "zbx
+        \\store gc --confirm" and "zbx store restore", which move things out of
+        \\the store, hold it alone. Without that, a gc could move an object to the
+        \\trash in the very moment an import decided to reuse it, and the new tree
+        \\would name an object that is not there.
+        \\
+        \\The command waited ten seconds for the lock and gave up; nothing was
+        \\changed. The message names the command that holds the lock when it is a
+        \\gc or a restore, and says "writers" when it is shared importers that are
+        \\keeping a gc waiting. Run the command again when the other one is done. A
+        \\lock never outlives its process: if nothing else is running, it was held
+        \\for the last of those ten seconds only.
+        ,
+    },
+    .{
+        .code = .E0437,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "an image record from a peer was not taken",
+        .explanation =
+        \\An image record says which tree an image became and how to run it (its
+        \\entrypoint, command, environment, directory and user). A node that fetched
+        \\the tree from a peer takes the peer's record so that the tree runs like a
+        \\pulled image and is kept by gc. The record is not trusted: it is taken
+        \\only if it reads as a record, names the tree that was fetched and the image
+        \\(manifest) the node asked for, that tree and every file below it are whole
+        \\in the store, and no record of the same manifest names another tree. The
+        \\message says which of these failed.
+        \\
+        \\Nothing was written. Fetch what is missing and import the record again, or
+        \\ask the peer for a record of the tree you fetched. A record of the same
+        \\manifest that names another tree is the node's own: the node keeps it, and
+        \\the peer's tree is not taken over it.
+        ,
+    },
+    .{
+        .code = .W0410,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a file was left out of the import",
+        .explanation =
+        \\The store keeps regular files, directories and symlinks. A device
+        \\node, a FIFO or a socket in the imported directory was skipped, and the
+        \\message names it. A root filesystem normally has none of these on disk:
+        \\a container gets its own /dev, so the digest does not miss them.
+        \\
+        \\Past the first few, the warnings are counted and the last one says how
+        \\many were not shown.
+        ,
+    },
+    .{
+        .code = .W0411,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "an extended attribute was left out of the import",
+        .explanation =
+        \\The store keeps the user.* attributes and security.capability (the file
+        \\capabilities). Others were skipped, and the message names the file and
+        \\the attribute: the trusted.*, system.* and security.* attributes
+        \\other than the capability (SELinux labels, ACLs), an attribute with a
+        \\name or value over the store's limits, and any attribute past the
+        \\sixteenth on a file. user.overlay.* is overlayfs's own and is never
+        \\imported, without a warning.
+        \\
+        \\The digest does not include what was left out.
+        ,
+    },
+    .{
+        .code = .W0412,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "some files have an owner or group that could not be mapped",
+        .explanation =
+        \\The import runs in the user's namespace, where only the user (as 0) and
+        \\the subordinate range from /etc/subuid and /etc/subgid (as 1 and up)
+        \\exist. A file owned by any other host id shows as 65534, the kernel's
+        \\overflow id, and that is what the store records, so the container sees
+        \\those files owned by 65534 whatever their owner on the host.
+        \\
+        \\The message counts the owners and the groups and names the first path.
+        \\A file that really is owned by 65534 in the container is counted too,
+        \\because the kernel gives no way to tell the two apart. The digest holds
+        \\65534 either way. To record a real owner, chown the files to an id the
+        \\user can map, or import as a user with a subuid range.
+        ,
+    },
+    .{
+        .code = .W0413,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a container's upper layer could not be removed",
+        .explanation =
+        \\Every container started from a tree digest has an upper layer under
+        \\$XDG_STATE_HOME/zbx/containers/<name>, which is kept as long as its run
+        \\record is. When the record is dropped (zbx keeps the newest 32), or a
+        \\new run takes the name, the layer is removed, from inside the user's
+        \\namespace because it holds files owned by subordinate ids. This one
+        \\could not be removed, and the message names the path and the reason.
+        \\
+        \\Nothing else is affected. After checking that no container uses it,
+        \\remove the directory by hand from inside a user namespace that maps
+        \\your subordinate id range, the one zbx itself uses: its files belong to
+        \\those ids, and the next zbx run with the same container name tries
+        \\again.
+        ,
+    },
+    .{
+        .code = .E0501,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not an image reference",
+        .explanation =
+        \\zbx was given text that is not an image reference. A reference is
+        \\
+        \\    [registry/][namespace/]name[:tag][@sha256:<64 hex digits>]
+        \\
+        \\and zbx never guesses a repair: an uppercase name, a space, a URL, a
+        \\missing name or a digest of another kind is refused with the reason.
+        \\
+        \\Without a registry the image is on Docker Hub (docker.io), and a name of
+        \\one part there lives in the library/ namespace, so "alpine:3.20" is
+        \\docker.io/library/alpine:3.20. The first part names a registry when it
+        \\has a dot or a port, or is "localhost"; otherwise it is a namespace.
+        \\With no tag and no digest the tag is "latest". With both a tag and a
+        \\digest, the digest decides.
+        \\
+        \\The message names what is wrong with the text.
+        ,
+    },
+    .{
+        .code = .E0502,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the registry's name does not resolve",
+        .explanation =
+        \\zbx could not find an address for the registry's host name. Either the
+        \\name is misspelled in the reference, or this machine has no working DNS,
+        \\or the network is down.
+        \\
+        \\When the machine reaches the internet through an HTTPS proxy (the
+        \\HTTPS_PROXY variable), the proxy looks the name up and this error means
+        \\the proxy could not. Check the name in the reference first, then that
+        \\other programs on this machine can resolve names.
+        ,
+    },
+    .{
+        .code = .E0503,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't reach the registry",
+        .explanation =
+        \\zbx found the registry's address but the connection failed: it was
+        \\refused, the network is unreachable, the proxy refused to open a tunnel,
+        \\or nothing answered within 30 seconds.
+        \\
+        \\zbx honours HTTPS_PROXY and NO_PROXY (and the lower-case spellings). A
+        \\proxy that is set but not running, or a firewall that blocks the
+        \\registry, shows up here. The message names the host, the port and the
+        \\reason; --verbose adds the system error.
+        \\
+        \\A registry on localhost is spoken to in plain HTTP on the port in the
+        \\reference.
+        ,
+    },
+    .{
+        .code = .E0504,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the registry's certificate can't be trusted",
+        .explanation =
+        \\The TLS handshake with the registry failed its checks: the certificate
+        \\does not lead to a root this machine trusts, it has expired, or it is for
+        \\another host name. zbx verifies every HTTPS connection and has no option
+        \\to turn that off.
+        \\
+        \\Behind a proxy that inspects traffic, the proxy's own certificate
+        \\authority must be trusted: put it in the system store, or point
+        \\SSL_CERT_FILE at a file holding the certificates to trust. A wrong clock
+        \\makes every certificate look expired or not yet valid.
+        ,
+    },
+    .{
+        .code = .E0505,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry answered with an error",
+        .explanation =
+        \\The registry answered a request with an HTTP status that zbx does not
+        \\handle, or a redirect it could not follow. The message names the URL
+        \\without its query (a query can carry a signature) and the status.
+        \\
+        \\A 5xx status is the registry's own failure and usually passes: run the
+        \\command again later. Statuses with their own meaning have their own
+        \\codes: 401 is ZBX-E0507, 404 is ZBX-E0508 and 429 is ZBX-E0506.
+        ,
+    },
+    .{
+        .code = .E0506,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry is rate limiting this host",
+        .explanation =
+        \\The registry answered 429 Too Many Requests. Docker Hub limits anonymous
+        \\pulls by the address they come from, so machines behind one NAT, and
+        \\CI runners, share one allowance.
+        \\
+        \\zbx does not retry on its own: a retry inside the limit only uses more
+        \\of it. When the registry says how long to wait (Retry-After) the message
+        \\gives it. Try again after that, name a mirror of Docker Hub in
+        \\ZBX_REGISTRY_MIRRORS (for example mirror.gcr.io), pull from another
+        \\registry, or reuse an image already in the store (zbx store ls).
+        ,
+    },
+    .{
+        .code = .E0507,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry refused anonymous access",
+        .explanation =
+        \\zbx pulls anonymously: when a registry answers 401 it asks for a token
+        \\from the realm in the WWW-Authenticate header, with no credentials, and
+        \\repeats the request once. This time that did not work: the token service
+        \\refused, the registry refused the token, or the challenge asked for
+        \\credentials (Basic) that zbx does not have.
+        \\
+        \\A private image, or one that does not exist (some registries answer
+        \\"denied" for both), ends here. Amazon ECR is the one private registry
+        \\zbx signs in to (see ZBX-E0527); other private registries are not
+        \\supported yet. Check the name; the message says which step was refused.
+        ,
+    },
+    .{
+        .code = .E0508,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the registry has no such image",
+        .explanation =
+        \\The registry answered 404 for the manifest: the repository does not
+        \\exist, or the tag or digest is not in it. The message names the
+        \\registry, the repository and the tag or digest.
+        \\
+        \\Check the spelling, and the tag with the registry's own listing. On
+        \\Docker Hub an official image lives in library/, which zbx adds for a
+        \\name of one part.
+        ,
+    },
+    .{
+        .code = .E0509,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the image has no build for this platform",
+        .explanation =
+        \\An image index lists one image per platform. zbx runs linux/amd64 and
+        \\linux/arm64 images, the one that matches this machine (arm64 images
+        \\with variant v8 or none), and the index has none for it. The message
+        \\lists the platforms the image offers, up to eight.
+        \\
+        \\Choose another tag or image, or run on a machine of a platform the
+        \\image has. An image built for another CPU cannot run here.
+        ,
+    },
+    .{
+        .code = .E0510,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry sent a type of document zbx does not read",
+        .explanation =
+        \\zbx reads the OCI image index and manifest and the Docker v2 manifest
+        \\list and manifest, with layers that are tar, gzip tar or zstd tar. The
+        \\registry sent something else and the message names its media type:
+        \\the old Docker schema 1 manifests, a Helm chart or other artifact, a
+        \\layer type that cannot be unpacked here, or a document whose own type
+        \\and Content-Type disagree.
+        \\
+        \\zbx refuses rather than guess from the shape of the JSON. Pull an image
+        \\that is published in the supported formats.
+        ,
+    },
+    .{
+        .code = .E0511,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "downloaded bytes do not match their digest",
+        .explanation =
+        \\Every manifest and every layer is named by the SHA-256 of its bytes, and
+        \\zbx hashes what arrives before using it. These bytes hash to something
+        \\else than the digest that named them (or than the Docker-Content-Digest
+        \\header), or a layer in the blob cache has changed on the disk since it
+        \\was downloaded. The message shows both digests.
+        \\
+        \\The bytes were damaged on the way, or the registry, a mirror or a proxy
+        \\in between is serving something it should not. Nothing from this
+        \\answer was kept. Try again; if it repeats, the source is not to be
+        \\trusted. For a damaged cache the message gives the file to remove.
+        ,
+    },
+    .{
+        .code = .E0512,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry's answer can't be used",
+        .explanation =
+        \\The registry answered, but the answer is not a document zbx can use:
+        \\the JSON is malformed or too complex, a manifest is larger than 1 MiB,
+        \\an index has more than 256 entries, an image more than 128 layers, a
+        \\digest is not sha256 and 64 hex digits, or a size is zero or too large.
+        \\
+        \\The message says which. Nothing was kept. This is the registry's or a
+        \\proxy's fault, not something to fix on this machine.
+        ,
+    },
+    .{
+        .code = .E0513,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry's answer ended early",
+        .explanation =
+        \\The connection ended, or went quiet, before the whole answer arrived: the
+        \\body was shorter than the Content-Length the registry declared. zbx does
+        \\not use part of a document.
+        \\
+        \\A network drop or a proxy timeout is the usual cause. Run the command
+        \\again.
+        ,
+    },
+    .{
+        .code = .E0514,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not a registry mirror",
+        .explanation =
+        \\ZBX_REGISTRY_MIRRORS names registries to try before Docker Hub, as a
+        \\comma-separated list of host or host:port, for example
+        \\
+        \\    ZBX_REGISTRY_MIRRORS=mirror.gcr.io
+        \\
+        \\At most four are read, each a DNS name, with no scheme and no path. An
+        \\entry that is anything else is refused at once, also for a pull that
+        \\would not use it, so a typo is found before it matters.
+        \\
+        \\A mirror only changes where bytes come from: every answer is checked by
+        \\digest, so a mirror can make a pull fail but never change what is
+        \\pulled. The lock file records the reference as written, not the mirror.
+        ,
+    },
+    .{
+        .code = .E0515,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a layer entry would leave the image's root",
+        .explanation =
+        \\A layer of the image holds an entry that could write outside the
+        \\directory the image is unpacked into, and zbx refused the whole layer:
+        \\an absolute path, a path with "..", a path that goes through a symlink
+        \\(the layer or an earlier one made it), or a hard link to a path outside
+        \\the image. An honest image has none; the message names the entry.
+        \\
+        \\Nothing from the image was kept in the store as a tree. The blobs that
+        \\were downloaded stay, so the layer is not fetched again. Do not run an
+        \\image you did not build or trust.
+        ,
+    },
+    .{
+        .code = .E0516,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a layer can't be unpacked",
+        .explanation =
+        \\A layer of the image is damaged or uses something zbx does not read:
+        \\a compressed stream that is cut or corrupt, a tar header with a wrong
+        \\checksum, a sparse file, a name over 4095 bytes, a hard link to a file
+        \\that is not there, an owner the user namespace does not map, or more
+        \\than 64 GiB in one layer. The message says which, and names the entry.
+        \\
+        \\The blob was checked against its digest when it arrived, so the image
+        \\itself is at fault (or the disk is, if the digest check also fails).
+        \\Nothing from the image was kept in the store as a tree.
+        ,
+    },
+    .{
+        .code = .E0517,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "an image's configuration can't be used",
+        .explanation =
+        \\The configuration of an image (the JSON blob its manifest names) says what
+        \\it runs by default: the entrypoint, the command, the environment, the
+        \\working directory and the user. This one is not JSON of that shape, or has
+        \\more words or more bytes than zbx keeps (48 words in a list, 64 variables,
+        \\1024 bytes in a word, 6 KiB in all), or an environment entry without a
+        \\name or a "=".
+        \\
+        \\The blob was checked against its digest, so the image is at fault. Nothing
+        \\from the image was recorded. Try another tag of the image.
+        ,
+    },
+    .{
+        .code = .E0518,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "zbx.lock can't be read",
+        .explanation =
+        \\zbx.lock is ZON, one field a line, and zbx reads it line by line. The
+        \\message names the line and what is wrong with it: a line that belongs
+        \\nowhere, a digest or platform that is not one, an entry missing a field,
+        \\two entries for one image, a version newer than this zbx reads, or more
+        \\than 256 entries.
+        \\
+        \\Fix the line, or remove the file and run zbx pull again to write a new
+        \\one: the lock only records what each reference resolved to, and a pull
+        \\makes it again. Do not edit a lock to point at digests you have not
+        \\checked.
+        ,
+    },
+    .{
+        .code = .E0519,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "zbx.lock and the store disagree about an image",
+        .explanation =
+        \\zbx.lock says the reference means one tree, and the store's record of the
+        \\image with the lock's manifest digest says another. A run starts from
+        \\neither: it would be running something nobody chose.
+        \\
+        \\The message names both tree digests. Either the lock was changed by hand
+        \\(or by a merge), or the store's record was made by a different pull. To
+        \\take the store's tree as the truth, remove the entry or the file and pull
+        \\again; to keep the lock's, restore the store from it with the pull the
+        \\message shows.
+        ,
+    },
+    .{
+        .code = .E0520,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the image zbx.lock names is not in the store",
+        .explanation =
+        \\zbx.lock names a manifest digest for the reference, and the store has no
+        \\image with that digest. The store may be new, the image may have been
+        \\removed (zbx store rm), or the lock may name a digest that was never
+        \\pulled. A run never fetches by itself, because the lock is what says what
+        \\to trust.
+        \\
+        \\The message names the digest the lock wants and, if the store has some
+        \\other image under the same reference, that one. Pull the locked digest to
+        \\fill the store from the lock:  zbx pull <repository>@sha256:<digest>
+        ,
+    },
+    .{
+        .code = .E0521,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the image's user is not in the image",
+        .explanation =
+        \\The image's configuration says it runs as a user (or group) by name, and the
+        \\image's own /etc/passwd or /etc/group has no such name. A number needs no
+        \\lookup and is used as it is; a name does. The message names what was looked
+        \\for and where.
+        \\
+        \\The image is at fault. Nothing was started.
+        ,
+    },
+    .{
+        .code = .E0522,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no image of that name is locked or in the store",
+        .explanation =
+        \\zbx run was given a name that is not a tree digest, and neither zbx.lock nor
+        \\the store knows an image by it. A run starts only what a lock has recorded
+        \\(or what is in the store when a library caller names it): it does not pull
+        \\by itself once a zbx.lock exists. Run zbx pull with the name to fetch the
+        \\image and record it.
+        ,
+    },
+    .{
+        .code = .E0523,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the image's user needs more ids than this run maps",
+        .explanation =
+        \\The image runs as a user other than root. That user's id exists in the
+        \\container only when the container maps a whole range of ids, which needs
+        \\the setuid helpers newuidmap and newgidmap and a range of subordinate ids
+        \\for your account. Without them the container maps only root, to your own
+        \\id (the warning ZBX-W0201 says so), and the image's user cannot be set.
+        \\
+        \\Give your account the ranges (zbx doctor shows how), or use an image that
+        \\runs as root.
+        ,
+    },
+    .{
+        .code = .E0524,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the image has no command to run",
+        .explanation =
+        \\The image sets neither an entrypoint nor a command, and none was given after
+        \\"--". Docker would fail the same way. Give the command to run:
+        \\
+        \\    zbx run <image> -- <command> [arguments]
+        ,
+    },
+    .{
+        .code = .E0525,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "zbx.lock can't be written",
+        .explanation =
+        \\zbx writes zbx.lock to the nearest directory up from the working directory
+        \\that has one, or else the working directory, through a temporary file in
+        \\the same directory that it renames over the lock. That failed: the disk is
+        \\full, the directory is not writable, or it is read-only. The message gives
+        \\the path and the reason. The image itself was pulled and is in the store;
+        \\run the command again once the directory can be written.
+        ,
+    },
+    .{
+        .code = .E0526,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "there is no zbx.lock for this project",
+        .explanation =
+        \\zbx lock show prints the project's zbx.lock: the nearest one in the working
+        \\directory or any directory above it. There is none. A lock is made by the
+        \\first pull (or the first run of a tag) in the project directory, so pull
+        \\an image to make one, from the directory the project lives in.
+        ,
+    },
+    .{
+        .code = .E0527,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "there are no AWS credentials to pull from Amazon ECR",
+        .explanation =
+        \\zbx pulls from a private Amazon ECR registry
+        \\(<account>.dkr.ecr.<region>.amazonaws.com) with the AWS credentials it
+        \\finds, in this order, and uses the first source that is set up: the
+        \\environment (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, with
+        \\AWS_SESSION_TOKEN for temporary keys), a web identity (AWS_ROLE_ARN and
+        \\AWS_WEB_IDENTITY_TOKEN_FILE, as on EKS and in GitHub Actions), and the
+        \\role of an EC2 instance (the instance metadata service, version 2 only).
+        \\None gave any, or the one that was set up is not complete. The message
+        \\says what each source did.
+        \\
+        \\An instance metadata service that answers 403, 404 or 405 to the token
+        \\request is one that does not serve version 2; zbx never asks version 1.
+        \\Raise the instance's metadata hop limit or require version 2, or pass
+        \\the keys in the environment.
+        \\
+        \\Profiles in ~/.aws, single sign-on and credential_process are not read
+        \\yet. To use one, export its keys first:
+        \\
+        \\    export $(aws configure export-credentials --format env)
+        \\
+        \\The macOS zbx runs pulls in its Linux guest, which has no AWS
+        \\credentials yet.
+        ,
+    },
+    .{
+        .code = .E0528,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "AWS refused the credentials",
+        .explanation =
+        \\AWS answered the call for an ECR authorization token (or the exchange of
+        \\a web identity for keys) with a refusal that is about the credentials:
+        \\they are expired, the key is unknown, the secret is wrong, or the token
+        \\is not valid. The message names the source of the credentials and AWS's
+        \\error code. It never repeats AWS's message text, which can hold account
+        \\details.
+        \\
+        \\Temporary keys expire (the environment's AWS_SESSION_TOKEN, a role's
+        \\session): get new ones and run the command again. zbx resolves
+        \\credentials for every pull and keeps none.
+        ,
+    },
+    .{
+        .code = .E0529,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the clock of this machine is too far from AWS's",
+        .explanation =
+        \\AWS refused the signed request because its time is too far from the time
+        \\AWS has (more than five minutes). The signature includes the time, so a
+        \\machine whose clock is wrong cannot sign for AWS, even with the right
+        \\keys.
+        \\
+        \\Set the clock (zbx doctor does not check it): enable time
+        \\synchronisation, for example with timedatectl set-ntp true or chrony,
+        \\and run the command again. A virtual machine that was suspended often
+        \\has a clock that is hours behind.
+        ,
+    },
+    .{
+        .code = .E0530,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the AWS identity may not get an ECR authorization token",
+        .explanation =
+        \\The credentials are valid, and AWS says the identity they belong to is
+        \\not allowed to call ecr:GetAuthorizationToken. That permission cannot be
+        \\limited to one repository: grant it on resource "*". Reading an image
+        \\takes three more: ecr:BatchGetImage, ecr:GetDownloadUrlForLayer and
+        \\ecr:BatchCheckLayerAvailability, on the repository.
+        \\
+        \\Ask whoever owns the IAM role or user to add them. The message names the
+        \\permission and AWS's error code.
+        ,
+    },
+    .{
+        .code = .E0531,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the ECR repository may not be read by this identity",
+        .explanation =
+        \\The registry answered 403 for a repository: the credentials are valid,
+        \\and the identity may not read it. Reading an image needs
+        \\ecr:BatchGetImage for the manifest and ecr:GetDownloadUrlForLayer for
+        \\each layer, on that repository (and the repository's own policy may
+        \\refuse the account). The message names the repository and the permission
+        \\that the failed request needs.
+        \\
+        \\Registries also answer this for a repository that is in another account
+        \\or region than the host names. Check the host, then the role's policy.
+        ,
+    },
+    .{
+        .code = .E0532,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the ECR repository does not exist",
+        .explanation =
+        \\The registry answered that it has no repository of this name
+        \\(NAME_UNKNOWN). This is not the same as a missing tag, which is
+        \\ZBX-E0508: the repository itself is not in the registry the host names.
+        \\Amazon ECR creates a repository only when someone does, and each account
+        \\and region has its own.
+        \\
+        \\Check the spelling of the repository, and the account and region in the
+        \\host name (<account>.dkr.ecr.<region>.amazonaws.com).
+        ,
+    },
+    .{
+        .code = .E0533,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the web identity token file can't be read",
+        .explanation =
+        \\AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE name a web identity: zbx
+        \\reads the token from the file and exchanges it with STS for temporary
+        \\keys. The file is missing, cannot be read by this user, is empty, or
+        \\does not hold a token (a token is letters, digits, dashes, underscores,
+        \\dots and equals signs on one line). Because the user chose this
+        \\identity, zbx does not go on to the instance's own role.
+        \\
+        \\On EKS the file is mounted by the service account's token projection; in
+        \\GitHub Actions the workflow fetches it and needs "id-token: write".
+        \\Check the path in AWS_WEB_IDENTITY_TOKEN_FILE and its permissions.
+        ,
+    },
+    .{
+        .code = .E0534,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "this Amazon ECR registry is not supported yet",
+        .explanation =
+        \\zbx signs for the standard AWS partition's ECR registries, which are
+        \\named <12 digits>.dkr.ecr.<region>.amazonaws.com. It refuses a registry
+        \\in another partition (GovCloud, China, the isolated clouds), a FIPS or
+        \\dual-stack endpoint, or a host whose region is not a region name,
+        \\instead of signing for the wrong endpoint. Nothing was sent.
+        \\
+        \\Pull through a registry host in the standard partition, or wait for
+        \\support.
+        ,
+    },
+    .{
+        .code = .E0535,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the ECR registry did not accept its authorization token",
+        .explanation =
+        \\zbx got an authorization token from ECR and sent it as Basic credentials
+        \\to the registry, and the registry answered 401. The token is valid for
+        \\twelve hours and for the region it was issued in.
+        \\
+        \\Check that the registry host's region is the one the credentials are
+        \\for, and that the machine's clock is right; then run the command again.
+        \\zbx asks for a new token on every pull.
+        ,
+    },
+    .{
+        .code = .E0550,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the source cannot be packed into an image",
+        .explanation =
+        \\zbx packs a build result, an image or a tree of the store into one image
+        \\layer, and the source named is not one it can pack: there is no such digest
+        \\or reference in the store, or the tree it names is not whole (a directory
+        \\or a file of it is missing from the store or has changed), or a blob
+        \\that was packed earlier is damaged: its bytes are no longer its digest.
+        \\
+        \\The cause says which. Nothing was written to the destination. For a tree
+        \\that is not whole, run `zbx store verify` to see what the store lost, and
+        \\build or import the source again. A damaged blob is dropped, so the same
+        \\command packs it afresh.
+        ,
+    },
+    .{
+        .code = .E0551,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the destination cannot be pushed to",
+        .explanation =
+        \\`zbx push <source> <destination>` puts an image under a tag in a registry,
+        \\and the destination named is not one it can use: it has no tag (a push by
+        \\digest alone is refused, because a registry may delete a manifest that no
+        \\tag points at),
+        \\or it names a digest, or it is not a reference at all.
+        \\
+        \\Name a tag: registry.example/team/app:1.0. The digest of what was pushed is
+        \\printed when the push is done, and `app@sha256:...` pulls it back.
+        ,
+    },
+    .{
+        .code = .E0552,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the registry wants credentials and none were given",
+        .explanation =
+        \\The registry answered a push with `401`: it wants a user and a password, and
+        \\the command gave none. Nothing was sent to the registry's token service.
+        \\
+        \\Give a user name and a file only you can read whose first line is the
+        \\password (or an access token, which most registries prefer):
+        \\`zbx push <image> <destination> --username <user> --password-file <file>`.
+        \\To read the password from standard input instead, use `--password-stdin`;
+        \\that is the way for a CI job, whose secret is then in no argument and no
+        \\file. zbx reads no environment variable for this, no `config.json` and no
+        \\credential helper, and an anonymous push is refused by every registry that
+        \\matters.
+        \\
+        \\An Amazon ECR registry (`<account>.dkr.ecr.<region>.amazonaws.com`) is the
+        \\exception: `zbx push` finds AWS credentials as `zbx pull` does (see
+        \\ZBX-E0527) and asks ECR for a token itself, so it needs no user and
+        \\password. It is this code for ECR only when a library caller gave the push
+        \\no AWS credentials.
+        ,
+    },
+    .{
+        .code = .E0553,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the registry or its token service refused the credentials",
+        .explanation =
+        \\The credentials were sent, and the registry, or the token service it named,
+        \\refused them (`401` or `403`), or the token it gave back does not allow a
+        \\push: it grants the scope `pull` only, or no scope at all.
+        \\
+        \\On Amazon ECR it is the authorization token AWS issued that was refused
+        \\(it lasts 12 hours; run the command again), or the AWS identity that may
+        \\not write to the repository: the cause names the five actions the role's
+        \\policy needs (`ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`,
+        \\`ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`).
+        \\
+        \\The cause says which. For a refusal, check the user and the password file;
+        \\many registries want an access token and not the account's password. For a
+        \\missing `push`, use a token with write access to the repository, or push to
+        \\a repository you own. The user name and the password are never in the
+        \\message.
+        ,
+    },
+    .{
+        .code = .E0554,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the token service is on a host the password may not be sent to",
+        .explanation =
+        \\A registry answers a request without a token by naming a token service (the
+        \\realm of its `WWW-Authenticate` challenge), and zbx sends the user and the
+        \\password there. It does so only when the realm is on the registry's own
+        \\host, is one of the pairs zbx knows (Docker Hub's registry and
+        \\`auth.docker.io`), or, for a registry on loopback, is on loopback, and only
+        \\over HTTPS (plain HTTP on loopback). The cause says which rule this realm
+        \\broke: it is on another host, so a password sent there would reach a
+        \\service the registry merely pointed at; it is not a URL zbx can use; or it
+        \\is plain `http` away from loopback.
+        \\
+        \\Nothing was sent. If the registry is yours, serve its token service from
+        \\its own host; if it is not, do not use it with a password.
+        ,
+    },
+    .{
+        .code = .E0555,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry refused a blob upload",
+        .explanation =
+        \\The registry did not take a blob of the image: it answered the check, the
+        \\mount request, a piece of the bytes or the closing request with a refusal,
+        \\or with something the upload protocol does not allow (a Location that cannot
+        \\be followed, a Range that says it kept fewer bytes than were sent).
+        \\
+        \\The cause names the step and the registry's own code. A `401` is not
+        \\reported here: it is E0552 (no credentials given) or E0553 (refused), and
+        \\so is a `403` with the code `DENIED` once credentials were sent. A `429`
+        \\means wait and try again. Nothing is half-done in a way that matters: a
+        \\push again skips every blob the registry holds, and the manifest is only
+        \\put once all of its blobs are there.
+        ,
+    },
+    .{
+        .code = .E0556,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry refused the manifest",
+        .explanation =
+        \\All the blobs of the image are in the registry, and the registry refused the
+        \\manifest that names them, or answered with a digest other than the
+        \\manifest's own. The cause gives the registry's code (MANIFEST_INVALID,
+        \\MANIFEST_BLOB_UNKNOWN, a tag that may not be overwritten, and the like).
+        \\
+        \\The tag was not moved. A push again sends no blob bytes when the registry
+        \\holds them all.
+        \\
+        \\On Amazon ECR this is also the code for a repository that does not exist
+        \\(`NAME_UNKNOWN`), at any step of the push: ECR never creates one on push.
+        \\Create it with
+        \\`aws ecr create-repository --repository-name <name> --region <region>`
+        \\and push again.
+        ,
+    },
+    .{
+        .code = .E0557,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the export directory exists and is not empty",
+        .explanation =
+        \\`zbx store export --oci` writes an OCI image layout, and it never writes
+        \\into a directory that already holds something, so a second export cannot
+        \\mix with an earlier one or with unrelated files. The directory named
+        \\exists and is not empty, or it is not a directory.
+        \\
+        \\Name a directory that does not exist (zbx makes it), or an empty one.
+        ,
+    },
+    .{
+        .code = .E0558,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the password file or input is unsafe or unusable",
+        .explanation =
+        \\The password for a push is read from the first line of a file, or from
+        \\standard input, and the one given is refused. A file that other users can
+        \\read is refused whole, as a key's passphrase file is, because anyone who
+        \\can read it has the password; so is a symbolic link (name the file it
+        \\points to), a file that is missing, one that cannot be read, an empty line,
+        \\and a user name and password that together are over 4096 bytes. Standard
+        \\input is refused when it is a terminal, where the password would show as it
+        \\is typed.
+        \\
+        \\The cause names the file and the fault. `chmod 600 <file>` makes a file
+        \\private to you. The password is never in the message.
+        ,
+    },
+    .{
+        .code = .E0560,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "there are no Google credentials to pull from this registry",
+        .explanation =
+        \\zbx pulls from Artifact Registry (<region>-docker.pkg.dev) and the four
+        \\gcr.io hosts anonymously first, as from any registry, with one exception:
+        \\when GOOGLE_APPLICATION_CREDENTIALS names an external_account file, zbx
+        \\exchanges it for an access token (workload identity federation) before
+        \\the first request, and that answer is final. Without the variable, when
+        \\the registry refuses the anonymous pull, zbx asks the metadata server of
+        \\a Google Compute Engine instance, once. No source gave an access token.
+        \\The message says what each source did.
+        \\
+        \\On GitHub Actions or GKE, set up workload identity federation and point
+        \\GOOGLE_APPLICATION_CREDENTIALS at its file. On Compute Engine, attach a
+        \\service account that may read the repository to the instance.
+        \\
+        \\A library caller reads no environment: it resolves a token with
+        \\google_credentials_resolve and passes it to the pull. When
+        \\GOOGLE_APPLICATION_CREDENTIALS is set and the caller did not ask for
+        \\workload identity, nothing else is tried in its place.
+        ,
+    },
+    .{
+        .code = .E0561,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the Google credentials file cannot be read",
+        .explanation =
+        \\GOOGLE_APPLICATION_CREDENTIALS names a credentials file, and zbx could not
+        \\read it: it is missing, not readable by this user, not a regular file, or
+        \\larger than 16384 bytes, the bound zbx reads. Once the variable is set,
+        \\its file is the answer: the metadata server is not tried instead. A
+        \\public image still pulls: zbx names the file only when the registry
+        \\refuses the anonymous pull.
+        \\
+        \\Check the path the variable names, or unset the variable.
+        ,
+    },
+    .{
+        .code = .E0562,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "service account key files are not supported",
+        .explanation =
+        \\GOOGLE_APPLICATION_CREDENTIALS names a service account key file. zbx does
+        \\not use key files: a key is a long-lived secret on disk, and anyone who
+        \\has it is the service account. Use workload identity federation instead,
+        \\whose external_account file holds no secret, and delete the key. A
+        \\public image still pulls: zbx names the file only when the registry
+        \\refuses the anonymous pull.
+        ,
+    },
+    .{
+        .code = .E0563,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the Google credentials file is not one zbx supports",
+        .explanation =
+        \\GOOGLE_APPLICATION_CREDENTIALS names a file zbx does not use. zbx reads an
+        \\external_account file (workload identity federation) whose subject token
+        \\comes from a file or an HTTPS url, exchanged at sts.googleapis.com, and
+        \\optionally impersonating a service account through
+        \\iamcredentials.googleapis.com. It does not use gcloud's user credentials
+        \\(authorized_user), executable, AWS or certificate sources, a plain-HTTP
+        \\url, another token_url or universe_domain, or a value written with JSON
+        \\escapes. The message names what the file has. A public image still
+        \\pulls: zbx names the file only when the registry refuses the anonymous
+        \\pull.
+        ,
+    },
+    .{
+        .code = .E0564,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the subject token for workload identity cannot be read",
+        .explanation =
+        \\The external_account file names where its subject token (an OIDC token
+        \\from GitHub Actions, GKE or another provider) is: a file or a url. zbx
+        \\could not read it there, it is empty, or it is larger than 16384 bytes,
+        \\the bound zbx reads. The token itself is never shown.
+        \\
+        \\In GitHub Actions the job needs 'permissions: id-token: write', and an
+        \\OIDC token lasts minutes: fetch it in the job that pulls.
+        ,
+    },
+    .{
+        .code = .E0565,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "Google refused the workload identity token exchange",
+        .explanation =
+        \\zbx sent the subject token to sts.googleapis.com to exchange it for a
+        \\Google token, and STS refused. The message shows Google's error code
+        \\(invalid_grant, invalid_target, ...) and never its text. Check that the
+        \\file's audience names the pool's provider, and that the provider's issuer
+        \\and attribute condition admit the subject token.
+        ,
+    },
+    .{
+        .code = .E0566,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "Google refused to impersonate the service account",
+        .explanation =
+        \\The external_account file impersonates a service account, and
+        \\iamcredentials.googleapis.com refused: the federated identity lacks
+        \\iam.serviceAccounts.getAccessToken on it. Grant the pool's principal (or
+        \\principal set) roles/iam.workloadIdentityUser on the service account.
+        ,
+    },
+    .{
+        .code = .E0567,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the registry refused the Google access token",
+        .explanation =
+        \\zbx sent its Google access token to the registry's token service, as the
+        \\password of the user oauth2accesstoken, and was refused (401), or the
+        \\token handed to the pull had already expired, in which case nothing was
+        \\sent. Access tokens last about an hour. Get a new one and check that this
+        \\machine's clock is right.
+        ,
+    },
+    .{
+        .code = .E0568,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the identity may not read the repository, or it does not exist",
+        .explanation =
+        \\The registry denied the pull. Artifact Registry answers a repository the
+        \\identity may not read and one that does not exist alike. The identity
+        \\needs artifactregistry.repositories.downloadArtifacts on the repository,
+        \\which roles/artifactregistry.reader grants. Check the repository's
+        \\project, name and region too.
+        ,
+    },
+    .{
+        .code = .E0569,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the repository does not exist",
+        .explanation =
+        \\The registry says the repository named does not exist (NAME_UNKNOWN).
+        \\Check the project, the repository and the region in the reference. The
+        \\gcr.io hosts are served by an Artifact Registry repository named gcr.io
+        \\in the project, in the host's location: the project needs one.
+        ,
+    },
+    .{
+        .code = .E0570,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the Google registry host is not one zbx authenticates to",
+        .explanation =
+        \\The host is a Google registry of a shape zbx sends no credentials to:
+        \\any *.pkg.dev host but <region>-docker.pkg.dev, or any *.gcr.io host but
+        \\gcr.io, us.gcr.io, eu.gcr.io and asia.gcr.io (mirror.gcr.io is Docker
+        \\Hub's public mirror). zbx pulls from it anonymously, and it refused. Pull
+        \\the image from a supported host.
+        ,
+    },
+    .{
+        .code = .E0571,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "workforce pools are not supported",
+        .explanation =
+        \\The external_account file's audience is a workforce identity pool (for
+        \\people signing in through an identity provider). zbx supports workload
+        \\identity pools, for machines and CI. Use a workload identity pool's
+        \\provider. A public image still pulls: zbx names the file only when the
+        \\registry refuses the anonymous pull.
+        ,
+    },
+    .{
+        .code = .E0572,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a Google credential service failed",
+        .explanation =
+        \\One step of getting a Google access token failed without a refusal zbx
+        \\can explain: the subject token url, sts.googleapis.com,
+        \\iamcredentials.googleapis.com or the metadata server did not answer,
+        \\refused with no error code, or answered with no usable token or one
+        \\already out of date. The message names the step. Run the command again;
+        \\if it repeats, the service or a proxy on the way is at fault. A token out
+        \\of date can also be this machine's clock.
+        ,
+    },
+    .{
+        .code = .W0501,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "device nodes in a layer were left out",
+        .explanation =
+        \\A layer holds device nodes, FIFOs or sockets. The store keeps regular
+        \\files, directories and symlinks only, and a rootless container cannot
+        \\make device nodes, so they were skipped. The message names the first
+        \\and says how many there were.
+        \\
+        \\A container gets its own /dev, so a root filesystem does not miss them.
+        ,
+    },
+    .{
+        .code = .W0502,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "extended attributes in a layer were left out",
+        .explanation =
+        \\The store keeps the user.* attributes and security.capability. A layer
+        \\carried others (trusted.*, system.*, security.selinux), too many on one
+        \\file or too large, or this file system would not take them, so they
+        \\were skipped. The message names the first file and says how many.
+        \\
+        \\The tree's digest does not cover them. Nothing to do unless the image
+        \\relies on file capabilities that were refused: then the program may
+        \\need a different capability setup.
+        ,
+    },
+    .{
+        .code = .W0503,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "no zbx.lock was found, so one was written",
+        .explanation =
+        \\zbx run was given an image name and there is no zbx.lock in the working
+        \\directory or any directory above it. It pulled the image and wrote zbx.lock
+        \\in the working directory, recording which manifest and tree the name meant
+        \\today. Commit the file to keep every machine on the same image. The next run
+        \\checks the store against it and refuses if they differ.
+        ,
+    },
+    .{
+        .code = .W0504,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "warnings from unpacking an image were not shown",
+        .explanation =
+        \\Unpacking an image can warn (device nodes or extended attributes left
+        \\out: W0501 and W0502). The process that unpacks reports its warnings
+        \\through a pipe of a fixed size, and an image that raises more than fit
+        \\had the rest counted but not sent. The image was unpacked and recorded;
+        \\only the warnings are missing.
+        \\
+        \\The message says how many were not shown. Nothing to do unless one of
+        \\mattered. The image is the same either way.
+        ,
+    },
+    .{
+        .code = .W0551,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "the image's tree annotation is not the tree its layers unpack to",
+        .explanation =
+        \\A manifest pushed by zbx carries an `org.zigbox.tree` annotation: the tree
+        \\digest of the image as it was packed. This image's layers unpacked to a
+        \\different tree. The image was pulled and recorded all the same.
+        \\
+        \\The usual cause is benign: the same layers unpack to a different tree on a
+        \\host with another id mapping (a full subuid range on the pusher's host, a
+        \\single id on this one). Compare the id mode "zbx doctor" reports on both
+        \\hosts. If they differ, nothing is wrong. If they match, the annotation is
+        \\wrong, or the layers are not the ones the pusher packed.
+        \\
+        \\Nothing trusts the annotation: a policy judges the tree this pull made, and
+        \\a signature counts only if it names that tree. A signature made for the
+        \\annotated tree therefore does not cover this image. If you expected it to,
+        \\do not rely on it: ask whoever pushed the image, and sign the tree this pull
+        \\made only if you have checked it yourself.
+        ,
+    },
+    .{
+        .code = .W0552,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the push succeeded but this host did not record the tag",
+        .explanation =
+        \\The registry holds the image under the tag, and the manifest digest was
+        \\printed. This host's store could not write its record that the image has
+        \\that tag, so a later `zbx run` or `zbx sign` by that name will not find it
+        \\here, until the record is made.
+        \\
+        \\The cause names the destination and why the store could not be written
+        \\(a full or read-only disk, say). Fix that, then push the same image to the
+        \\same destination again: the registry already holds every blob, so nothing
+        \\is sent but the manifest, and the record is written.
+        ,
+    },
+    .{
+        .code = .E0600,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--publish is not a usable HOST:CONTAINER",
+        .explanation =
+        \\--publish HOST:CONTAINER forwards TCP port HOST of this machine to port
+        \\CONTAINER of the container, through pasta. Both are decimal port numbers
+        \\from 1 to 65535, with no protocol after them: every forward is TCP. The
+        \\option may be given up to 16 times, each with its own host port.
+        \\
+        \\--publish gives the container a network of its own through pasta, as
+        \\--net user does, so it needs no --net. The cause names what is wrong with
+        \\the value; nothing was started.
+        ,
+    },
+    .{
+        .code = .E0601,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "pasta is not installed",
+        .explanation =
+        \\--net user and --publish connect the container to the network through
+        \\pasta, a program from the passt project that runs as the user, needs no
+        \\privilege and changes no firewall rule, route or interface of the host.
+        \\zbx looks for it in the directories of PATH and found none.
+        \\
+        \\Install it (Debian and Ubuntu: apt install passt; Fedora: dnf install
+        \\passt), or run without a network (the default) or with the host's
+        \\(--net host). zbx doctor shows whether pasta was found.
+        ,
+    },
+    .{
+        .code = .E0602,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "pasta is too old",
+        .explanation =
+        \\zbx attaches pasta to the container's network namespace by the
+        \\container's process id. pasta releases created before 2024_02_16 do not
+        \\notice when such a namespace goes away, so they would keep the published
+        \\ports after the container ended. zbx refuses them before it starts
+        \\anything.
+        \\
+        \\The cause names the version found and the one needed. Install a newer
+        \\passt package; Ubuntu 24.04 and Debian 13 ship one that is new enough.
+        ,
+    },
+    .{
+        .code = .E0603,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "pasta failed to start",
+        .explanation =
+        \\zbx started pasta to connect the container's network namespace, and pasta
+        \\ended, or did not report the interface ready within 10 seconds, before
+        \\the container's command could run. The container was stopped and never
+        \\ran.
+        \\
+        \\The cause is pasta's own last line. Its whole output is in the run's
+        \\pasta log, named in the context (zbx state directory, logs). A host with
+        \\no default route, or a security policy that confines pasta, are the
+        \\usual reasons.
+        ,
+    },
+    .{
+        .code = .E0604,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a published host port is already in use",
+        .explanation =
+        \\--publish HOST:CONTAINER has pasta listen on port HOST of this machine,
+        \\on every address. Another program already listens there, so pasta could
+        \\not, and the container was not started.
+        \\
+        \\Choose another host port, or stop the program that holds it. On the host,
+        \\ss -tlnp shows which program listens on which port.
+        ,
+    },
+    .{
+        .code = .E0605,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the host lets users bind no port this low",
+        .explanation =
+        \\pasta listens on the host's port as the user, without privilege. Linux
+        \\lets an unprivileged process bind only ports from
+        \\net.ipv4.ip_unprivileged_port_start up (1024 unless changed), so a lower
+        \\host port was refused before anything started. The container's own port
+        \\may be low: port 80 inside the container works.
+        \\
+        \\Publish a host port at or above that bound (--publish 8080:80), or lower
+        \\the bound for every user, as root:
+        \\    sysctl net.ipv4.ip_unprivileged_port_start=80
+        ,
+    },
+    .{
+        .code = .E0606,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--listen is refused with these options",
+        .explanation =
+        \\--listen ADDR:PORT makes a TCP listener on the container's own loopback
+        \\and hands it to the program that started zbx, which accepts the
+        \\connections: the container never gets a way out. That only makes sense
+        \\when the container has no network of its own (--net none, the default),
+        \\and it needs --listen-send FD, a Unix socket this process was started
+        \\with, to carry the listener on. Nothing was started.
+        \\
+        \\Drop --net (or give --net none), and add --listen-send with the number of
+        \\the Unix socket the parent passed down. The number is a descriptor
+        \\(0 to 2147483647) that is already open in zbx and is a Unix stream
+        \\socket; zbx checks that before it starts anything.
+        \\
+        \\On macOS --listen is not available at all: the container runs in a
+        \\virtual machine, and a socket cannot be handed across to the process
+        \\that started zbx.
+        ,
+    },
+    .{
+        .code = .E0607,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--listen takes 127.0.0.1 and a port from 1 to 65535",
+        .explanation =
+        \\The listener lives on the container's loopback, so its address is always
+        \\127.0.0.1 (IPv4); any other address, a name or an IPv6 address is
+        \\refused, and so is a port that is not a number from 1 to 65535. Nothing
+        \\was started.
+        \\
+        \\Write it as --listen 127.0.0.1:8080.
+        ,
+    },
+    .{
+        .code = .E0608,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the listener could not be made inside the container",
+        .explanation =
+        \\Inside the container's network namespace zbx makes a TCP socket, binds
+        \\it to 127.0.0.1 and the port from --listen, and listens. One of those
+        \\calls failed or the listener could not be taken from the container; the
+        \\context names the step and the cause names the call and the error. The
+        \\container was not started.
+        \\
+        \\A kernel or security policy that denies sockets, or a descriptor limit,
+        \\is the usual reason; run zbx doctor to see what this host allows.
+        ,
+    },
+    .{
+        .code = .E0609,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the listener could not be handed on to --listen-send",
+        .explanation =
+        \\zbx hands the listener to the descriptor named by --listen-send with
+        \\SCM_RIGHTS, so that program can accept connections. The send failed: the
+        \\descriptor no longer takes it, usually because the other end was closed
+        \\after zbx started; the container was stopped, so no one is left holding a
+        \\listener nobody serves. A descriptor that is not an open Unix stream
+        \\socket is refused earlier, with E0606, before anything starts.
+        \\
+        \\Pass one end of a socketpair(AF_UNIX, SOCK_STREAM), keep the other end,
+        \\and read the listener from it with recvmsg.
+        ,
+    },
+    .{
+        .code = .E0610,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a socket can be made only in a container with --net none",
+        .explanation =
+        \\A socket made for a container lives in the container's network namespace.
+        \\zbx makes one only in a container started with --net none (the default),
+        \\whose namespace holds nothing but its own loopback. A container started with
+        \\--net host shares the host's network namespace, so a socket made "in" it
+        \\would be the host's: that would open a port on the host under the
+        \\container's name. A container with --net user reaches the outside through
+        \\pasta, and sockets in it are not offered.
+        \\
+        \\Start the container with --net none (or without --net) and ask again.
+        ,
+    },
+    .{
+        .code = .E0611,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a socket could not be made inside the container",
+        .explanation =
+        \\zbx makes the socket with a short-lived helper process that joins the
+        \\container's user and network namespaces, opens the socket and hands it back
+        \\with SCM_RIGHTS. One of those steps failed; the step and the system error
+        \\are in the message. Usual causes: the caller is not the user that started
+        \\the container (joining its user namespace is then refused), the container
+        \\ended while the helper ran, or the caller has no free descriptor. A caller
+        \\that ignores SIGCHLD has its helper reaped by the kernel, and the wait for
+        \\it fails with ECHILD: leave SIGCHLD at its default to use this call.
+        \\
+        \\The helper is a child of the caller and never enters the container's PID
+        \\namespace, so nothing inside the container can see or signal it.
+        ,
+    },
+    .{
+        .code = .E0612,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the hosts file cannot be bound at /etc/hosts",
+        .explanation =
+        \\--hosts-file binds a file you own, read-only, at /etc/hosts in place of the
+        \\one zbx generates. It is refused for a container with a network (a
+        \\container with --net user or --net host resolves names through DNS, and a
+        \\hosts file would shadow it), for a path that is not absolute, and for a
+        \\path that is missing, not a regular file, not readable by you, or that
+        \\cannot be followed to a file (a loop of symbolic links) or read when the
+        \\container starts. The cause says which.
+        \\
+        \\The file itself is bound, not a copy: rewriting it in place is seen inside
+        \\at once, replacing it by renaming another file over it is not. The path is
+        \\not kept in the container's run record, so nothing that reads the record
+        \\(zbx ps, a bundle, an agent that adopts the container) learns it, and a
+        \\container run again gets it only if it is given again. /etc/resolv.conf and
+        \\/etc/hostname are generated as before.
+        ,
+    },
+    .{
+        .code = .E0701,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "no state directory to keep bundles and run records in",
+        .explanation =
+        \\zbx keeps run records and diagnostic bundles under $XDG_STATE_HOME/zbx,
+        \\or ~/.local/state/zbx when that is not set, and the layers of a container
+        \\started from a tree digest under its containers directory. Neither
+        \\variable names an absolute directory here, so there is nowhere to read a
+        \\run record from, to write a bundle to or to put a container.
+        \\
+        \\Set HOME, or point XDG_STATE_HOME at a directory you can write to.
+        ,
+    },
+    .{
+        .code = .E0702,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't write the bundle",
+        .explanation =
+        \\The bundle was put together but could not be saved in the bundles
+        \\directory under the state directory ($XDG_STATE_HOME/zbx/bundles, or
+        \\~/.local/state/zbx/bundles). The cause says why; a full disk is the usual
+        \\one. Nothing partial is left behind: the file is written under a
+        \\temporary name and renamed only when it is complete.
+        \\
+        \\Free space, or point XDG_STATE_HOME at a directory with room, and run the
+        \\same command again.
+        ,
+    },
+    .{
+        .code = .E0703,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no run record with that name",
+        .explanation =
+        \\"zbx bundle <name>" collects the record of one run, found by its name in
+        \\the runs directory under the state directory. There is none called that:
+        \\the name is misspelled, or the record was deleted. zbx keeps the newest 32.
+        \\
+        \\"zbx bundle --last" takes the most recent run whatever its name.
+        ,
+    },
+    .{
+        .code = .E0704,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no runs are recorded yet",
+        .explanation =
+        \\"zbx bundle --last" collects the most recent run, but the runs directory
+        \\holds no record that can be read: nothing has been run with this state
+        \\directory yet, or the records were deleted or are from a newer zbx.
+        \\
+        \\Run something first with "zbx run", then ask for the bundle.
+        ,
+    },
+    .{
+        .code = .E0705,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "not a valid state volume name",
+        .explanation =
+        \\A state volume's name is a directory name under the state directory, never
+        \\a path: lowercase letters, digits, '.', '-' and '_', starting with a letter
+        \\or a digit, at most 63 bytes. "pgdata", "web.cache" and "db_2" are names;
+        \\"PgData", ".hidden" and "a/b" are not.
+        \\
+        \\--state takes NAME:PATH, or NAME:PATH:ro to mount it read-only:
+        \\    zbx run --state pgdata:/var/lib/postgresql/data postgres:16
+        ,
+    },
+    .{
+        .code = .E0706,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the state volume is in use",
+        .explanation =
+        \\A state volume has one writer at a time. A run that mounts it read-write
+        \\holds it for its whole life, from before its command starts until it ends
+        \\(a clean exit, zbx stop, --timeout, a killed container or a killed zbx all
+        \\let it go). A run that mounts it with :ro shares it with other readers,
+        \\never with a writer. zbx state rm needs it free as well.
+        \\
+        \\The cause names the container that holds it. Stop that container first
+        \\(zbx stop <name>), or mount the volume read-only with NAME:PATH:ro if
+        \\reading is all this run needs.
+        ,
+    },
+    .{
+        .code = .E0707,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no state volume with that name",
+        .explanation =
+        \\There is no state volume of that name in the state directory
+        \\($XDG_DATA_HOME/zbx/state, or ~/.local/share/zbx/state). A volume is made
+        \\only by the first run that names it with --state, and removed only by zbx
+        \\state rm, after which zbx state restore brings it back for a week.
+        \\
+        \\zbx state ls lists the volumes, and the trash.
+        ,
+    },
+    .{
+        .code = .E0708,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a state volume with that name exists already",
+        .explanation =
+        \\zbx state restore puts a removed volume back under its name, and a volume
+        \\of that name was made again since it was removed (a run named it with
+        \\--state). Restoring would replace the new one, so nothing was changed.
+        \\
+        \\Remove the new volume first if it is not needed (zbx state rm <name>,
+        \\which moves it to the trash too), then restore the old one.
+        ,
+    },
+    .{
+        .code = .E0709,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no state volume with that name in the trash",
+        .explanation =
+        \\zbx state restore brings back a volume that zbx state rm moved to the trash.
+        \\The trash has no volume of that name: it was never removed, the name is
+        \\misspelled, or its trash was emptied by a later zbx state rm after it
+        \\expired.
+        \\
+        \\zbx state ls lists the volumes and what the trash holds.
+        ,
+    },
+    .{
+        .code = .E0710,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the state volume's trash has expired",
+        .explanation =
+        \\What zbx state rm moves to the trash is kept for 7 days, as what zbx store
+        \\gc moves is; after that the next zbx state rm empties it. This volume was
+        \\removed longer ago than that, so it is not restored: an expired trash is
+        \\due to go, and bringing it back would make the expiry a matter of luck.
+        \\
+        \\Its files are still in the trash directory until then
+        \\(<state>/.trash/<name>@<seconds>), and can be copied out by hand from the
+        \\user's namespace: unshare --map-auto --map-root-user, then cp -a.
+        ,
+    },
+    .{
+        .code = .E0711,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't make or read the state directory",
+        .explanation =
+        \\State volumes live in $XDG_DATA_HOME/zbx/state, or ~/.local/share/zbx/state
+        \\when that is not set, beside the store. Either neither variable names an
+        \\absolute directory, or a directory or file there could not be made, read
+        \\or written; the cause names the path and what the system said. A full
+        \\disk and a directory owned by another user are the usual reasons.
+        \\
+        \\Set HOME, or point XDG_DATA_HOME at a directory you own with room.
+        ,
+    },
+    .{
+        .code = .E0712,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't read a state volume's record",
+        .explanation =
+        \\Each volume has a small record, <state>/<name>/state.zon: when it was made,
+        \\when it was last used and by which container. This one is damaged, or was
+        \\written by a newer zbx, which this one does not misread.
+        \\
+        \\Use the zbx that wrote it, or move the record aside: the volume's files in
+        \\<state>/<name>/data are not touched, and the next run writes a new record.
+        ,
+    },
+    .{
+        .code = .E0713,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't mount a state volume in the container",
+        .explanation =
+        \\A state volume is bound into the container before its command starts: its
+        \\data directory is made by the container's root, bound in the container's
+        \\/dev, then moved onto its path once the container's root is entered, so
+        \\that the path is read as the container reads it. One of those steps
+        \\failed; the cause names it and what the kernel said.
+        \\
+        \\With --read-only the path must already exist in the image: nothing can be
+        \\made in a read-only root. zbx doctor shows what this host allows.
+        ,
+    },
+    .{
+        .code = .E0714,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "won't write the archive to a terminal",
+        .explanation =
+        \\zbx state export writes a gzip-compressed tar archive: binary data a
+        \\terminal would show as noise. Standard output is a terminal, so nothing
+        \\was read.
+        \\
+        \\Name a file with -o, or redirect the output:
+        \\    zbx state export pgdata -o pgdata.tar.gz
+        \\    zbx state export pgdata > pgdata.tar.gz
+        ,
+    },
+    .{
+        .code = .E0715,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't write the archive",
+        .explanation =
+        \\The archive could not be written: the file named with -o cannot be made,
+        \\the disk is full, or the output was closed. The cause says which. A file
+        \\that was started is removed again; nothing partial is left.
+        \\
+        \\Free space, or write somewhere else with -o.
+        ,
+    },
+    .{
+        .code = .E0716,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't read the state volume to export it",
+        .explanation =
+        \\Exporting reads every file of the volume in the user's namespace, where
+        \\files of the container's users can be read. The read stopped: a file or
+        \\directory could not be read, one changed while it was read, the tree is
+        \\deeper than 64 directories, a path is longer than 4095 bytes, or it has
+        \\more entries or more files with several names than one export keeps
+        \\(4194304 and 16384). The cause says which.
+        \\
+        \\Nothing is written for a stopped export when -o names a file. A volume
+        \\that a container is still changing cannot be read consistently: stop it
+        \\first.
+        ,
+    },
+    .{
+        .code = .W0701,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "writing a bundle without redaction",
+        .explanation =
+        \\--no-redact keeps the environment values, labels, and anything that looks
+        \\like a password, token or key in the bundle exactly as they were. Nobody
+        \\should send such a bundle anywhere without reading every file in it first.
+        \\
+        \\Leave --no-redact out and the values are replaced by [redacted:<kind>],
+        \\which is what you want for a bug report.
+        ,
+    },
+    .{
+        .code = .W0702,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a state volume's size could not be counted",
+        .explanation =
+        \\zbx state ls counts a volume's size in the user's namespace, where files of
+        \\the container's users can be read, each file with several names once. The
+        \\count stopped for this volume (a file could not be read, the tree is deeper
+        \\than 64 directories, or it has more names or hard links than one listing
+        \\keeps), so its size is shown as unknown. The rest of the listing is right.
+        \\
+        \\du -sh in the user's namespace counts it by hand:
+        \\    unshare --map-auto --map-root-user du -sh <state>/<name>/data
+        ,
+    },
+    .{
+        .code = .W0703,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a file was left out of the export",
+        .explanation =
+        \\A state volume can hold files a tar archive of this kind does not keep:
+        \\devices, sockets and fifos. Each one is skipped with this note (the
+        \\first 16; the rest are counted). The archive holds everything else, and
+        \\is complete without them.
+        ,
+    },
+    .{
+        .code = .E0801,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "can't read the build file",
+        .explanation =
+        \\zbx build reads zbx.build.zon in the project directory (the nearest
+        \\directory up with a zbx.lock, else the working directory), or the file
+        \\named with -f, which must be inside the project. It is a small subset of
+        \\ZON: structs, strings, string lists, true and false, and .version = 1,
+        \\with // comments. The cause names the line and column and what was
+        \\expected there, or the value that is refused and why.
+        \\
+        \\The fields: .version and .image are required, .steps is optional. A
+        \\step has .name ([a-z0-9-], at most 32 bytes, not "image"), .base (an
+        \\image reference), .run (an argv), and optionally .inputs, .needs, .env
+        \\(KEY=VALUE) and .network. .image has an optional .base, .add (each with
+        \\.from, a step, and .to, an absolute path) and .config.
+        \\
+        \\Print what a file says, once it reads, with zbx build --graph.
+        ,
+    },
+    .{
+        .code = .E0802,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the build graph is invalid",
+        .explanation =
+        \\The steps of a build file form a graph: each step can name steps it
+        \\needs, whose outputs it sees under /in/<name>, and .image.add takes
+        \\outputs from steps. The graph is refused when two steps have the same
+        \\name, a need or an add names no step, a step lists a need twice or more
+        \\than 6, or steps need each other round. A step is also refused when its
+        \\needs, binds and caches, plus /src and /out (not counted with .output =
+        \\.root), are more than the 8 mounts a run holds. A cycle is named in
+        \\need order: a -> b -> a means a needs b and b needs a.
+        \\
+        \\The same code refuses a file that parses but uses something this zbx
+        \\reads and does not build: a copy with .chown or .chmod, a copy from
+        \\an image, an .exclude on a copy from a step:, a bind from the
+        \\project's files or from an image (a bind takes a step: output only),
+        \\or a bind on a copy step. The cause names the field; zbx build
+        \\--graph still shows the whole file.
+        \\
+        \\Nothing runs before the whole graph is valid. zbx build --graph prints
+        \\it, in the order a build starts the steps.
+        ,
+    },
+    .{
+        .code = .E0803,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a build input is refused",
+        .explanation =
+        \\A step's .inputs are files or directories of the project, written as
+        \\paths relative to the project directory (src/main.go: no leading /, no
+        \\. or .. part). Each is resolved with every symbolic link followed, and
+        \\must be there, be a file or a directory, and stay inside the project. A
+        \\link that leads out is refused naming where it leads, as a --mount
+        \\outside the project is: a build sees only what the project holds.
+        \\
+        \\Inputs are checked before anything runs. A copy step's .src is refused
+        \\when it matches nothing, and when it matches more than one path while
+        \\its .to does not end in /: every match would land on the one path, so,
+        \\as Docker does, end .to with / to copy each match into a directory.
+        ,
+    },
+    .{
+        .code = .E0804,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a build step's base is not locked",
+        .explanation =
+        \\Each step's .base is a reference that zbx.lock pins: a tag or a digest
+        \\reference, with the manifest and tree it resolved to. A build never
+        \\resolves a tag itself, so a base the lock does not list is refused
+        \\before anything runs. zbx pull <ref> pulls the image and records it in
+        \\zbx.lock; commit the lock with the build file so every build of the
+        \\project uses the same base.
+        ,
+    },
+    .{
+        .code = .E0805,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a build step failed",
+        .explanation =
+        \\A step runs its .run command in a container made from its base, with its
+        \\inputs read-only at /src, each needed step's output at /in/<name>, and
+        \\/out to write its output into. Only a step whose command exits 0 has an
+        \\output. The first line says how it ended: its exit code, a signal, out
+        \\of memory, the process limit, or the step's timeout (30 minutes), in the
+        \\words zbx run uses.
+        \\
+        \\A step has no network unless it says .network = true, so a step that
+        \\fetches something fails as one that cannot resolve a name. The step's
+        \\whole output is kept in its log.
+        \\
+        \\The step is also refused, with this code, when its environment is too
+        \\large: the base image's variables, the step's .env and the fixed ones
+        \\together are more than a command can be given. Remove variables from
+        \\.env or use a base with a smaller environment.
+        ,
+    },
+    .{
+        .code = .E0806,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a build step's output is refused",
+        .explanation =
+        \\What a step leaves in /out becomes its output tree, owned by 0:0, with
+        \\the modes the step wrote and no extended attributes. A tree holds files,
+        \\directories and symbolic links only, so a device file, a FIFO or a
+        \\socket left in /out fails the step instead of being dropped: a later
+        \\step or the image would miss it. An output larger than the store's
+        \\limits on files, paths or depth is refused as the store refuses any
+        \\tree (E0415).
+        ,
+    },
+    .{
+        .code = .E0807,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the image can't be made as declared",
+        .explanation =
+        \\.image in the build file declares the result: a base, the step outputs
+        \\added to it, and an optional .config saying how it runs. .config is
+        \\refused when a field is not what it can be: .workdir must be an
+        \\absolute path, .user is a name, a number, or user:group of those (a name
+        \\is looked up in the image when the build runs), each .env entry is
+        \\KEY=VALUE, and a label key is [a-z0-9._/-] and given once. The cause
+        \\names the field and why.
+        ,
+    },
+    .{
+        .code = .E0808,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the build was stopped by a signal",
+        .explanation =
+        \\zbx build stops when it gets SIGINT (Ctrl-C) or SIGTERM (kill, or a CI job
+        \\that timed out). It does not end at once: it stops the steps that are
+        \\running, removes the work they had begun and the store roots that kept
+        \\their inputs, and then exits with this error, so a stopped build leaves
+        \\nothing for store gc to keep. The steps that had finished are in the build
+        \\cache, and the next zbx build starts from them.
+        \\
+        \\The cause names the signal. Nothing is wrong with the build file or the
+        \\host; run zbx build again when you want the result. A build started in the
+        \\background of a script, with the signal ignored, keeps ignoring it.
+        ,
+    },
+    .{
+        .code = .W0801,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "the build has steps that use the network",
+        .explanation =
+        \\A step with .network = true in the build file runs with the network (through
+        \\pasta), so what it produces can depend on what the network returned that
+        \\day, not only on the build's inputs. zbx still caches such a step like any
+        \\other, so a rebuild does not fetch again and the result digest stays put
+        \\until an input changes; the report marks the step "net". A fresh machine
+        \\with an empty cache can build a different result.
+        \\
+        \\The cause names the steps. To make the build reproducible, pin what the
+        \\step fetches (a version, or a checksum the command verifies), or fetch it
+        \\once, outside the build, and list the file as an input.
+        ,
+    },
+    .{
+        .code = .E0817,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a user, group or owner id cannot be used",
+        .explanation =
+        \\A step's .user, a copy's .chown, or the image's .config .user names a user
+        \\or group, and zbx looks the name up in /etc/passwd and /etc/group of the
+        \\tree the step's base holds. A name that is not there is refused when the
+        \\step is about to start, so a build does not silently run as the wrong id.
+        \\A base of the form step:NAME exists only once that step has run, so the
+        \\refusal can come after earlier steps have.
+        \\
+        \\The cause names where the name was written (the step or .image.config) and
+        \\the name. To fix it, add the user or group in an earlier step (for example a
+        \\step that runs adduser) and base this step on it with .base = "step:NAME",
+        \\or write the id as a number. When /etc/passwd (over 128 KiB) or /etc/group
+        \\(over 256 KiB) is too large to read, the cause says so: write numbers.
+        \\
+        \\A copy's .chown is refused the same way for an id no file can have: an id
+        \\of 4294967295, which the kernel reads as no owner, and, on a host that maps
+        \\the full range, an id above 65536, which the store's user namespace does
+        \\not map. The cause names the id and the range the namespace maps.
+        ,
+    },
+    .{
+        .code = .E0818,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a glob matched more paths than one import can hold",
+        .explanation =
+        \\An input or a copy source written as a glob is matched against the project
+        \\when the build runs, and every path it matches is kept so that the step's
+        \\inputs enter its tree in order. One import (a step's inputs, or one copy
+        \\entry's source, from the project or from a step's output) holds at most
+        \\65536 matched paths and 4 MiB of their names; each import starts afresh.
+        \\A directory that a glob matches counts once, however many files it holds.
+        \\
+        \\The cause names the input and the bound. To fix it, match a directory
+        \\instead of the files in it, narrow the glob, or add the paths you do not
+        \\need to .exclude (an excluded path is never walked into when no line
+        \\re-includes anything).
+        ,
+    },
+    .{
+        .code = .E0820,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a fetch could not be downloaded",
+        .explanation =
+        \\A copy entry's .fetch is downloaded in the parent when its copy step misses
+        \\the cache, through the same HTTP client a pull uses (proxies from the
+        \\environment, SSL_CERT_FILE honoured). Only https:// is fetched; plain
+        \\http:// only for a loopback host. A redirect may not go from https to http,
+        \\nor from a host that is not loopback to one that is (127.1, 0x7f.0.0.1 and
+        \\the other spellings of 127/8 and 0.0.0.0 count as loopback), and at most 4
+        \\redirects are followed. A body over 1 GiB is refused.
+        \\
+        \\The message says why: the HTTP status, the network error, the size bound,
+        \\the redirects. A step that hits the cache downloads nothing, and neither
+        \\does one whose bytes are in the store already (blobs/sha256 under the
+        \\pinned hash, from an earlier build or a pull), so a build on a host that
+        \\can reach the URL fills the store for one that cannot.
+        ,
+    },
+    .{
+        .code = .E0821,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the fetched bytes do not match their pinned hash",
+        .explanation =
+        \\A copy entry's .fetch pins the file by its SHA-256, and the bytes are
+        \\hashed as they arrive. When the hash is not the pinned one, the file is
+        \\removed, nothing reaches the store, and no step runs.
+        \\
+        \\Either side can be wrong. If the hash was copied wrongly, correct .sha256
+        \\(or the Dockerfile's ADD --checksum). If it was right, the server's file
+        \\has changed: find out why before trusting the new bytes.
+        ,
+    },
+    .{
+        .code = .W0802,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "the build has steps with cache mounts",
+        .explanation =
+        \\A step with .caches mounts a directory that lives outside the build's result
+        \\and persists between builds, so what the step produces can depend on what
+        \\the cache held, not only on the build's inputs. zbx never puts a cache in a
+        \\step's key, so a rebuild that hits the step cache is unchanged, but a step
+        \\that does run on another machine, or after --clear-caches, can produce
+        \\different bytes.
+        \\
+        \\The cause names the steps. To make the build reproducible, keep the cache to
+        \\things the command verifies or rebuilds (a download cache), and do not let
+        \\the command's output depend on what was in it.
+        ,
+    },
+    .{
+        .code = .E0810,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the Dockerfile can't be read",
+        .explanation =
+        \\zbx import reads a Dockerfile (./Dockerfile, the one named, or Dockerfile in
+        \\--context) and translates it into a build file. It is refused when the file
+        \\is not there, cannot be read or is larger than 256 KiB, and when its text is
+        \\not a Dockerfile: an unknown instruction, a line continued past the end, a
+        \\heredoc with no end, a bad escape directive, an instruction missing its
+        \\arguments, or an ENV or LABEL word that is not KEY=VALUE or has no name
+        \\before the `=`.
+        \\
+        \\The cause names the line and what was expected there. Nothing is written: an
+        \\import that is refused leaves the project as it was.
+        ,
+    },
+    .{
+        .code = .E0811,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a Dockerfile instruction or flag is not supported",
+        .explanation =
+        \\zbx import translates what a build file can say the same way, and refuses
+        \\the rest rather than guess: ADD from a URL without --checksum=sha256:<hex>
+        \\(with it, the URL written in full, it is a pinned fetch), a git repository
+        \\or a local archive, a RUN --mount of a secret, an ssh agent or a tmpfs, a
+        \\bind from the context or an image, --network=host, --security=insecure,
+        \\--device, ONBUILD, COPY heredocs and --parents, FROM --platform for another
+        \\platform, FROM scratch with steps, and the pattern forms of variable
+        \\substitution (${X#p} and the like).
+        \\
+        \\The cause names the instruction or flag and its line; the fix says what to
+        \\write instead, often an ADD --checksum or a RUN that fetches with a
+        \\checksum. Where zbx differs from Docker: steps run rootless, with a fixed
+        \\environment and timestamps; there is no daemon cache, only the store's; a
+        \\RUN with no detected fetch has no network; and image references are pinned
+        \\once in zbx.lock and never re-resolved by a build.
+        ,
+    },
+    .{
+        .code = .E0812,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a Dockerfile variable has no value",
+        .explanation =
+        \\zbx import substitutes variables where Docker does (FROM, COPY, ADD, ENV,
+        \\WORKDIR, USER, LABEL and the rest, never in a RUN's text), and resolves each
+        \\ARG once, at import: from --build-arg, else from its default. An ARG that is
+        \\used but has neither has no value, and a ${X?message} or ${X:?message} whose
+        \\variable is unset refuses the import as Docker refuses the build.
+        \\
+        \\The cause names the variable and its line. Give the value on the command
+        \\line with --build-arg NAME=VALUE, or a default in the Dockerfile (ARG
+        \\NAME=VALUE).
+        ,
+    },
+    .{
+        .code = .E0813,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a Dockerfile stage can't be used",
+        .explanation =
+        \\A Dockerfile's stages become chains of steps, each named after its stage
+        \\(<stage>-<n>, the name lowered and cut to [a-z0-9-], stage<i> for an unnamed
+        \\one). The import is refused when --target names no stage, when a FROM, COPY
+        \\--from or --mount from names a stage that is not defined before it, when the
+        \\stages use each other in a cycle, and when two stages' names give the same
+        \\step names: zbx never renames a step silently.
+        \\
+        \\The cause names the stage and its line. Rename one of two colliding stages,
+        \\or give --target one of the stages the Dockerfile defines.
+        ,
+    },
+    .{
+        .code = .E0814,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--hermetic refused a step",
+        .explanation =
+        \\zbx import --hermetic refuses a translation in which any step would have the
+        \\network or a cache mount, because such a step's output can depend on more
+        \\than its inputs. A RUN gets the network when it says --network=default and
+        \\the import's --network is all, or when --network detect finds a fetching
+        \\command in its text (apk add, apt-get, pip install, go mod download, curl
+        \\and the rest of the checked-in table); a RUN --mount=type=cache gets a
+        \\cache. A bind from another stage's step is not refused: that step's output
+        \\is an input of the build, so it is hermetic.
+        \\
+        \\The cause names the first such line and why. Nothing is written. Drop
+        \\--hermetic to import with the steps flagged (W0810), or change the step:
+        \\fetch the files once, outside the build, and copy them in.
+        \\
+        \\zbx build --hermetic is --locked, and refuses the same way any step with a
+        \\cache mount and any network step without a pin (.expect, or a current pin in
+        \\zbx.lock); the cause names the step. Pin a network step with zbx build --pin
+        \\first, and drop its caches.
+        ,
+    },
+    .{
+        .code = .E0815,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the Dockerfile is larger than a build file holds",
+        .explanation =
+        \\A build file has bounds: 256 steps, each with bounded arguments,
+        \\environment, copies, caches and binds, and the whole file in bounded text.
+        \\The import also bounds what it reads: 2048 instructions, 64 stages, 256
+        \\words in one instruction, 256 variables and 64 build arguments. A Dockerfile
+        \\whose translation would pass one of them is refused rather than cut.
+        \\
+        \\The cause names the bound, the count and the line. Split the Dockerfile into
+        \\two builds, the second starting from the image of the first, or join RUN
+        \\instructions with &&.
+        ,
+    },
+    .{
+        .code = .E0816,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the build file can't be written",
+        .explanation =
+        \\zbx import writes the build file to zbx.build.zon in the context directory,
+        \\or to -o's path. A file already there is never replaced unless --force is
+        \\given, since it may be a build file written by hand. The file is written
+        \\whole or not at all, so a write that fails (a directory that cannot be
+        \\written, a full disk) leaves what was there.
+        \\
+        \\The cause names the path. Give --force to replace the file, or -o to write
+        \\another one.
+        ,
+    },
+    .{
+        .code = .W0810,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "the import has steps that are not hermetic",
+        .explanation =
+        \\Each step that the import gave the network or a cache mount can produce
+        \\different bytes on another day or another machine. The report marks each
+        \\one, with why: net with the word that matched (--network detect), net with
+        \\the flag that asked for it, or cache. The build warns of them again (W0801,
+        \\W0802).
+        \\
+        \\The cause names the steps. Pin what each one fetches (a version, or a
+        \\checksum the command verifies), or fetch it once outside the build and copy
+        \\it in; zbx import --hermetic refuses an import that still has such steps.
+        ,
+    },
+    .{
+        .code = .W0811,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "parts of the Dockerfile did not carry over",
+        .explanation =
+        \\Some instructions have no step or setting of their own in a build file.
+        \\EXPOSE, VOLUME, HEALTHCHECK, STOPSIGNAL and MAINTAINER become labels of the
+        \\image (org.zigbox.import.expose and the like, the value as written). The
+        \\syntax and check directives, COPY --link, RUN --security=sandbox, a cache's
+        \\sharing mode, the BUILDKIT_* and SOURCE_DATE_EPOCH arguments, and an ENV of
+        \\a variable the build fixes are ignored: the builder has their meaning
+        \\already, or keeps its own. A COPY's --chown or --chmod, a COPY --from an
+        \\image, and --exclude on a COPY --from a stage are kept in the build file,
+        \\but zbx build does not run them yet (E0802), so the list names them too.
+        \\
+        \\The cause names each part. Read the list to be sure none of them matters to
+        \\the image, and change any copy that zbx build would refuse.
+        ,
+    },
+    .{
+        .code = .E0822,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a pinned step's output differs from its pin",
+        .explanation =
+        \\A pin is the output digest a network step is expected to produce: written
+        \\by hand as the step's .expect, or recorded in zbx.lock by zbx build --pin.
+        \\Under --locked or --hermetic a pinned step whose output differs from its
+        \\pin (drift) stops the build: no step that depends on it runs, and the lock
+        \\is not changed. What the network served changed, most often a mirror that
+        \\published a new package version. A lock pin also records the step's key; a
+        \\pin whose key no longer matches the step (the step was changed) is stale,
+        \\and is refused the same way rather than pinned again.
+        \\
+        \\The cause names the step, the pinned digest and the new one, or, for a stale
+        \\pin, the two keys. Run zbx build without --locked to see the new output. To
+        \\accept it, delete the step's pin from zbx.lock and run zbx build --pin, or
+        \\edit .expect.
+        \\
+        \\zbx build --pin records the output of each network step that has no pin
+        \\and no .caches, once the build succeeds. --locked adds no pin and enforces
+        \\each one. --hermetic is --locked that also refuses, before anything runs, a
+        \\step with .caches or a network step with no pin (ZBX-E0814). --pin with
+        \\either of the others is refused (ZBX-E0005).
+        ,
+    },
+    .{
+        .code = .W0803,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "a pinned step drifted, and its new output was used",
+        .explanation =
+        \\A pinned network step (one with .expect, or with a pin in zbx.lock) produced
+        \\an output that differs from its pin. Without --locked the build goes on with
+        \\the new output, so every step after it misses and rebuilds, and the pin is
+        \\left as it was: the warning repeats on every build until a person accepts
+        \\the change or the network serves the pinned bytes again.
+        \\
+        \\The cause names the step, the pinned digest and the new one. To accept the
+        \\new output, delete the step's pin from zbx.lock and run zbx build --pin, or
+        \\edit .expect. To refuse drift instead, build with --locked (E0822).
+        ,
+    },
+    .{
+        .code = .E0901,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the key cannot be used",
+        .explanation =
+        \\A key is a pair of files in the keys directory ($XDG_CONFIG_HOME/zbx/keys,
+        \\by default ~/.config/zbx/keys): NAME.key holds the secret and NAME.pub the
+        \\public key. The cause says what is wrong: the file is not there, cannot be
+        \\read or written, is not a zbx key file, was written by a newer zbx, or its
+        \\secret can be read by other users. Like ssh, zbx refuses a secret that group
+        \\or others can read, and a keys directory that they can. It also refuses a
+        \\keys directory that is a symbolic link (or not a directory): keep the
+        \\keys in a real directory.
+        \\
+        \\Make the secret private to you:
+        \\    chmod 600 ~/.config/zbx/keys/NAME.key
+        \\    chmod 700 ~/.config/zbx/keys
+        \\
+        \\"zbx key list" shows the keys there are. A damaged key file cannot be
+        \\repaired; if you have no copy, make a new key and trust that one instead.
+        ,
+    },
+    .{
+        .code = .E0902,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a key with that name already exists",
+        .explanation =
+        \\"zbx key new" never replaces a key: a secret key that is overwritten is
+        \\gone for good, and so is everything signed with it that nobody else can
+        \\check. The name is taken by a key (or by part of one) in the keys directory.
+        \\
+        \\Choose another name:
+        \\    zbx key new release-2
+        \\
+        \\What to do depends on which file is there:
+        \\
+        \\A NAME.key alone, written in the last 10 minutes: another "zbx key new NAME"
+        \\may still be writing it. Wait a few minutes and run it again. Do not remove
+        \\the file: it may be a live key's secret.
+        \\
+        \\A NAME.key alone, older than that: an interrupted "zbx key new" left it. If
+        \\that key was never used, remove the leftover yourself:
+        \\    rm ~/.config/zbx/keys/NAME.key
+        \\
+        \\A NAME.pub alone: the secret half is gone. If you removed the secret on
+        \\purpose, remove the public half too:
+        \\    rm ~/.config/zbx/keys/NAME.pub
+        \\
+        \\To retire a whole key, remove its NAME.key and NAME.pub files yourself.
+        ,
+    },
+    .{
+        .code = .E0903,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a signature record in the store is damaged or newer",
+        .explanation =
+        \\Signatures are kept in the store, one file per tree, under trust/signatures:
+        \\each line of it is one signed statement. zbx reads the file whole before it
+        \\adds to it, and checks every line: its signature and its statement. A file
+        \\that fails is not trusted and not changed, because adding to it would
+        \\keep the damage.
+        \\
+        \\The cause says which. A damaged file is not what zbx wrote: a disk or a
+        \\program changed it, or it was put there by hand or by "zbx trust import" of
+        \\something that was not a zbx signature. A newer file was written by a newer
+        \\zbx, with a statement this one does not know.
+        \\
+        \\A signature is a copy of what the signer said, so nothing is lost by
+        \\removing a damaged file: sign the tree again, or import the signatures
+        \\again from where they came. For a newer file, use the newer zbx.
+        ,
+    },
+    .{
+        .code = .E0904,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a policy file cannot be read or is not a policy",
+        .explanation =
+        \\A policy file says which keys you trust and what a run must have. zbx reads
+        \\/etc/zbx/policy.zon and ~/.config/zbx/policy.zon (or $XDG_CONFIG_HOME/zbx/
+        \\policy.zon) before every run, exec and build step, and every file that
+        \\exists must be a policy: a file that is not is refused and nothing runs,
+        \\because a policy that cannot be read must not be taken for "no rules".
+        \\
+        \\A policy is a restricted ZON file:
+        \\    .{
+        \\        .version = 1,
+        \\        .keys = .{ .{ .name = "release", .public = "zbx-ed25519:..." } },
+        \\        .require_signature = true,
+        \\        .verify = "cached",
+        \\    }
+        \\Only .version is required. Fields come in any order, once each. There are
+        \\at most 16 keys, none listed twice, and the file is at most 16 KiB.
+        \\.require_provenance = true asks for a signed provenance statement (E0906).
+        \\
+        \\The system file, /etc/zbx/policy.zon, must be owned by root and not
+        \\writable by group or others: a file anyone else could rewrite is no rule,
+        \\so it is refused too. As root, "chown root:root /etc/zbx/policy.zon" and
+        \\"chmod 644 /etc/zbx/policy.zon" put it right.
+        \\
+        \\The cause gives the line and column and what was expected there. Correct
+        \\the file, or remove it (the system file: ask the administrator). "zbx
+        \\policy check" reads the policy files and runs nothing.
+        ,
+    },
+    .{
+        .code = .E0905,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no trusted signature covers what was to run",
+        .explanation =
+        \\A policy file asked for require_signature, and the tree this run would
+        \\start from has no signature that satisfies it. Nothing was started: no
+        \\container, no run record.
+        \\
+        \\A signature counts when, in this order: its signature verifies, its key is
+        \\one the policy lists, it is a statement about this tree, and what it is
+        \\bound to fits the run. A signature of the tree alone counts for any run of
+        \\it; one of a build result counts only for a run of that result, and one of
+        \\an image only for a run of that image. The cause names each signature
+        \\present and the first reason it does not count.
+        \\
+        \\Sign it with a key the policy lists ("zbx sign <digest>"), or add the key
+        \\that signed it to the policy file the cause names. "zbx policy check
+        \\<digest>" shows the same verdict without running anything. A directory
+        \\given as --rootfs has no tree and cannot be signed, so a policy that
+        \\requires a signature refuses it.
+        ,
+    },
+    .{
+        .code = .E0906,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no trusted signed provenance covers what was to run",
+        .explanation =
+        \\A policy file asked for require_provenance, and the build result this run
+        \\would start from has no signed provenance that satisfies it. Nothing was
+        \\started: no container, no run record.
+        \\
+        \\"zbx build" writes a SLSA provenance record for every result it makes, hit
+        \\or miss. The record is only a claim until a key signs it ("zbx sign
+        \\<result>" signs the stored record, byte for byte). It satisfies the rule
+        \\when the signature verifies, its key is one the policy lists, and it is
+        \\about this tree and bound to the result that is to run.
+        \\
+        \\The cause says which of five things is wrong. Nothing has recorded a build
+        \\of this result (it was built by an older zbx, or not built here): build it
+        \\again. A record is stored, or a provenance signature is present, but no
+        \\key the policy lists signed it: sign it, or add the signer's key to the
+        \\policy. A listed key signed provenance for another result: run that one.
+        \\A pulled or pushed image is judged by the result its record derives from its
+        \\tree, settings and labels: a signed provenance of that result covers it,
+        \\and the causes above apply to it. If its record does not keep the labels
+        \\(it was pulled by an older zbx, or they did not fit), no result can be
+        \\derived: pull the image again. What is to run may also be no build result
+        \\(a base image of a build, which never derives one, or a bare tree): only a
+        \\result built by zbx carries provenance, so a policy that requires it cannot
+        \\be met by one. A directory given as --rootfs has no tree to sign and is
+        \\refused as ZBX-E0905.
+        ,
+    },
+    .{
+        .code = .E0907,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a file of the image in the store was changed",
+        .explanation =
+        \\Before it starts anything, a run under a policy file checks that the
+        \\files of its image are the ones the image names: every file object the
+        \\tree reaches is hashed again, its bytes, mode, owner and attributes, and
+        \\compared with its name. A signature vouches for a tree's digest, so it
+        \\means something only if the files in the store still match it. Nothing
+        \\was started.
+        \\
+        \\The cause names the first file that differs, by its path in the image, and
+        \\says what differs: its bytes, its mode or its owner. The first checked run
+        \\of a tree hashes all of it and records what it saw in trust/verified in
+        \\the store; later runs look at each file's inode, size and change time and
+        \\hash again only a file that changed. The record is a cache, never trusted:
+        \\a damaged one is ignored and rewritten. verify = "always" in the policy
+        \\file hashes every file every run. A run with no policy file does no check.
+        \\
+        \\The check also compares the image's materialized directory, under cache/
+        \\in the data directory, with the tree: each file must be the same inode as
+        \\its object, and each directory and link must have the mode, owner and
+        \\target the tree gives, with no entry added or missing. Extended
+        \\attributes and times of directories and links are not compared. Such a
+        \\difference is refused and never repaired, as the directory may be in use
+        \\by a running container. A tree with more files, directories and links than
+        \\zbx checks (or too many directories side by side) is refused too: run a
+        \\smaller image.
+        \\
+        \\Run "zbx store verify" to see everything that is damaged, then remove the
+        \\damaged tree and pull or build it again; for a changed materialized
+        \\directory, remove it under cache/ and run again. A file changed between
+        \\the check and the start of the container is not seen.
+        ,
+    },
+    .{
+        .code = .E0908,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "zbx verify found a broken link",
+        .explanation =
+        \\"zbx verify" walks, offline, from the signature on a tree to everything the
+        \\signed build provenance names, and stops at the first link that is broken.
+        \\It never uses the network, a registry or zbx.lock. The six links:
+        \\
+        \\  1. the tree's signatures: a record exists and every signature verifies.
+        \\  2. a trusted signer: a key every policy file lists, or the one given with
+        \\     --key or --public. With no policy file and neither flag, verify names
+        \\     the signers it found and stops here.
+        \\  3. the tree: every object is present and hashes to its id, uncached.
+        \\  4. the provenance: a trusted signature covers SLSA provenance of this
+        \\     tree. A tree signed without provenance stops after link 3 and passes
+        \\     unless --require-provenance is given.
+        \\  5. the inputs: each base tree, each step's input and output tree and the
+        \\     image's output, present and sound. One that is not in the store is
+        \\     ZBX-W0903 (garbage collection may have taken it) and fails only with
+        \\     --strict; a damaged one fails always.
+        \\  6. the build file and zbx.lock: when the project's files are in the
+        \\     working directory, their hashes must be the signed ones; if they are
+        \\     not there, that is reported and is not a failure.
+        \\
+        \\The cause names the link and what is wrong with it. Pull or build what is
+        \\missing and sign again, or trust the signer's key; "zbx store verify"
+        \\shows a damaged tree.
+        ,
+    },
+    .{
+        .code = .E0909,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a trust bundle was refused",
+        .explanation =
+        \\"zbx trust import" reads an in-toto bundle, one envelope per line, and
+        \\takes it whole or not at all. It is refused when it is longer than any
+        \\record, when a line is not an envelope this zbx reads or its statement is
+        \\not about the tree, when a signature does not verify, when a statement is
+        \\of a newer form, or when the store already holds 4096 signed trees
+        \\(trust_records_max) or the tree 8 signatures. Nothing was written.
+        \\
+        \\"zbx trust export" refuses with this code when the store has no signature
+        \\for the tree. A signature by a key this host does not trust is kept: trust
+        \\is decided when something runs, by policy.
+        \\
+        \\Ask for the bundle again, from "zbx trust export <tree>" on the machine
+        \\that signed. At the bound, "zbx trust prune" shows the records whose trees
+        \\are gone, and "zbx trust prune --apply" removes them.
+        ,
+    },
+    .{
+        .code = .E0910,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "signing was refused",
+        .explanation =
+        \\"zbx sign" signs what is in the store, and only a tree that is whole and
+        \\sound: a signature over a tree with a missing or damaged file would
+        \\vouch for something nobody can run. It checks every file object of the
+        \\tree, without trusting the cache, before it signs.
+        \\
+        \\The cause says what was refused: the digest names nothing in the store
+        \\(give a build result, a tree, or "NAME@sha256:..." of an image that was
+        \\pulled or built here), a file of the tree is missing or damaged, or a
+        \\bound was reached. A tree has at most 8 signatures, and the store at most
+        \\4096 signed trees. Signing again with a key that already signed the same
+        \\thing is not a refusal: it changes nothing and says so.
+        \\
+        \\For a missing or damaged tree, pull or build it again, then sign it. For a
+        \\bound, run "zbx trust prune" to see the records whose trees are gone and
+        \\"zbx trust prune --apply" to remove them. Nothing was written.
+        ,
+    },
+    .{
+        .code = .E0911,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the key's passphrase is missing, unusable or wrong",
+        .explanation =
+        \\A key is sealed with a passphrase (argon2id and XChaCha20-Poly1305), unless
+        \\it was made with --no-passphrase. zbx asks for the passphrase on the
+        \\terminal when both standard input and standard error are one. Anywhere else
+        \\(CI, a script, an agent) there is no one to ask, and zbx does not read
+        \\standard input for it: give the passphrase in a file only you can read.
+        \\    zbx key new release --passphrase-file ~/.config/zbx/release.pass
+        \\
+        \\The file's first line is the passphrase, without its newline, at most 1024
+        \\bytes. A file that group or others can read is refused (chmod 600 it), and
+        \\so is an empty passphrase. A path that is a symbolic link (a secrets
+        \\volume mounts files that way) is refused too: name the file it points to.
+        \\
+        \\On a Mac, zbx key and zbx sign run in the virtual machine with no terminal,
+        \\so a sealed key always needs --passphrase-file, with a file under your home
+        \\(the only directory the machine shares), or a key made with --no-passphrase:
+        \\    zbx sign web --key release --passphrase-file ~/.config/zbx/release.pass
+        \\A wrong passphrase is refused after the same work
+        \\as a right one, so the refusal tells an attacker nothing about how close the
+        \\guess was.
+        \\
+        \\A forgotten passphrase is a lost key. There is no recovery: make a new key.
+        ,
+    },
+    .{
+        .code = .W0901,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the provenance store is full, so this result has no provenance record",
+        .explanation =
+        \\The build succeeded and the result is usable. The store keeps at most
+        \\trust_records_max provenance records (4096), and it already holds that
+        \\many, so this result's record was not written. A rebuild of a result
+        \\that has a record replaces it as usual; only a result with no record
+        \\yet is affected.
+        \\
+        \\A policy with require_provenance refuses a run of this result (ZBX-E0906:
+        \\no provenance stored) until there is room for its record. Remove the
+        \\records of results you no longer need from trust/provenance in the
+        \\store, then build again: the build is a cache hit and writes the record.
+        ,
+    },
+    .{
+        .code = .W0902,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a damaged trust record was kept; its tree is in the store",
+        .explanation =
+        \\"zbx trust prune" removes only the records of trees that are gone. This
+        \\record is damaged or of a newer format, but its tree (or, for provenance,
+        \\its result) is in the store, so it was kept: removing it would give up a
+        \\signature that may still be wanted, and a run reads a damaged record as
+        \\ZBX-E0903.
+        \\
+        \\Import the tree's bundle again ("zbx trust import") or sign the tree
+        \\again to replace the record, or upgrade zbx if the record is newer.
+        ,
+    },
+    .{
+        .code = .W0903,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "zbx verify could not check an input that is not in the store",
+        .explanation =
+        \\An input the signed provenance names (a base image's tree, a step's input
+        \\or output tree, or the image's output) is not in the store, perhaps because
+        \\"zbx store gc" took it after the build. Offline, verify cannot check
+        \\something it does not have, so it says so and goes on; the other links
+        \\still hold. "zbx verify --strict" fails on it. Pull or build the input
+        \\again to check it.
+        ,
+    },
+    .{
+        .code = .E1001,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "this zbx is not allowed to run virtual machines",
+        .explanation =
+        \\On a Mac, zbx runs containers in a small Linux virtual machine that it
+        \\starts through Apple's Virtualization.framework. The framework refuses a
+        \\program that does not carry the com.apple.security.virtualization
+        \\entitlement, or a Mac that cannot virtualize at all (an Intel Mac, or a
+        \\Mac inside another virtual machine without nested virtualization).
+        \\
+        \\A zbx installed from a release is signed with the entitlement already.
+        \\A zbx built from source is not: sign it with the entitlements file in
+        \\the repository (vm/zbx.entitlements). An ad-hoc signature is enough on
+        \\the Mac that built it.
+        ,
+    },
+    .{
+        .code = .E1002,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the virtual machine did not start",
+        .explanation =
+        \\Virtualization.framework refused to start the Linux virtual machine, or
+        \\the machine failed while it started. The cause gives the framework's own
+        \\words, its error domain and its code, and the step that failed
+        \\(configuring, validating or starting).
+        \\
+        \\The usual reasons are a size the framework does not allow (see zbx vm
+        \\config), too little free memory on the Mac, and a damaged VM image.
+        \\The machine's console is in the log file the diagnostic names: its last
+        \\lines say how far the guest got.
+        ,
+    },
+    .{
+        .code = .E1003,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the virtual machine did not answer in time",
+        .explanation =
+        \\The virtual machine started, but its init did not answer on the vsock
+        \\port within the time zbx allows for a boot. The kernel may have stopped
+        \\(see the console log the diagnostic names), or the Mac is too busy to
+        \\run it.
+        \\
+        \\zbx vm stop stops what is left of it; the next command starts a fresh
+        \\one. If it happens every time, send the console log with the report.
+        ,
+    },
+    .{
+        .code = .E1004,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "another process holds the virtual machine",
+        .explanation =
+        \\There is one virtual machine per user, owned by one host process that
+        \\holds a lock file in the VM directory. That lock is held, but the process
+        \\that holds it does not answer on its control socket: it is starting, hung
+        \\or stuck. A host that was killed leaves no lock behind, so this is not a
+        \\stale file.
+        \\
+        \\The cause names the process. If it is hung, end it with kill, and run the
+        \\command again.
+        ,
+    },
+    .{
+        .code = .E1005,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't make or write the VM directory",
+        .explanation =
+        \\zbx keeps the virtual machine's files in ~/Library/Application Support/
+        \\zbx/vm: the unpacked kernel and initramfs, the console log, the lock
+        \\and the control socket. A file or directory there could not be made,
+        \\read or written, or the path is too long for a Unix socket (103 bytes).
+        \\The cause names the path and what the system said.
+        \\
+        \\A full disk and a directory owned by another user are the usual
+        \\reasons. HOME decides the place.
+        ,
+    },
+    .{
+        .code = .E1006,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no virtual machine is running",
+        .explanation =
+        \\No command uses this code now. zbx vm stop used to refuse when no virtual
+        \\machine ran; it now succeeds and prints the stopped status, because
+        \\stopping what is not running is already done. The code stays registered
+        \\because a code never changes meaning or goes away; it is for a command
+        \\that truly needs a running machine.
+        \\
+        \\zbx vm status says whether one is running.
+        ,
+    },
+    .{
+        .code = .E1007,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the virtual machine's size is out of range",
+        .explanation =
+        \\zbx vm config sets how many CPUs and how much memory the virtual machine
+        \\boots with. The value is outside what this Mac allows: zbx's own limits,
+        \\Virtualization.framework's, and the Mac's CPUs and memory together. The
+        \\cause names the allowed range. Memory is in whole MiB: 2G, 4096M.
+        \\
+        \\Nothing was changed. zbx vm config with no options shows the current
+        \\values.
+        ,
+    },
+    .{
+        .code = .E1008,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't read the virtual machine's settings",
+        .explanation =
+        \\The file ~/Library/Application Support/zbx/vm-settings holds the size
+        \\chosen with zbx vm config. This one is damaged, or was written by a newer
+        \\zbx, which this one does not misread.
+        \\
+        \\Set the size again with zbx vm config, which writes a new file, or move
+        \\the old one aside.
+        ,
+    },
+    .{
+        .code = .W1001,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "replacing a virtual machine of another version",
+        .explanation =
+        \\A virtual machine is running from an image (kernel and initramfs) of
+        \\another version than this zbx carries, left over from before an upgrade.
+        \\zbx does not drive it: it stops it and starts one from its own image.
+        \\
+        \\Nothing is lost that the containers did not already lose by the stop of
+        \\their machine; state volumes are not in the machine's memory.
+        ,
+    },
+    .{
+        .code = .E1009,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the connection to the virtual machine was lost",
+        .explanation =
+        \\zbx forwards a command into the virtual machine over one connection, and
+        \\that connection ended before the command had: the machine stopped (it
+        \\was killed, or the Mac slept), or the guest's command service died. The
+        \\command's result is unknown. A container that was started detached (zbx
+        \\run -d) is not stopped by this.
+        \\
+        \\zbx vm status says whether the machine runs; the next command starts a
+        \\fresh one if it does not. In zbx run, this is exit 125.
+        ,
+    },
+    .{
+        .code = .E1010,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the virtual machine's command service did not answer",
+        .explanation =
+        \\The machine runs, but nothing took the connection on the guest's command
+        \\port (zbx guest serve, which the guest's init starts when it sets the
+        \\machine up for the user). It may have died or never started; the
+        \\console log the diagnostic names says how far the guest got.
+        \\
+        \\zbx vm stop stops the machine; the next command starts a fresh one.
+        ,
+    },
+    .{
+        .code = .E1011,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the virtual machine could not be set up for this user",
+        .explanation =
+        \\Once the machine runs, the guest sets itself up for the Mac user: the
+        \\clock, the user and its id ranges, the delegated cgroup subtree, and the
+        \\command service. One of those steps failed; the cause names it, and the
+        \\console log has the guest's own words.
+        \\
+        \\zbx vm stop stops the machine; the next command starts a fresh one.
+        ,
+    },
+    .{
+        .code = .W1002,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the virtual machine has no network",
+        .explanation =
+        \\The guest asked for an address on the NAT network by DHCP and got none.
+        \\Containers that need no network still run; pulling an image will fail
+        \\until the machine has one. A fresh machine usually has: zbx vm stop, and
+        \\the next command starts one.
+        ,
+    },
+    .{
+        .code = .E1012,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the virtual machine's disk cannot be made smaller",
+        .explanation =
+        \\The disk is a file on the Mac that holds the images, the state and the
+        \\records of everything zbx ran in the machine, with an ext4 file system in
+        \\it. A file system cannot be shrunk without risking what is on it, so zbx
+        \\vm config --disk takes a size at least as big as the file now is, and
+        \\the disk only grows. The size applies at the next boot.
+        \\
+        \\To start over with a smaller disk, stop the machine and move the file
+        \\aside yourself; zbx never deletes it.
+        ,
+    },
+    .{
+        .code = .E1013,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a directory or path is not shared with the virtual machine",
+        .explanation =
+        \\The machine sees one directory of the Mac: your home directory, at the
+        \\same path. A command runs in the directory you ran zbx in, and the
+        \\machine can only enter that directory when it is inside the home. A
+        \\command started anywhere else would run in a different place than you
+        \\asked for, so zbx refuses. The paths zbx build and zbx import are
+        \\given (-f, -o, --context) are read and written in the machine, so each
+        \\must be inside the home as well.
+        \\
+        \\Change into a directory below your home and run the command there, with
+        \\paths below your home.
+        ,
+    },
+    .{
+        .code = .E1014,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the virtual machine's disk is full",
+        .explanation =
+        \\Images, containers' state and zbx's records live on the machine's disk,
+        \\and it has no room left for what the command writes. The disk is a
+        \\sparse file: it takes room on the Mac only as it fills, up to the size
+        \\zbx vm config --disk sets (64 GiB unless you set another).
+        \\
+        \\Remove what you no longer need, or make the disk bigger. The new size
+        \\applies after zbx vm stop, at the next boot.
+        ,
+    },
+    .{
+        .code = .E1015,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the Mac has no room for the virtual machine's disk",
+        .explanation =
+        \\The virtual machine's disk is a sparse file on the Mac, and the Mac's
+        \\volume that holds it has too little free room left. A volume that fills
+        \\up while the machine writes would show as input and output errors in
+        \\the guest and could damage its file system, so zbx does not start the
+        \\machine.
+        \\
+        \\Free space on the Mac's volume and run the command again.
+        ,
+    },
+    .{
+        .code = .E1016,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "Rosetta is not installed on this Mac",
+        .explanation =
+        \\Images built for linux/amd64 run in the machine through Rosetta, Apple's
+        \\translator, which this Mac does not have. Install it once; the machine
+        \\picks it up when it next starts, so stop it with zbx vm stop.
+        ,
+    },
+    .{
+        .code = .E1017,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a published port cannot be opened on the Mac",
+        .explanation =
+        \\--publish HOST:CONTAINER makes the container's port reachable at the
+        \\Mac's own localhost:HOST. zbx listens on that port itself, on the loopback
+        \\addresses (127.0.0.1 and ::1) unless the option names an address:
+        \\0.0.0.0:HOST:CONTAINER listens on every interface, which puts the
+        \\container on the Mac's network and is never the default.
+        \\
+        \\Another program already listens on the port, or the system refused the
+        \\listener; the cause says which. The container was not started.
+        \\
+        \\macOS lets a program that is not root listen on a port under 1024 only on
+        \\every interface, not on 127.0.0.1 alone: --publish 0.0.0.0:80:80 works
+        \\without root, and exposes the port on the Mac's network.
+        ,
+    },
+    .{
+        .code = .W1003,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the Mac has no IPv4 DNS server, so the machine asks public ones",
+        .explanation =
+        \\The virtual machine asks the DNS servers the Mac asks. This Mac's network
+        \\names none that has an IPv4 address (a router that advertises only an
+        \\IPv6 one, for example), and an IPv6 resolver of the Mac cannot be reached
+        \\across the machine's NAT. The machine's gateway does not answer DNS, so
+        \\zbx puts 1.1.1.1 (Cloudflare) and 8.8.8.8 (Google) before it, and the
+        \\machine's name lookups, such as a pull's, go to them. A Mac with an IPv4
+        \\DNS server never does this.
+        \\
+        \\To keep the lookups on your own network, join one that has an IPv4 DNS
+        \\server, then zbx vm stop; the next command starts a machine that asks it.
+        \\The warning is printed once, by the command that starts the machine.
+        ,
+    },
+    .{
+        .code = .W1201,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "the image has no lazy index: pulling it whole",
+        .explanation =
+        \\zbx run --lazy starts a container from an image's lazy index: the list of
+        \\its files and the chunks they are made of, which a zbx with layer writer 2
+        \\puts in the image when it pushes it. This image has none: it was pushed
+        \\by another tool, or by an older zbx. Or it has more than one layer: an
+        \\index covers one layer, so for now such an image is not started lazily.
+        \\
+        \\The run goes on as without --lazy: the whole image is pulled, then run.
+        ,
+    },
+    .{
+        .code = .E1201,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "lazy start is not possible on this host",
+        .explanation =
+        \\zbx run --lazy serves the image's files through FUSE from the zbx
+        \\process while the container runs, and fetches the chunks it has not got
+        \\yet as they are read. That needs /dev/fuse, a kernel that lets a user
+        \\namespace mount FUSE, and memory for the server's tables and chunk
+        \\buffers. The cause says which of these this host lacks.
+        \\
+        \\The container was not started. Run it without --lazy: the whole image is
+        \\then read before the container starts.
+        ,
+    },
+    .{
+        .code = .E1202,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the image's lazy index was refused",
+        .explanation =
+        \\An image pushed by zbx carries a lazy index: the list of the image's
+        \\files and the chunks they are made of, hashed in the image's manifest.
+        \\zbx run --lazy checks the index before it uses any of it: its bytes must
+        \\hash to the manifest's value, stay within zbx's bounds, and describe
+        \\exactly the image's tree. This one did not: the registry, or whoever
+        \\pushed the image, sent an index that does not belong to it.
+        \\
+        \\Nothing was started and nothing was written. Run it without --lazy: a
+        \\whole pull checks every layer against the manifest instead.
+        ,
+    },
+    .{
+        .code = .W1202,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "a source sent a chunk that does not match its hash",
+        .explanation =
+        \\zbx run --lazy fetches the chunks of the image's files as they are read,
+        \\and checks each against its hash in the image's lazy index before any of
+        \\it is used. This source sent bytes that do not match: none were used, the
+        \\next source was asked, and this one is not asked for that file again.
+        \\
+        \\The source, or the network on the way, is at fault. Tell its owner.
+        ,
+    },
+    .{
+        .code = .E1203,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a chunk could not be fetched in time: the read got EIO",
+        .explanation =
+        \\zbx run --lazy fetches the chunks of the image's files as they are read.
+        \\No source gave this chunk within the read's deadline, so the process that
+        \\read it got an input/output error (EIO). The cause says what each source
+        \\did. The container goes on; reading the file again tries again.
+        \\
+        \\Check the network and the registry. Run the image without --lazy to
+        \\read it all before the container starts.
+        ,
+    },
+    .{
+        .code = .E1206,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the store's disk is too full to keep fetched chunks",
+        .explanation =
+        \\zbx run --lazy keeps each chunk it fetches in the store, so the next read
+        \\is local. The disk that holds the store has too little free space left
+        \\to keep one more: the read that needed it got an input/output error (EIO).
+        \\
+        \\Free space on that disk, then read the file again.
+        ,
+    },
+    .{
+        .code = .E1207,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the image is too large for lazy start",
+        .explanation =
+        \\Lazy start arrives in 0.6.0: this zbx (0.5.3) refuses --lazy with E0004.
+        \\
+        \\zbx run --lazy serves the image's files from memory it sets aside when
+        \\the run starts: a table with room for a fixed number of entries (files,
+        \\directories and links) and a fixed number of bytes of directory
+        \\listings. This image has more of one than that room; the cause says
+        \\which, and the limit.
+        \\
+        \\The container was not started. Run it without --lazy: the whole image is
+        \\then read before the container starts, with no such limit.
+        ,
+    },
+    .{
+        .code = .E1208,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "--lazy does not work with another option given",
+        .explanation =
+        \\Lazy start arrives in 0.6.0: this zbx (0.5.3) refuses --lazy with E0004.
+        \\
+        \\zbx run --lazy starts a container before its image is all on disk,
+        \\serving the files from the store as the container reads them. The server
+        \\runs in the zbx process that runs the container, so for now the run must
+        \\stay in the foreground: -d with --lazy is not yet supported. It also needs
+        \\an image (not --rootfs, which runs a directory as it is).
+        \\
+        \\The cause names the option. Nothing was started. Leave out --lazy, or
+        \\the other option. A program that uses zigbox as a library sees this code
+        \\too when it gives peer sources to a run that cannot take them.
+        ,
+    },
+    .{
+        .code = .W1203,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "lazy start (--lazy) is not possible on this host",
+        .explanation =
+        \\zbx run --lazy serves the image's files through FUSE from the zbx
+        \\process while the container runs. That needs /dev/fuse and a kernel that
+        \\lets a user namespace mount FUSE, and the fuse check of zbx doctor found
+        \\this host lacks one of them: the cause says which. Nothing else depends on
+        \\it, so this is a warning and "zbx doctor" still exits 0.
+        \\
+        \\Load the fuse module (sudo modprobe fuse), or run without --lazy: the
+        \\whole image is then read before the container starts. A run that asks for
+        \\--lazy on this host is refused as ZBX-E1201 before anything starts.
+        ,
+    },
+    .{
+        .code = .B0001,
+        .severity = .bug,
+        .blame = .internal,
+        .summary = "zbx hit an internal error",
+        .explanation =
+        \\zbx broke one of its own rules: a failed assertion, an unexpected error from
+        \\its own code, or an arithmetic or bounds check. This is a bug in zbx, not
+        \\something you did, and it always exits with code 70.
+        \\
+        \\Rerun with --verbose to see the internal message, and report it at
+        \\https://github.com/Zigbox/zigbox/issues/new with the command you ran. A
+        \\stack trace is not printed.
+        ,
+    },
+};
+
+/// The longest tag: a kind letter and four digits.
+const tag_bytes: u32 = 5;
+
+// E0820's explanation names the fetch bounds in words ("at most 4 redirects", "over 1 GiB"):
+// a change to either constant fails here until the text says the new value.
+comptime {
+    assert(constants.build_fetch_redirects_max == 4);
+    assert(constants.build_fetch_bytes_max == 1024 * 1024 * 1024);
+}
+
+comptime {
+    const fields = std.meta.fieldNames(Code);
+    // One entry per tag, in tag order: this is what makes a duplicate or a missing entry a
+    // build error, and lets `entry` index the table directly.
+    assert(registry.len == fields.len);
+    assert(fields.len <= std.math.maxInt(u16));
+    @setEvalBranchQuota(800_000);
+    for (registry, fields, 0..) |item, name, index| {
+        assert(@backingInt(item.code) == index);
+        assert(std.mem.eql(u8, @tagName(item.code), name));
+        check_entry(item);
+    }
+}
+
+/// Compile-time validation of one entry. Split out so each rule reads on its own line.
+fn check_entry(item: Entry) void {
+    comptime {
+        const tag = @tagName(item.code);
+        assert(tag.len == tag_bytes);
+        for (tag[1..]) |digit| assert(std.ascii.isDigit(digit));
+        // The kind letter and the severity say the same thing.
+        switch (item.severity) {
+            .@"error" => assert(tag[0] == 'E'),
+            .warning => assert(tag[0] == 'W'),
+            .bug => assert(tag[0] == 'B'),
+            .note => unreachable, // Notes carry no code letter; none is registered.
+        }
+        // A bug is ours; anything ours is a bug.
+        assert((item.blame == .internal) == (item.severity == .bug));
+        check_summary(item.summary);
+        check_explanation(item.explanation);
+    }
+}
+
+fn check_summary(summary: []const u8) void {
+    comptime {
+        assert(summary.len > 0);
+        assert(summary.len <= constants.diag_summary_bytes_max);
+        assert(summary[summary.len - 1] != '.');
+        assert(summary[0] != ' ');
+        assert(summary[summary.len - 1] != ' ');
+        for (summary) |byte| assert(text_util.is_printable(byte));
+    }
+}
+
+fn check_explanation(explanation: []const u8) void {
+    comptime {
+        assert(explanation.len > 0);
+        assert(explanation.len <= constants.diag_explanation_bytes_max);
+        assert(explanation[explanation.len - 1] != '\n');
+        var lines = std.mem.splitScalar(u8, explanation, '\n');
+        while (lines.next()) |line| {
+            assert(line.len <= constants.diag_explanation_line_bytes_max);
+            for (line) |byte| assert(text_util.is_printable(byte));
+        }
+    }
+}
+
+pub fn entry(code: Code) *const Entry {
+    const index = @backingInt(code);
+    assert(index < registry.len);
+    const found = &registry[index];
+    assert(found.code == code); // Pair assertion with the comptime check above.
+    return found;
+}
+
+/// The exit code a failure of this blame ends the process with. The only place that decides.
+pub fn exit_code(blame: Blame) u8 {
+    const code: u8 = switch (blame) {
+        .user => constants.exit_user,
+        .environment => constants.exit_environment,
+        .external => constants.exit_external,
+        .internal => constants.exit_internal,
+    };
+    assert(code != constants.exit_ok);
+    assert(code != constants.tool_exit_ok);
+    return code;
+}
+
+/// Which family of exit codes a command uses. A command that runs a container passes the
+/// container's own exit code through, so it cannot also use the standard four.
+pub const ExitScope = enum { standard, container_run };
+
+/// The exit code for a failure of `code`, in `scope`. `command_missing` is true only for an
+/// E0202 whose cause is a command that was not found (as opposed to one that cannot be run).
+/// The only place that decides, for both scopes; call sites pass what they know and never pick.
+pub fn exit_code_in(scope: ExitScope, code: Code, command_missing: bool) u8 {
+    if (command_missing) assert(code == .E0202);
+    const result: u8 = switch (scope) {
+        .standard => exit_code(entry(code).blame),
+        .container_run => if (code == .E0202)
+            (if (command_missing) constants.exit_run_not_found else constants.exit_run_not_runnable)
+        else
+            constants.exit_run_failed,
+    };
+    assert(result != constants.exit_ok);
+    if (scope == .container_run) assert(result >= constants.exit_run_failed);
+    if (scope == .standard) assert(result <= constants.exit_internal);
+    return result;
+}
+
+/// What the process exits with when a diagnostic cannot even be written to stderr. In the
+/// standard scope that is the environment's code; a container run uses its own failure code.
+pub fn exit_code_unwritable(scope: ExitScope) u8 {
+    const result = switch (scope) {
+        .standard => constants.exit_environment,
+        .container_run => constants.exit_run_failed,
+    };
+    assert(result != constants.exit_ok);
+    assert(result != constants.exit_internal);
+    return result;
+}
+
+/// Whether a failure of this code can end a `zbx run`. The commands that report the others
+/// (the doctor's checks, `explain`, `bundle`, a missing command word) never run a container.
+pub fn can_end_run(code: Code) bool {
+    assert(@backingInt(code) < registry.len);
+    assert(registry[@backingInt(code)].code == code);
+    return switch (code) {
+        .E0001, .E0002, .E0007 => false,
+        .E0101, .E0102, .E0103, .E0104, .E0105, .E0106 => false,
+        .E0702, .E0703, .E0704 => false,
+        .E0707, .E0708, .E0709, .E0710, .W0702 => false,
+        .E0714, .E0715, .E0716, .W0703 => false,
+        .E0402, .E0403, .E0404, .E0406 => false,
+        .E0414, .E0418, .E0420, .E0426, .E0427, .E0428 => false,
+        .E0429, .E0430, .E0431, .E0432, .E0433, .E0434, .E0435, .E0436, .E0437 => false,
+        .W0410, .W0411, .W0412, .W0413 => false,
+        .E0501, .E0502, .E0503, .E0504, .E0505, .E0506, .E0507 => false,
+        .E0508, .E0509, .E0510, .E0511, .E0512, .E0513, .E0514 => false,
+        .E0515, .E0516, .E0517, .W0501, .W0502, .E0526, .W0551, .W0552 => false,
+        .E0527, .E0528, .E0529, .E0530, .E0531, .E0532, .E0533, .E0534, .E0535 => false,
+        .E0560, .E0561, .E0562, .E0563, .E0564, .E0565, .E0566, .E0567, .E0568 => false,
+        .E0569, .E0570, .E0571, .E0572 => false,
+        .E0801, .E0802, .E0803, .E0804, .E0805, .E0806, .E0807, .W0801 => false,
+        .E0808, .E0817, .E0818, .E0820, .E0821, .W0802 => false,
+        .E0810, .E0811, .E0812, .E0813, .E0814, .E0815, .E0816, .W0810, .W0811 => false,
+        .E0822, .W0803 => false,
+        .E0901, .E0902, .E0908, .E0909, .E0910, .E0911, .W0901, .W0902, .W0903 => false,
+        .E1006, .E1007 => false,
+        .E1203, .E1206 => false,
+        .E0220, .E0221, .E0222, .E0223, .E0224, .E0225, .E0226, .E0227 => false,
+        .E0228, .E0229, .E0230 => false,
+        .W0207, .W0208, .W0209 => false,
+        else => true,
+    };
+}
+
+/// The codes only `zbx exec` reports. It uses the exit codes of a container run (125 for its own
+/// failures, 126 and 127 for a command that cannot run or is not there, E0202), so the codes it
+/// shares with `run` read as `run`'s do, and these read as exec's.
+pub fn exec_only(code: Code) bool {
+    assert(@backingInt(code) < registry.len);
+    return switch (code) {
+        .E0220, .E0221, .E0222, .E0223, .E0224 => true,
+        else => false,
+    };
+}
+
+/// The longest text `exit_text` writes.
+pub const exit_text_bytes_max = 40;
+
+/// How a code's exit code reads in `zbx explain` and on the error pages: the standard one and,
+/// for a failure that `zbx run` can report, the code `run` uses instead. A warning never ends a
+/// command, so it has only the standard one.
+pub fn exit_text(code: Code, buffer: *[exit_text_bytes_max]u8) []const u8 {
+    const found = entry(code);
+    const standard = exit_code_in(.standard, code, false);
+    const text = if (exec_only(code))
+        std.fmt.bufPrint(buffer, "{d} ({d} in zbx exec)", .{
+            standard,
+            exit_code_in(.container_run, code, false),
+        })
+    else if (found.severity == .warning or !can_end_run(code))
+        std.fmt.bufPrint(buffer, "{d}", .{standard})
+    else if (code == .E0202)
+        std.fmt.bufPrint(buffer, "{d} ({d} or {d} in zbx run)", .{
+            standard,
+            exit_code_in(.container_run, code, false),
+            exit_code_in(.container_run, code, true),
+        })
+    else
+        std.fmt.bufPrint(buffer, "{d} ({d} in zbx run)", .{
+            standard,
+            exit_code_in(.container_run, code, false),
+        });
+    const written = text catch unreachable; // The longest form is 24 bytes; the buffer holds 40.
+    assert(written.len > 0);
+    assert(written.len <= exit_text_bytes_max);
+    return written;
+}
+
+const prefix = "ZBX-";
+
+const full_names = blk: {
+    const fields = std.meta.fieldNames(Code);
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |name, index| names[index] = prefix ++ name;
+    break :blk names;
+};
+
+/// "ZBX-E0001". Comptime-built, so it is a static string.
+pub fn full_name(code: Code) []const u8 {
+    const name = full_names[@backingInt(code)];
+    assert(name.len == constants.diag_code_bytes);
+    assert(std.mem.startsWith(u8, name, prefix));
+    return name;
+}
+
+/// "E0101.html": the file name of a code's generated page, shared by the site generator and the
+/// docs URL of a diagnostic, so the two cannot drift apart.
+pub fn page_name(buffer: *[16]u8, code: Code) []const u8 {
+    // Cannot fail: a tag is five bytes.
+    const name = std.fmt.bufPrint(buffer, "{s}.html", .{@tagName(code)}) catch unreachable;
+    assert(name.len == 10);
+    assert(std.mem.endsWith(u8, name, ".html"));
+    return name;
+}
+
+/// Finds a code from what a user typed: "E0001", "ZBX-E0001", in any letter case. Anything else
+/// (another product's prefix, extra characters, an unregistered number) is null.
+pub fn parse(text: []const u8) ?Code {
+    assert(text.len <= constants.arg_bytes_max);
+    assert(registry.len > 0);
+    var rest = text;
+    if (rest.len >= prefix.len) {
+        if (std.ascii.eqlIgnoreCase(rest[0..prefix.len], prefix)) rest = rest[prefix.len..];
+    }
+    if (rest.len != tag_bytes) return null;
+    for (registry) |item| {
+        if (std.ascii.eqlIgnoreCase(rest, @tagName(item.code))) return item.code;
+    }
+    return null;
+}
+
+test "every registered code round-trips through its names" {
+    // Goal: full_name and parse are inverse for every code, and the table is indexed by tag.
+    // Method: walk the whole registry; the comptime block already proved the table is
+    // complete, so a failure here means the lookup helpers disagree with it.
+    for (registry) |item| {
+        try std.testing.expect(entry(item.code).code == item.code);
+        try std.testing.expectEqualStrings(item.summary, entry(item.code).summary);
+        try std.testing.expectEqual(item.code, parse(@tagName(item.code)).?);
+        try std.testing.expectEqual(item.code, parse(full_name(item.code)).?);
+        try std.testing.expectEqual(constants.diag_code_bytes, full_name(item.code).len);
+    }
+    try std.testing.expectEqualStrings("ZBX-E0001", full_name(.E0001));
+    try std.testing.expectEqualStrings("ZBX-B0001", full_name(.B0001));
+}
+
+test "parse accepts case-insensitive codes and refuses everything else" {
+    // Goal: the boundary where an argument stops being a code. Near misses are null, never a
+    // guess, because "zbx explain" must not explain the wrong code.
+    try std.testing.expectEqual(Code.E0001, parse("e0001").?);
+    try std.testing.expectEqual(Code.E0001, parse("zbx-E0001").?);
+    try std.testing.expectEqual(Code.B0001, parse("ZBX-b0001").?);
+    try std.testing.expect(parse("") == null);
+    try std.testing.expect(parse("ZBX-") == null);
+    try std.testing.expect(parse("E001") == null);
+    try std.testing.expect(parse("E00011") == null);
+    try std.testing.expect(parse("E9999") == null);
+    try std.testing.expect(parse("ZC-E0001") == null);
+    try std.testing.expect(parse("ZBX-ZBX-E0001") == null);
+    try std.testing.expect(parse(" E0001") == null);
+    try std.testing.expect(parse("E0001 ") == null);
+    try std.testing.expect(parse("E0001\x00") == null);
+}
+
+test "a container run exits 125, 126 or 127 for zbx's own failures, whatever the blame" {
+    // Goal: no code of the registry can make a container run exit with a standard code, and E0202
+    // alone splits into 126 and 127. Method: every entry, in both scopes.
+    for (registry) |item| {
+        const standard = exit_code_in(.standard, item.code, false);
+        try std.testing.expectEqual(exit_code(item.blame), standard);
+        const run = exit_code_in(.container_run, item.code, false);
+        if (item.code == .E0202) {
+            try std.testing.expectEqual(@as(u8, 126), run);
+            try std.testing.expectEqual(@as(u8, 127), exit_code_in(.container_run, .E0202, true));
+            try std.testing.expectEqual(standard, exit_code_in(.standard, .E0202, true));
+        } else {
+            try std.testing.expectEqual(@as(u8, 125), run);
+        }
+    }
+    try std.testing.expectEqual(@as(u8, 125), exit_code_in(.container_run, .E0201, false));
+    try std.testing.expectEqual(@as(u8, 125), exit_code_in(.container_run, .B0001, false));
+    var text: [exit_text_bytes_max]u8 = undefined;
+    try std.testing.expectEqualStrings("1 (125 in zbx run)", exit_text(.E0201, &text));
+    try std.testing.expectEqualStrings("1 (126 or 127 in zbx run)", exit_text(.E0202, &text));
+    try std.testing.expectEqualStrings("70 (125 in zbx run)", exit_text(.B0001, &text));
+    try std.testing.expectEqualStrings("2", exit_text(.E0101, &text)); // The doctor's, not a run's.
+    try std.testing.expectEqual(@as(u8, 2), exit_code_unwritable(.standard));
+    try std.testing.expectEqual(@as(u8, 125), exit_code_unwritable(.container_run));
+}
+
+test "blame decides the exit code, and every blame has a distinct one" {
+    // Goal: the mapping is total, distinct, and agrees with each registered entry.
+    try std.testing.expectEqual(@as(u8, 1), exit_code(.user));
+    try std.testing.expectEqual(@as(u8, 2), exit_code(.environment));
+    try std.testing.expectEqual(@as(u8, 3), exit_code(.external));
+    try std.testing.expectEqual(@as(u8, 70), exit_code(.internal));
+    for (registry) |item| {
+        try std.testing.expect(exit_code(item.blame) != constants.exit_ok);
+    }
+}

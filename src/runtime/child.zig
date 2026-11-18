@@ -1,0 +1,526 @@
+//! The child's side of a run: the body `host.spawn` runs in the new process. It walks the plan's
+//! child steps in order, each through `host.zig`, and ends in `exec`.
+//!
+//! After `clone3` this code allocates nothing and formats no text: every path, the hostname and
+//! the exec image were made by the parent in the plan. A failure is four bytes in the report
+//! pipe (`sync.zig`), and the child ends; the parent builds the diagnostic.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const constants = @import("../constants.zig");
+const host_mod = @import("../host.zig");
+const capabilities = @import("capabilities.zig");
+const plan_mod = @import("plan.zig");
+const knobs = @import("knobs.zig");
+const seccomp = @import("seccomp.zig");
+const sync = @import("sync.zig");
+const cdi_steps = @import("cdi_steps.zig");
+
+const Host = host_mod.Host;
+const Plan = plan_mod.Plan;
+const Step = plan_mod.Step;
+
+/// Everything the child needs, handed over by the parent. It lives in the parent's memory and
+/// the child sees its own copy.
+pub const Context = struct {
+    host: Host,
+    plan: *const Plan,
+    /// The parent writes one byte when the id maps are in place; the child reads it.
+    ready: host_mod.Pipe,
+    /// The child writes records; the parent reads them to the end.
+    report: host_mod.Pipe,
+    /// In a plan with a listener or a lazy plan (`Plan.has_channel`): the channel the FUSE
+    /// descriptor and the listener are handed over (`Host.channel`): `read` is the parent's end,
+    /// `write` the child's. Unused (and not made) otherwise.
+    channel: host_mod.Pipe,
+};
+
+const Error = host_mod.Error || error{
+    /// The parent closed the ready pipe without the go-ahead byte: it gave up or died.
+    ParentGone,
+};
+
+/// A step failure's errno when it is not the one the last call left in the host (the exec step
+/// tries several paths and reports the most telling failure, not the last).
+const State = struct {
+    errno_override: u16,
+    /// The generated /etc files whose steps failed (bit n for `netfiles.File` n): the rest of
+    /// that file's steps are skipped, and the one note says what went wrong.
+    failed_etc: u8,
+    /// The listener `make_listener` made, until `send_listener` has sent it and closed it.
+    listener: ?host_mod.Handle,
+    /// The FUSE descriptor `mount_fuse` made, until `send_fuse` has sent it and closed it.
+    fuse: ?host_mod.Handle,
+    /// The image's `ldconfig` did not run for the CDI libraries: `exec` hands the command
+    /// `Plan.ld_library_path` instead.
+    ld_failed: bool,
+    /// A /sys step that leaves no /sys failed with its note: the cgroup view, which is mounted
+    /// on /sys/fs/cgroup, is not tried.
+    sys_missing: bool,
+};
+
+pub const go_ahead: u8 = 1;
+
+/// The body of the child. Returns the exit code of a child that did not reach its command; a
+/// command that started never returns (the real host) or ends the child (the simulator).
+pub fn entry(context: *anyopaque) u8 {
+    const child: *const Context = @ptrCast(@alignCast(context));
+    const host = child.host;
+    assert(child.plan.count == child.plan.steps_expected());
+    assert(child.ready.read != child.report.read); // Two distinct pipes.
+    // The parent's ends of the pipes are closed here so that end of file reaches both sides.
+    host.close(child.ready.write);
+    host.close(child.report.read);
+    if (child.plan.has_channel()) host.close(child.channel.read);
+    var state: State = .{
+        .errno_override = 0,
+        .failed_etc = 0,
+        .listener = null,
+        .fuse = null,
+        .ld_failed = false,
+        .sys_missing = false,
+    };
+    for (child.plan.steps[0..child.plan.count], 0..) |*step, index| {
+        if (plan_mod.side_of(step.kind) != .child) continue;
+        if (skipped(step, &state)) continue;
+        host.begin_step(@intCast(index));
+        state.errno_override = 0;
+        run_step(child, step, &state) catch |err| {
+            if (err == error.ParentGone) return constants.child_exit_setup_failed;
+            const raw = if (state.errno_override != 0) state.errno_override else host.last_errno();
+            // A failure made inside host.zig has no errno; EIO stands for it.
+            const errno = if (raw != 0) raw else constants.errno_io;
+            const record: sync.Record = .{
+                .kind = if (step.tolerant) .note else .failure,
+                .step = @intCast(index),
+                .errno = errno,
+            };
+            write_record(child, record);
+            if (step.tolerant) {
+                if (step.kind == .run_ldconfig) state.ld_failed = true;
+                if (leaves_no_sys(step.kind)) state.sys_missing = true;
+                const group = plan_mod.group_of(step);
+                if (group > 0) state.failed_etc |= @as(u8, 1) << @intCast(group - 1);
+                continue;
+            }
+            return constants.child_exit_setup_failed;
+        };
+    }
+    host.begin_step(host_mod.step_none);
+    // Only the simulator gets here: the real host's `exec` never returns.
+    assert(child.plan.steps[child.plan.count - child.plan.tail_count() - 1].kind == .exec);
+    assert(state.listener == null); // `send_listener` closed it: the command never holds it.
+    assert(state.fuse == null); // So did `send_fuse`.
+    return constants.exit_ok;
+}
+
+/// A step of a generated /etc file whose file already failed is not tried: the failure was
+/// noted once. Removing the staged copy is the exception, since a copy left in /dev would
+/// still be writable; it runs whatever happened before.
+fn skipped(step: *const Step, state: *const State) bool {
+    assert(plan_mod.side_of(step.kind) == .child);
+    if (step.kind == .mount_cgroup) return state.sys_missing;
+    const group = plan_mod.group_of(step);
+    assert(group <= 3);
+    if (group == 0) return false;
+    if (step.kind == .unstage_etc_file) return false;
+    return state.failed_etc & (@as(u8, 1) << @intCast(group - 1)) != 0;
+}
+
+/// The /sys steps whose failure leaves the container without a /sys: the directory, the bind
+/// and the fresh sysfs. A failed read-only remount leaves the bind in place.
+fn leaves_no_sys(kind: plan_mod.Kind) bool {
+    assert(@backingInt(kind) <= @backingInt(plan_mod.Kind.exec));
+    if (kind == .remount_sys) assert(plan_mod.is_sys(kind));
+    return kind == .make_sys_dir or kind == .bind_sys or kind == .mount_sysfs;
+}
+
+/// Tells the parent. If this write fails there is nobody to tell and nothing more to do: the
+/// child ends with the setup-failure code either way.
+fn write_record(child: *const Context, record: sync.Record) void {
+    assert(record.step < child.plan.count);
+    assert(record.errno != 0);
+    const bytes = record.encode();
+    child.host.write_handle_all(child.report.write, &bytes) catch return;
+}
+
+/// A host file or device node bound over its target, from the step's source.
+fn bind_file(host: Host, plan: *const Plan, step: *const Step) Error!void {
+    assert(plan_mod.side_of(step.kind) == .child);
+    assert(step.source.len > 0);
+    try mount(host, .bind_file, plan.text(step.target), plan.text(step.source));
+}
+
+fn run_step(child: *const Context, step: *const Step, state: *State) Error!void {
+    const host = child.host;
+    const plan = child.plan;
+    assert(plan_mod.side_of(step.kind) == .child);
+    const target = plan.text(step.target);
+    if (plan_mod.is_state(step.kind)) return run_state_step(host, plan, step, target);
+    if (plan_mod.is_mount(step.kind)) return run_mount_step(host, plan, step, target);
+    switch (step.kind) {
+        .die_with_parent => try host.die_with_parent(),
+        .await_release => try await_release(child),
+        .set_hostname => try host.set_hostname(plan.hostname()),
+        .set_umask => host.set_umask(plan.umask),
+        .make_mounts_private => try mount(host, .make_private, target, null),
+        .bind_rootfs, .bind_sys => try mount(host, .bind_tree, target, plan.text(step.source)),
+        .mount_overlay => try mount(host, .overlay, target, plan.text(step.source)),
+        .mount_proc => try mount(host, .proc, target, null),
+        .mount_dev => try mount(host, .dev_tmpfs, target, null),
+        .mount_shm => try mount(host, .shm_tmpfs, target, plan.text(step.source)),
+        .mount_pts => try mount(host, .devpts, target, null),
+        .make_proc_dir, .make_dev_dir, .make_tmp_dir => try make_dir(host, target),
+        .make_run_dir, .make_sys_dir, .make_etc_dir => try make_dir(host, target),
+        .mount_tmp => try mount(host, .tmp_tmpfs, target, null),
+        .mount_run => try mount(host, .run_tmpfs, target, null),
+        .remount_readonly, .remount_etc_file => try mount(host, .remount_readonly, target, null),
+        .restrict_capabilities => try host.restrict_capabilities(capabilities.keep_mask),
+        .clear_ambient => try host.clear_ambient(),
+        .set_no_new_privs => try host.no_new_privs(),
+        .install_seccomp => try host.install_seccomp(&seccomp.program),
+        .make_shm_dir, .make_pts_dir => try host.make_directory(target, false),
+        .bring_up_loopback => try host.bring_up_loopback(),
+        .make_listener => state.listener = try host.listen_loopback(plan.listen_port),
+        .send_listener => try send_listener(child, state),
+        .mount_fuse => state.fuse = try host.mount_fuse(target),
+        .send_fuse => try send_fuse(child, state),
+        .mount_sysfs => try mount(host, .sysfs, target, null),
+        .unshare_cgroup => try host.unshare_cgroup(),
+        .mount_cgroup => try mount_cgroup_view(host, target),
+        .create_etc_file => try host.create_file(target, true),
+        .stage_etc_file => try host.write_file_mode(target, plan.text(step.source), 0o644),
+        .bind_etc_file, .bind_device, .bind_user_device => try bind_file(host, plan, step),
+        .unstage_etc_file => try unstage(host, target),
+        .remount_sys => try mount(host, .remount_readonly_tree, target, null),
+        .enter_workdir => try enter_workdir(host, target),
+        .set_user => try host.set_user(plan.user_uid, plan.user_gid, plan.keep_groups),
+        .rearm_death_signal => try rearm_death_signal(child),
+        .create_device_file => try host.create_file(target, false),
+        .create_user_device => try make_file_target(host, target),
+        .bind_cdi_nodes, .stage_cdi_mounts => try run_cdi_step(host, plan, step.kind, state),
+        .move_cdi_mounts, .run_ldconfig => try run_cdi_step(host, plan, step.kind, state),
+        .link_dev => try host.symlink(plan.text(step.source), target),
+        .enter_rootfs, .enter_new_root => try host.change_directory(target),
+        .pivot_root => try host.pivot_root(target, plan.text(step.source)),
+        .detach_old_root => try host.unmount_detach(target),
+        .seal_descriptors => try host.seal_descriptors(),
+        .write_sysctl => try host.write_sysctl(target, plan.text(step.source)),
+        .set_rlimit => try set_rlimit(host, plan, step.index),
+        .exec => try exec(child, state),
+        // Handled by `run_state_step` and `run_mount_step` above, or the parent's steps.
+        .make_state_data, .make_state_stage, .bind_state, .remount_state => unreachable,
+        .make_state_target, .move_state, .remove_state_stage, .serve_fuse => unreachable,
+        .make_mount_stage_dir, .make_mount_stage_file, .copy_secret => unreachable,
+        .bind_mount_dir, .bind_mount_file, .remount_mount, .remount_mount_tree => unreachable,
+        .make_mount_target_dir, .make_mount_target_file, .move_mount => unreachable,
+        .remove_mount_stage_dir, .remove_mount_stage_file, .mount_user_tmpfs => unreachable,
+        .make_pipes, .spawn, .deny_setgroups, .write_gid_map, .write_uid_map => unreachable,
+        .run_newuidmap, .run_newgidmap, .spawn_keeper, .start_scope => unreachable,
+        .start_pasta, .await_pasta, .release_child, .await_report, .reap => unreachable,
+        .receive_listener => unreachable,
+    }
+}
+
+/// A directory the rootfs may already have (Alpine has /tmp and /run): only a missing one is made.
+fn make_dir(host: Host, target: [:0]const u8) Error!void {
+    assert(target.len > 0);
+    assert(target[0] == '/');
+    try host.make_directory(target, true);
+}
+
+/// One of a CDI device's steps; a failure inside a loop leaves its index in `errno_override`.
+fn run_cdi_step(host: Host, plan: *const Plan, kind: plan_mod.Kind, state: *State) Error!void {
+    assert(plan.cdi != null);
+    const override = &state.errno_override;
+    switch (kind) {
+        .bind_cdi_nodes => try cdi_steps.bind_nodes(host, plan, override),
+        .stage_cdi_mounts => try cdi_steps.stage_mounts(host, plan, override),
+        .move_cdi_mounts => try cdi_steps.move_mounts(host, plan, override),
+        .run_ldconfig => try cdi_steps.run_ldconfig(host, plan, override),
+        else => unreachable,
+    }
+}
+
+fn run_state_step(
+    host: Host,
+    plan: *const Plan,
+    step: *const Step,
+    target: [:0]const u8,
+) host_mod.Error!void {
+    assert(plan_mod.is_state(step.kind));
+    switch (step.kind) {
+        // The container's root makes the volume's `data` in its own user namespace, so that it
+        // is the owner as the container sees it; an existing one is the volume's files.
+        .make_state_data => try host.make_directory(target, true),
+        .make_state_stage => try host.make_directory(target, false),
+        .bind_state => try mount(host, .bind_tree, target, plan.text(step.source)),
+        .remount_state => try mount(host, .remount_readonly, target, null),
+        .make_state_target => try make_parents(host, target),
+        .move_state => try mount(host, .move, target, plan.text(step.source)),
+        .remove_state_stage => try host.remove_directory(target),
+        else => unreachable, // `is_state` said so.
+    }
+}
+
+fn run_mount_step(
+    host: Host,
+    plan: *const Plan,
+    step: *const Step,
+    target: [:0]const u8,
+) host_mod.Error!void {
+    assert(plan_mod.is_mount(step.kind));
+    switch (step.kind) {
+        .make_mount_stage_dir => try host.make_directory(target, false),
+        .make_mount_stage_file => try host.create_file(target, false),
+        .copy_secret => try copy_secret(host, plan.text(step.source), target),
+        .bind_mount_dir => try mount(host, .bind_tree, target, plan.text(step.source)),
+        .bind_mount_file => try mount(host, .bind_file, target, plan.text(step.source)),
+        .remount_mount => try mount(host, .remount_readonly, target, null),
+        .remount_mount_tree => try mount(host, .remount_readonly_tree, target, null),
+        .make_mount_target_dir => try make_parents(host, target),
+        .make_mount_target_file => try make_file_target(host, target),
+        .move_mount => try mount(host, .move, target, plan.text(step.source)),
+        .remove_mount_stage_dir => try host.remove_directory(target),
+        .remove_mount_stage_file => try host.remove_file(target),
+        .mount_user_tmpfs => try mount(host, .user_tmpfs, target, plan.text(step.source)),
+        else => unreachable, // `is_mount` said so.
+    }
+}
+
+/// Removes the staged copy of a generated file. A copy that was never written (the file's steps
+/// stopped before) is not there, which is fine.
+fn unstage(host: Host, target: [:0]const u8) host_mod.Error!void {
+    assert(target.len > 0);
+    assert(target[0] == '/');
+    host.remove_file(target) catch |err| {
+        if (err != error.NotFound) return err;
+    };
+}
+
+/// Copies the host's file `source` to `target` (a new file in the container's /dev) with mode
+/// 0400. The child is the container's root, so the copy is owned by it. The copy is the only
+/// place the bytes are kept: this buffer, on the child's stack, is wiped when it is done.
+fn copy_secret(host: Host, source: [:0]const u8, target: [:0]const u8) host_mod.Error!void {
+    assert(source.len > 0);
+    assert(target.len > 0);
+    var bytes: [constants.secret_bytes_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &bytes);
+    const content = try host.read_file(source, &bytes);
+    assert(content.len <= constants.secret_bytes_max);
+    try host.write_file_mode(target, content, 0o400);
+}
+
+/// Makes the file `target` and the directories above it that are missing; a file that is there
+/// is left as it is (the mount covers it).
+fn make_file_target(host: Host, target: [:0]const u8) host_mod.Error!void {
+    assert(target.len > 1);
+    assert(target[0] == '/');
+    const slash = std.mem.lastIndexOfScalar(u8, target, '/').?;
+    if (slash > 0) {
+        var parent: [constants.path_bytes_max + 1]u8 = undefined;
+        if (slash >= parent.len) return error.PathTooLong;
+        @memcpy(parent[0..slash], target[0..slash]);
+        parent[slash] = 0;
+        try make_parents(host, parent[0..slash :0]);
+    }
+    try host.create_file(target, true);
+}
+
+/// Makes the directory and the ones above it that are missing, then goes there.
+fn enter_workdir(host: Host, path: [:0]const u8) host_mod.Error!void {
+    assert(path.len > 0);
+    assert(path[0] == '/');
+    try make_parents(host, path);
+    try host.change_directory(path);
+}
+
+/// Makes the directory and the ones above it that are missing. The prefixes are cut from the
+/// path in a buffer on the stack: the child formats nothing and allocates nothing.
+fn make_parents(host: Host, path: [:0]const u8) host_mod.Error!void {
+    assert(path.len > 0);
+    assert(path[0] == '/');
+    var prefix: [constants.path_bytes_max + 1]u8 = undefined;
+    if (path.len >= prefix.len) return error.PathTooLong;
+    var at: usize = 1;
+    while (at <= path.len) : (at += 1) {
+        const end = at == path.len or path[at] == '/';
+        if (!end) continue;
+        @memcpy(prefix[0..at], path[0..at]);
+        prefix[at] = 0;
+        if (at > 1) try host.make_directory(prefix[0..at :0], true);
+    }
+}
+
+/// The cgroup view: the cover first, then the read-only cgroup2 on it (`host_mod.MountKind`).
+/// Both are one step, not tolerant: a failure after the cover is E0323, never a container
+/// without a view.
+fn mount_cgroup_view(host: Host, target: [:0]const u8) host_mod.Error!void {
+    assert(target.len > 0);
+    assert(std.mem.endsWith(u8, target, "/sys/fs/cgroup"));
+    try mount(host, .cgroup_cover, target, null);
+    try mount(host, .cgroup2, target, null);
+}
+
+fn mount(
+    host: Host,
+    kind: host_mod.MountKind,
+    target: [:0]const u8,
+    source: ?[:0]const u8,
+) host_mod.Error!void {
+    assert(target.len > 0);
+    assert(target[0] != 0);
+    const has_source = kind == .bind_tree or kind == .bind_file or kind == .overlay or
+        kind == .move or kind == .user_tmpfs or kind == .shm_tmpfs;
+    assert((source != null) == has_source);
+    try host.mount(.{ .kind = kind, .target = target, .source = source });
+}
+
+/// Sets one resource limit of `--ulimit`. The parent checked the hard value against its own
+/// (ZBX-E0311), so the kernel refusing it here is a host that changed between the two.
+fn set_rlimit(host: Host, plan: *const Plan, index: u8) Error!void {
+    assert(index < knobs.resources_count);
+    const resource: knobs.Resource = @fromBackingInt(@intCast(index));
+    const limit = plan.rlimits.get(resource).?; // The plan has a step only for one that is set.
+    assert(limit.soft <= limit.hard);
+    try host.set_rlimit(resource, limit);
+}
+
+/// The change of user cleared the request to die with zbx: it is made again, and then, since zbx
+/// may have died between the two, the child looks whether zbx still holds the read end of the
+/// report pipe (it does until the command starts) and ends at once if not. `getppid` cannot say:
+/// zbx is outside the container's PID namespace, where it reads as 0.
+fn rearm_death_signal(child: *const Context) Error!void {
+    assert(child.plan.has_user);
+    assert(child.report.write != child.ready.read);
+    try child.host.die_with_parent();
+    if (!child.host.pipe_has_reader(child.report.write)) return error.ParentGone;
+}
+
+/// Sends the FUSE descriptor to the parent and closes the child's copy, whether the send worked
+/// or not; the channel too when no listener follows it. The parent serves the connection from
+/// here: the overlay mount after this waits in the kernel until the parent answers `INIT`.
+fn send_fuse(child: *const Context, state: *State) host_mod.Error!void {
+    assert(child.plan.lazy);
+    const fuse = state.fuse.?;
+    const sent = child.host.send_handle(child.channel.write, fuse);
+    // The send's errno is the one to report, not a close's.
+    const errno = child.host.last_errno();
+    child.host.close(fuse);
+    state.fuse = null;
+    if (!child.plan.has_listener) child.host.close(child.channel.write);
+    sent catch |err| {
+        state.errno_override = errno;
+        return err;
+    };
+}
+
+/// Sends the listener to the parent and closes both of the child's copies, the listener and its
+/// end of the channel, whether the send worked or not: the command must never hold either.
+fn send_listener(child: *const Context, state: *State) host_mod.Error!void {
+    assert(child.plan.has_listener);
+    const listener = state.listener.?;
+    const sent = child.host.send_handle(child.channel.write, listener);
+    // The send's errno is the one to report, not a close's.
+    const errno = child.host.last_errno();
+    child.host.close(listener);
+    state.listener = null;
+    child.host.close(child.channel.write);
+    sent catch |err| {
+        state.errno_override = errno;
+        return err;
+    };
+}
+
+/// Waits for the go-ahead. No byte, only end of file, means the parent will not continue.
+fn await_release(child: *const Context) Error!void {
+    var byte: [1]u8 = undefined;
+    const count = try child.host.read_some(child.ready.read, &byte);
+    child.host.close(child.ready.read);
+    if (count == 0) return error.ParentGone;
+    assert(count == 1);
+    assert(byte[0] == go_ahead);
+}
+
+/// The command's environment with the CDI directories on `LD_LIBRARY_PATH`: ahead of a value the
+/// environment has already (the user's own directories stay, after the vendor's), or as a new
+/// entry. `line` holds the joined entry; `plan.envp` has the room for a new one (the
+/// environment's bound leaves one entry free, `plan.build_exec_image` asserts it).
+fn library_path_env(plan: *const Plan, line: *[library_line_bytes]u8) @TypeOf(plan.envp) {
+    var envp = plan.envp;
+    var count: usize = 0;
+    const key = "LD_LIBRARY_PATH=";
+    const own = std.mem.span(plan.text(plan.ld_library_path).ptr);
+    assert(std.mem.startsWith(u8, own, key));
+    while (envp[count]) |variable| : (count += 1) {
+        const text = std.mem.span(variable);
+        if (!std.mem.startsWith(u8, text, key)) continue;
+        const present = text[key.len..];
+        // An empty value joins as nothing: a trailing ':' would search the working directory.
+        if (present.len == 0) {
+            envp[count] = plan.text(plan.ld_library_path).ptr;
+            return envp;
+        }
+        // Each environment value is held to `env_value_bytes_max`, which `line` has room for.
+        assert(own.len + 1 + present.len < line.len);
+        @memcpy(line[0..own.len], own);
+        line[own.len] = ':';
+        @memcpy(line[own.len + 1 ..][0..present.len], present);
+        line[own.len + 1 + present.len] = 0;
+        envp[count] = @ptrCast(line);
+        return envp;
+    }
+    assert(count + 1 < envp.len);
+    envp[count] = plan.text(plan.ld_library_path).ptr;
+    envp[count + 1] = null;
+    return envp;
+}
+
+const library_line_bytes = constants.cdi_run_dirs_max * (constants.cdi_path_bytes_max + 1) +
+    constants.env_value_bytes_max + 80;
+
+/// Tries each candidate path in turn, as a shell does for a name without a slash. A file that
+/// is missing moves on to the next candidate; a file that is there but cannot be run is
+/// reported over a missing one, since it is the more telling failure.
+fn exec(child: *const Context, state: *State) Error!void {
+    const plan = child.plan;
+    assert(plan.candidates_count > 0);
+    assert(plan.argv[0] != null);
+    const argv: host_mod.CStrings = @ptrCast(&plan.argv);
+    var with_library_path: @TypeOf(plan.envp) = undefined;
+    var library_line: [library_line_bytes]u8 = undefined;
+    const envp: host_mod.CStrings = if (state.ld_failed and plan.ld_library_path.len > 0) blk: {
+        with_library_path = library_path_env(plan, &library_line);
+        break :blk @ptrCast(&with_library_path);
+    } else @ptrCast(&plan.envp);
+    var missing: ?Error = null;
+    var missing_errno: u16 = 0;
+    var denied: ?Error = null;
+    var denied_errno: u16 = 0;
+    for (plan.candidate_slice()) |candidate| {
+        const path = plan.text(candidate);
+        child.host.exec(.{ .path = path, .argv = argv, .envp = envp }) catch |err| switch (err) {
+            error.NotFound => {
+                missing = err;
+                missing_errno = child.host.last_errno();
+                continue;
+            },
+            error.AccessDenied => {
+                denied = err;
+                denied_errno = child.host.last_errno();
+                continue;
+            },
+            else => return err, // The file is there and cannot be run: that is the answer.
+        };
+        return; // The simulator's way of saying the command started.
+    }
+    if (denied) |err| {
+        assert(denied_errno != 0);
+        state.errno_override = denied_errno;
+        return err;
+    }
+    // Every candidate was tried and none was there, so `missing` was set by the last of them.
+    assert(missing_errno != 0);
+    state.errno_override = missing_errno;
+    return missing.?;
+}

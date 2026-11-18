@@ -1,0 +1,1778 @@
+//! The only interface through which Zigbox touches the kernel. Two implementations exist:
+//! `host_real.zig` (syscalls) and `host_sim.zig` (an in-memory model with seeded fault
+//! injection). Code above this file must not know which one it is using.
+//!
+//! Design choice: a runtime vtable (`*anyopaque` context plus a table of function pointers)
+//! rather than a comptime-selected type. Reasons: (1) the fuzzers and unit tests build real
+//! binaries once and swap implementations per iteration without instantiating every caller
+//! twice; (2) callers take a plain `Host` value, so no generic parameter spreads through
+//! `doctor`, `cli` and the later milestones; (3) the call overhead is irrelevant next to a
+//! syscall. The cost is that the compiler cannot see which implementation a call reaches. The
+//! vtable struct has no field defaults, so an implementation that omits an entry does not
+//! compile.
+//!
+//! The vtable holds only primitives. Retry and short-read logic is written once, here, in
+//! `read_file` and `write_all`, so that the simulator's injected EINTR and short reads exercise
+//! the same code that runs in production.
+
+const std = @import("std");
+const bpf = @import("runtime/bpf.zig");
+const knobs = @import("runtime/knobs.zig");
+const store_fs = @import("store/fs.zig");
+const registry_net = @import("registry/net.zig");
+const assert = std.debug.assert;
+const constants = @import("constants.zig");
+const linux = std.os.linux;
+
+/// Operating errors the kernel layer can report. Deliberately coarse: callers choose a message
+/// and a fix per error, never per errno.
+pub const Error = error{
+    NotFound,
+    AccessDenied,
+    Interrupted,
+    WouldBlock,
+    NoSpace,
+    OutOfMemory,
+    PathTooLong,
+    InvalidPath,
+    /// The file holds more bytes than the caller's buffer, which is its documented limit.
+    FileTooLarge,
+    /// An operation made no progress within its call bound (a livelock guard).
+    Stalled,
+    Unsupported,
+    /// The file exists but does not have the requested extended attribute.
+    NoData,
+    /// A wait for a peer's bytes ended with none (`read_timeout`); a bound, not a failure of
+    /// the kernel.
+    TimedOut,
+    IoFailed,
+};
+
+/// Maps a raw errno to the coarse operating error callers handle. The one mapping: the real
+/// host and the simulator both use it, so a simulated errno means what a real one would.
+pub fn error_for_errno(errno: u16) Error {
+    assert(errno != 0); // Zero is success, never an error.
+    const code: linux.E = @fromBackingInt(errno);
+    const mapped: Error = switch (code) {
+        .INTR => error.Interrupted,
+        .AGAIN => error.WouldBlock,
+        .NOENT, .NOTDIR => error.NotFound,
+        .ACCES, .PERM => error.AccessDenied,
+        .NOSPC => error.NoSpace,
+        .NOMEM => error.OutOfMemory,
+        .NAMETOOLONG => error.PathTooLong,
+        .NOSYS => error.Unsupported,
+        .NODATA => error.NoData,
+        .TIMEDOUT => error.TimedOut,
+        .RANGE => error.FileTooLarge,
+        else => error.IoFailed,
+    };
+    assert(mapped != error.Stalled); // Only host.zig's own loops produce that.
+    return mapped;
+}
+
+/// An open, read-only file. Small integers so the simulator can hand out table indexes.
+pub const Handle = u32;
+
+pub const Stream = enum { stdout, stderr };
+
+pub const Text = struct {
+    bytes: [constants.uname_field_bytes]u8,
+    len: u8,
+
+    pub fn slice(text: *const Text) []const u8 {
+        assert(text.len < constants.uname_field_bytes);
+        assert(text.bytes[text.len] == 0); // from_slice zero-fills past the end.
+        return text.bytes[0..text.len];
+    }
+
+    pub fn from_slice(source: []const u8) Text {
+        assert(source.len < constants.uname_field_bytes);
+        var text: Text = .{ .bytes = @splat(0), .len = @intCast(source.len) };
+        @memcpy(text.bytes[0..source.len], source);
+        assert(text.bytes[source.len] == 0);
+        return text;
+    }
+};
+
+pub const Uname = struct {
+    release: Text,
+    machine: Text,
+};
+
+/// File type and permission bits, and the owner, as `stat` reports them.
+pub const Stat = struct {
+    mode: u32,
+    uid: u32,
+};
+
+/// What `Host.device_node` reports of a node (`--device`, M10). `mode` holds the file type bits.
+/// `can_open` is the kernel's answer for the caller's effective ids and groups (read and write);
+/// `member` says whether the caller is in the node's group, for the diagnostic.
+pub const DeviceNode = struct {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    can_open: bool,
+    member: bool,
+
+    pub const Kind = enum { character, block, other };
+
+    pub fn kind(node: DeviceNode) Kind {
+        return switch (node.mode & 0o170000) {
+            0o020000 => .character,
+            0o060000 => .block,
+            else => .other,
+        };
+    }
+};
+
+/// Whether the permission bits of `mode` let a caller with these ids open the node for reading
+/// and writing, as the kernel decides it (owner, then group, then others; root is not special
+/// here, the simulator's caller is never root). The simulator uses it.
+pub fn mode_allows_read_write(mode: u32, owner: u32, uid: u32, in_group: bool) bool {
+    assert(mode <= std.math.maxInt(u16));
+    assert(uid != std.math.maxInt(u32));
+    const shift: u5 = if (uid == owner) 6 else if (in_group) 3 else 0;
+    return (mode >> shift) & 0o6 == 0o6;
+}
+
+/// Probes run in a forked child so a failed probe cannot damage the caller. The child runs as
+/// an unprivileged user even when the caller is root, so the answer is about ordinary users.
+pub const ProbeKind = enum {
+    userns,
+    overlay,
+    /// Whether the kernel lets this user make an id-mapped mount of a path (`open_tree` clone,
+    /// then `mount_setattr` with `MOUNT_ATTR_IDMAP`) in a scratch user and mount namespace. Asked
+    /// with `Host.probe_idmap`, which names the path. zbx never uses such a mount; the doctor only
+    /// reports the fact.
+    idmap,
+    /// Whether this user can open `/dev/fuse` and mount FUSE from a scratch user and mount
+    /// namespace, as `zbx run --lazy` does (S2). Nothing serves the mount; it goes with the
+    /// namespace.
+    fuse,
+};
+
+pub const ProbeOutcome = enum {
+    ok,
+    /// The operation under test was refused (EPERM, EACCES, ENOSPC, ENODEV, EINVAL ...).
+    denied,
+    /// Overlay only: the child could not enter the user and mount namespaces the probe needs.
+    setup_denied,
+    /// The namespace was created but writing setgroups/uid_map/gid_map was refused.
+    map_denied,
+    /// FUSE only: `/dev/fuse` is missing, or this user may not open it.
+    no_device,
+    /// The child failed for a reason that says nothing about the feature (no memory, ...).
+    failed,
+    /// The child was killed by a signal.
+    signaled,
+    /// The child did not finish within the probe timeout and was killed and reaped.
+    timed_out,
+};
+
+// ---- Containers --------------------------------------------------------------------------
+//
+// The primitives a container run is built from. Each is one kernel operation (or one tiny
+// fixed sequence of them), so that a plan step maps to one fallible call and the simulator can
+// fail exactly that step. `run.zig` owns the order; this file owns what each call means.
+
+/// A process id in the caller's PID namespace.
+pub const Pid = u32;
+
+/// The two ends of a pipe. Both are close-on-exec, so a successful `exec` closes them: that EOF
+/// is how a parent learns that the child's command started.
+pub const Pipe = struct {
+    read: Handle,
+    write: Handle,
+};
+
+/// The namespaces a child is created in.
+pub const SpawnFlags = struct {
+    user: bool,
+    mount: bool,
+    pid: bool,
+    uts: bool,
+    ipc: bool,
+    /// A network namespace of its own, owned by the new user namespace. Without it the child
+    /// shares the host's (`--net host`).
+    net: bool,
+    /// Pipe write ends the child makes its standard output and error before it runs `entry`; the
+    /// parent keeps the read ends and closes the write ends itself. Null: the child's streams
+    /// are the parent's.
+    output: ?OutputPipes = null,
+    /// The child's standard input is /dev/null before it runs `entry`, not the parent's (a build
+    /// step must not read the terminal or a pipe of whoever started `zbx`).
+    stdin_null: bool = false,
+    /// The child's parent is the caller's parent, not the caller (`CLONE_PARENT`): `exec`'s
+    /// joiner forks the command this way, so that `zbx` waits for it directly. It takes no
+    /// namespace flag: the child is born in the namespaces the caller joined.
+    sibling: bool = false,
+};
+
+/// The namespaces `exec` joins (`setns`), in the order it joins them: the user namespace first,
+/// which gives the capabilities the others need (the caller owns it, so joining it needs
+/// none), and the mount namespace last, since it changes the root that paths are read from.
+/// The namespaces an exec'd command joins; `[namespaces_count]` arrays are indexed by kind.
+pub const namespaces_count: u32 = 7;
+
+comptime {
+    assert(std.enums.values(NamespaceKind).len == namespaces_count);
+}
+
+pub const NamespaceKind = enum {
+    user,
+    ipc,
+    uts,
+    net,
+    pid,
+    /// A scoped container's own (M2b), rooted at its scope: an exec'd command joins it, so it
+    /// sees `0::/` and the read-only view as the container's own command does.
+    cgroup,
+    mount,
+
+    /// The name of the file in `/proc/<pid>/ns/`.
+    pub fn file_name(kind: NamespaceKind) []const u8 {
+        const name: []const u8 = switch (kind) {
+            .user => "user",
+            .ipc => "ipc",
+            .uts => "uts",
+            .net => "net",
+            .pid => "pid",
+            .cgroup => "cgroup",
+            .mount => "mnt",
+        };
+        assert(name.len >= 3);
+        assert(name.len <= 6);
+        return name;
+    }
+};
+
+/// A pseudo-terminal: the side zbx keeps (`master`) and the side the command gets (`peer`).
+/// Both are close-on-exec.
+pub const Terminal = struct {
+    master: Handle,
+    peer: Handle,
+};
+
+/// The settings of zbx's own terminal, saved before it is made raw and put back after.
+pub const TerminalSaved = struct {
+    bytes: [terminal_saved_bytes]u8,
+    /// Set when `bytes` holds settings that were read and must be put back.
+    valid: bool,
+};
+
+/// Room for the kernel's `struct termios` (60 bytes on x86_64 and aarch64).
+pub const terminal_saved_bytes: u32 = 64;
+
+/// The write ends of the pipes that carry a container's standard output and error.
+/// A stream left null stays the parent's own (a terminal that is not interposed on).
+pub const OutputPipes = struct {
+    stdout: ?Handle,
+    stderr: ?Handle,
+};
+
+/// The body of a spawned child. It runs in the child, on a copy of the parent's memory, and its
+/// result is the child's exit code unless it replaced itself with `exec`.
+pub const ChildEntry = *const fn (entry_context: *anyopaque) u8;
+
+pub const ExitStatus = union(enum) {
+    exited: u8,
+    /// Killed by this signal number.
+    signaled: u8,
+};
+
+/// The three files of a user namespace that define its ids, in the order they must be written:
+/// `setgroups` ("deny") first, because an unprivileged writer may not map groups otherwise.
+pub const IdMapKind = enum { setgroups, gid_map, uid_map };
+
+/// Every mount a container setup makes. The host knows each one's flags and options, so that a
+/// plan step is a name, not a pile of kernel constants, and the simulator models what each does.
+pub const MountKind = enum {
+    /// `target` ("/"): make the whole tree private so nothing propagates to the host.
+    make_private,
+    /// Bind `source` onto `target`, with everything mounted below it.
+    bind_tree,
+    /// Bind the single file or device `source` onto the file `target`.
+    bind_file,
+    /// A fresh procfs for the PID namespace of the caller: nosuid, nodev, noexec.
+    proc,
+    /// The container's `/dev`: tmpfs, mode 0755, nosuid.
+    dev_tmpfs,
+    /// `/dev/shm`: tmpfs, nosuid, nodev, noexec; `source` is the mount data, its mode (1777)
+    /// and its size (`--shm-size`, M2b).
+    shm_tmpfs,
+    /// `/dev/pts`: a private devpts instance whose ptmx is mode 0666.
+    devpts,
+    /// A read-only rootfs gets `/tmp`: tmpfs, mode 1777, nosuid, nodev, sized by
+    /// `constants.tmpfs_bytes_max`.
+    tmp_tmpfs,
+    /// ... and `/run`: tmpfs, mode 0755, nosuid, nodev.
+    run_tmpfs,
+    /// `target` (a bind mount) becomes read-only. In a user namespace the kernel requires the
+    /// flags the mount already has (nosuid, nodev, noexec, atime) to be kept, so the host reads
+    /// them first.
+    remount_readonly,
+    /// `target` (a mount, with the mounts below it) becomes read-only throughout: the whole
+    /// tree at once (`mount_setattr` with `AT_RECURSIVE`), which a user namespace may do because
+    /// it only adds a restriction.
+    remount_readonly_tree,
+    /// A fresh sysfs on `target`, read-only: nosuid, nodev, noexec. In a network namespace of the
+    /// container's own it shows that namespace's devices, not the host's.
+    sysfs,
+    /// A small tmpfs on `target`, read-only: nosuid, nodev, noexec, mode 0555 (M2b). It covers
+    /// `/sys/fs/cgroup` before the cgroup view: below the host's /sys, bound, the host's cgroup2
+    /// is mounted there, and the kernel refuses its superblock again on that mount (EBUSY).
+    /// Mounted in every mode, so the view has one sequence (docs/decisions/
+    /// 2026-11-17-m2b-cgroup-cover.md).
+    cgroup_cover,
+    /// A fresh cgroup2 on `target`, read-only: nosuid, nodev, noexec (M2b). In a cgroup namespace
+    /// of the caller's own, its root is the cgroup the caller was in when it took the namespace.
+    /// Below a bound host /sys it needs `cgroup_cover` on `target` first.
+    cgroup2,
+    /// An overlayfs mount on `target`. `source` is the mount data (`userxattr,lowerdir=...`):
+    /// the kernel reads it as text, so it is the one request whose source is not a path.
+    overlay,
+    /// Moves the mount at `source` (a mount point) to `target` (`MS_MOVE`), with what is mounted
+    /// below it. A state volume is bound in the container's /dev first and moved into the new
+    /// root after it is entered, so that its target is read as the container reads it.
+    move,
+    /// A tmpfs of the user's asking (`--tmpfs`): nosuid, nodev, noexec, owned by the container's
+    /// root. `source` is the mount data (`mode=1777,size=<bytes>`), as for the overlay.
+    user_tmpfs,
+};
+
+/// Whether a fresh mount of `kind` is read-only from the start. The real host's flags and the
+/// simulator's model both follow it, and a test in `host_real.zig` checks the flags against it,
+/// so a view that becomes writable fails `zig build test` (the container could otherwise rewrite
+/// its own scope's limits through `/sys/fs/cgroup`).
+pub fn mounted_read_only(kind: MountKind) bool {
+    const read_only = switch (kind) {
+        .sysfs, .cgroup_cover, .cgroup2 => true,
+        else => false,
+    };
+    if (kind == .cgroup2) assert(read_only);
+    if (kind == .proc) assert(!read_only);
+    return read_only;
+}
+
+pub const MountRequest = struct {
+    kind: MountKind,
+    target: [:0]const u8,
+    /// Set exactly for the bind kinds.
+    source: ?[:0]const u8,
+};
+
+/// A null-terminated array of C strings, as `execve` takes it.
+pub const CStrings = [*:null]const ?[*:0]const u8;
+
+pub const ExecRequest = struct {
+    path: [:0]const u8,
+    argv: CStrings,
+    envp: CStrings,
+    /// Seconds the helper may run before it is killed (SIGALRM); zero is no limit.
+    timeout_seconds: u32 = 0,
+};
+
+/// What a helper program (newuidmap, newgidmap) did: how it ended, and the first bytes it wrote.
+pub const HelperResult = struct {
+    status: ExitStatus,
+    output_len: u32,
+    /// The deadline passed and the helper was killed: its status is then no success, whatever
+    /// it says.
+    timed_out: bool = false,
+};
+
+/// What the parent waiting for its container learns next.
+pub const Event = union(enum) {
+    /// The child ended.
+    exited: ExitStatus,
+    /// A signal zbx forwards arrived (INT, TERM, HUP or QUIT), or the terminal's window
+    /// changed size (WINCH, which `exec` passes on to its pseudo-terminal and nothing forwards).
+    signal: u8,
+    /// The wait's time ran out with neither (only for a wait given a time).
+    timeout,
+    /// Some of the watched handles (`wait_event_watching`) have bytes to read or reached their
+    /// end: bit i is set when the i-th is ready.
+    output: u32,
+};
+
+/// A child `wait_any` reaped: its place in the pids it was given, and how it ended.
+pub const Reaped = struct { index: u8, status: ExitStatus };
+
+/// Which side of `fork_supervisor` a process is on.
+pub const Role = enum {
+    /// The caller that asked for a detached run; it goes on, and the supervisor is its child.
+    parent,
+    /// The new process: its own session, its stdin, stdout and stderr on /dev/null.
+    supervisor,
+};
+
+/// Which signals a process has handlers for or ignores, as bit masks (bit n-1 is signal n).
+pub const SignalState = struct {
+    caught: u64,
+    ignored: u64,
+
+    pub fn has(mask: u64, number: u8) bool {
+        assert(number > 0);
+        assert(number <= 64);
+        return mask >> @intCast(number - 1) & 1 == 1;
+    }
+};
+
+/// The names in one directory, NUL-terminated one after another. Fixed size: a directory with
+/// more entries, or a longer name, sets `truncated` and the rest is not listed.
+pub const DirListing = struct {
+    bytes: [constants.dir_listing_bytes_max]u8,
+    len: u32,
+    count: u32,
+    truncated: bool,
+
+    pub fn reset(listing: *DirListing) void {
+        listing.len = 0;
+        listing.count = 0;
+        listing.truncated = false;
+    }
+
+    /// Adds a name, or marks the listing truncated if it does not fit.
+    pub fn add(listing: *DirListing, entry: []const u8) void {
+        assert(entry.len > 0);
+        assert(std.mem.indexOfScalar(u8, entry, 0) == null);
+        const fits = entry.len <= constants.dir_name_bytes_max;
+        if (!fits or listing.count == constants.dir_entries_max) {
+            listing.truncated = true;
+            return;
+        }
+        @memcpy(listing.bytes[listing.len..][0..entry.len], entry);
+        listing.bytes[listing.len + entry.len] = 0;
+        listing.len += @intCast(entry.len + 1);
+        listing.count += 1;
+        assert(listing.len <= listing.bytes.len);
+    }
+
+    /// The name at `index` (in the order added).
+    pub fn name(listing: *const DirListing, index: u32) []const u8 {
+        assert(index < listing.count);
+        var at: u32 = 0;
+        var seen: u32 = 0;
+        while (seen < index) : (seen += 1) {
+            at += @intCast(std.mem.indexOfScalar(u8, listing.bytes[at..listing.len], 0).? + 1);
+        }
+        const rest = listing.bytes[at..listing.len];
+        return rest[0..std.mem.indexOfScalar(u8, rest, 0).?];
+    }
+};
+
+/// The step index to give `begin_step` when no plan step is running.
+pub const step_none: u32 = std.math.maxInt(u32);
+
+pub const VTable = struct {
+    open_read: *const fn (context: *anyopaque, path: [:0]const u8) Error!Handle,
+    read: *const fn (context: *anyopaque, handle: Handle, buffer: []u8) Error!u32,
+    close: *const fn (context: *anyopaque, handle: Handle) void,
+    write: *const fn (context: *anyopaque, stream: Stream, bytes: []const u8) Error!u32,
+    uname: *const fn (context: *anyopaque) Error!Uname,
+    stat: *const fn (context: *anyopaque, path: [:0]const u8) Error!Stat,
+    /// Reads the raw `security.capability` xattr. Returns `NoData` if the file has none and
+    /// `FileTooLarge` if it does not fit `buffer`.
+    read_capability: *const fn (
+        context: *anyopaque,
+        path: [:0]const u8,
+        buffer: []u8,
+    ) Error!u32,
+    /// The mode of the seccomp filter of this process, from `prctl(PR_GET_SECCOMP)`.
+    seccomp_mode: *const fn (context: *anyopaque) Error!u32,
+    is_terminal: *const fn (context: *anyopaque, stream: Stream) bool,
+    /// True if the environment variable NO_COLOR is set to a non-empty value (no-color.org).
+    no_color: *const fn (context: *anyopaque) bool,
+    /// The real user id of this process.
+    uid: *const fn (context: *anyopaque) u32,
+    probe: *const fn (context: *anyopaque, kind: ProbeKind) Error!ProbeOutcome,
+    /// The `idmap` probe for the file system `path` is on. `ok`: the mount was made.
+    probe_idmap: *const fn (context: *anyopaque, path: [:0]const u8) Error!ProbeOutcome,
+    /// The raw errno of the most recent call through this vtable: 0 if it succeeded. Lets the
+    /// diagnostics name the real errno without widening `Error`.
+    last_errno: *const fn (context: *anyopaque) u16,
+    // Containers. The step markers and the per-step fault injection are explained at
+    // `Host.begin_step`.
+    pipe: *const fn (context: *anyopaque) Error!Pipe,
+    write_handle: *const fn (context: *anyopaque, handle: Handle, bytes: []const u8) Error!u32,
+    /// `clone3` with the namespaces in `flags`. The child runs `entry` and exits with its result.
+    spawn: *const fn (
+        context: *anyopaque,
+        flags: SpawnFlags,
+        entry: ChildEntry,
+        entry_context: *anyopaque,
+    ) Error!Pid,
+    /// Forks the scope's keeper (see `Host.start_keeper`).
+    start_keeper: *const fn (context: *anyopaque, hold: Handle) Error!Pid,
+    /// Starts a program that outlives the call (see `Host.start_program`).
+    start_program: *const fn (
+        context: *anyopaque,
+        request: ExecRequest,
+        stdout: Handle,
+        log: [:0]const u8,
+    ) Error!Pid,
+    /// Blocks until the child ends and reaps it.
+    wait: *const fn (context: *anyopaque, pid: Pid) Error!ExitStatus,
+    signal: *const fn (context: *anyopaque, pid: Pid, signal: u8) Error!void,
+    write_id_map: *const fn (
+        context: *anyopaque,
+        pid: Pid,
+        kind: IdMapKind,
+        bytes: []const u8,
+    ) Error!void,
+    mount: *const fn (context: *anyopaque, request: MountRequest) Error!void,
+    unmount_detach: *const fn (context: *anyopaque, path: [:0]const u8) Error!void,
+    pivot_root: *const fn (
+        context: *anyopaque,
+        new_root: [:0]const u8,
+        put_old: [:0]const u8,
+    ) Error!void,
+    change_directory: *const fn (context: *anyopaque, path: [:0]const u8) Error!void,
+    make_directory: *const fn (context: *anyopaque, path: [:0]const u8, exist_ok: bool) Error!void,
+    create_file: *const fn (context: *anyopaque, path: [:0]const u8, exist_ok: bool) Error!void,
+    /// Removes an empty directory (`rmdir`).
+    remove_directory: *const fn (context: *anyopaque, path: [:0]const u8) Error!void,
+    /// Brings the loopback interface `lo` up in the caller's network namespace: one ioctl on a
+    /// throwaway socket. In a namespace of the container's own, `lo` is down until this runs.
+    bring_up_loopback: *const fn (context: *anyopaque) Error!void,
+    /// A channel for handing one descriptor from the container's setup child to its parent: a
+    /// connected pair of Unix stream sockets, both close-on-exec. `Pipe.read` is the parent's end
+    /// (it receives), `Pipe.write` the child's (it sends); each side closes the end it does not
+    /// use.
+    channel: *const fn (context: *anyopaque) Error!Pipe,
+    /// Makes a TCP listener on `127.0.0.1:port` in the caller's network namespace: `socket`
+    /// (close-on-exec), `bind`, `listen`. A failure carries the failing call's errno.
+    listen_loopback: *const fn (context: *anyopaque, port: u16) Error!Handle,
+    /// Opens `/dev/fuse` (close-on-exec) and mounts its connection on the directory `target`,
+    /// read-only, `nosuid` and `nodev`, for the lazy server: the descriptor, which the server
+    /// reads its requests from. A failure carries the failing call's errno and leaves nothing
+    /// open.
+    mount_fuse: *const fn (context: *anyopaque, target: [:0]const u8) Error!Handle,
+    /// Makes a new, unconnected IPv4 TCP socket in the caller's network namespace: `socket`
+    /// (close-on-exec) and nothing else. A failure carries the errno.
+    tcp4_socket: *const fn (context: *anyopaque) Error!Handle,
+    /// Sends `handle` over the channel end `channel` (`SCM_RIGHTS`, one byte of data).
+    send_handle: *const fn (context: *anyopaque, channel: Handle, handle: Handle) Error!void,
+    /// Whether `handle` is an open descriptor of this process that is a Unix stream socket
+    /// (`getsockopt` `SO_DOMAIN` and `SO_TYPE`). A descriptor that is closed, or not a socket,
+    /// is not one; so is a number past what a descriptor can be.
+    is_unix_stream: *const fn (context: *anyopaque, handle: Handle) bool,
+    /// Receives one descriptor over the channel end `channel` (close-on-exec in this process).
+    /// End of file with nothing sent is `error.IoFailed` with errno `EPIPE`.
+    receive_handle: *const fn (context: *anyopaque, channel: Handle) Error!Handle,
+    symlink: *const fn (context: *anyopaque, target: [:0]const u8, link: [:0]const u8) Error!void,
+    set_hostname: *const fn (context: *anyopaque, name: []const u8) Error!void,
+    /// Sets the calling process's file mode creation mask (`umask`); it cannot fail.
+    set_umask: *const fn (context: *anyopaque, mask: u16) void,
+    /// Marks every descriptor above 2 close-on-exec (`close_range`), so none reaches the command.
+    seal_descriptors: *const fn (context: *anyopaque) Error!void,
+    /// Asks the kernel to kill this process when its parent dies (`PR_SET_PDEATHSIG`).
+    die_with_parent: *const fn (context: *anyopaque) Error!void,
+    /// Whether some process still holds the read end of the pipe whose write end is `handle`
+    /// (`poll` without waiting: POLLERR says no reader is left). A container's child uses its
+    /// report pipe to ask whether zbx is still there: zbx holds the read end until the command
+    /// starts, and from inside a PID namespace `getppid` cannot name a parent outside it.
+    pipe_has_reader: *const fn (context: *anyopaque, handle: Handle) bool,
+    /// Makes the pipe of `handle` hold at least `bytes_min` bytes and checks that it does:
+    /// `NoSpace` if the kernel gave less (a user over the pipe-memory limits gets one or two
+    /// pages), so that a writer of that many bytes never waits for a reader.
+    pipe_capacity: *const fn (context: *anyopaque, handle: Handle, bytes_min: u32) Error!void,
+    /// Drops every capability not in `keep` (a mask by capability number) from the bounding set,
+    /// then makes it the effective, permitted and inheritable sets (`PR_CAPBSET_DROP`, `capset`).
+    restrict_capabilities: *const fn (context: *anyopaque, keep: u64) Error!void,
+    /// Empties the ambient capability set (`PR_CAP_AMBIENT_CLEAR_ALL`).
+    clear_ambient: *const fn (context: *anyopaque) Error!void,
+    /// Sets `no_new_privs` (`PR_SET_NO_NEW_PRIVS`), which stays for the process and its children.
+    no_new_privs: *const fn (context: *anyopaque) Error!void,
+    /// Becomes the user and group: no supplementary groups (unless `keep_groups`: a run with
+    /// devices keeps them, M10), then the group, then the user (all three ids of each), so that
+    /// nothing of root is left. Needs CAP_SETUID and CAP_SETGID.
+    set_user: *const fn (context: *anyopaque, uid: u32, gid: u32, keep_groups: bool) Error!void,
+    /// Looks at a device node on the host for `--device` (M10): what it is, who owns it, and
+    /// whether the caller may open it for reading and writing, and is in its group.
+    device_node: *const fn (context: *anyopaque, path: [:0]const u8) Error!DeviceNode,
+    /// The calling process's soft and hard limit of `resource` (`prlimit64`, reading).
+    get_rlimit: *const fn (context: *anyopaque, resource: knobs.Resource) Error!knobs.Rlimit,
+    /// Sets the calling process's limits of `resource` (`prlimit64` on itself). A hard limit
+    /// above the current one needs CAP_SYS_RESOURCE in the initial user namespace: EPERM.
+    set_rlimit: *const fn (
+        context: *anyopaque,
+        resource: knobs.Resource,
+        limit: knobs.Rlimit,
+    ) Error!void,
+    /// Writes `value` to a file under `/proc/sys` that exists, in one write and without creating
+    /// or truncating it (a sysctl takes its whole value from one write). The kernel's EINVAL is a
+    /// value it refused.
+    write_sysctl: *const fn (context: *anyopaque, path: [:0]const u8, value: []const u8) Error!void,
+    /// Takes a cgroup namespace of the caller's own (`unshare(CLONE_NEWCGROUP)`), rooted at the
+    /// cgroup it is in now. Needs CAP_SYS_ADMIN over its user namespace.
+    unshare_cgroup: *const fn (context: *anyopaque) Error!void,
+    /// Installs a seccomp filter (`seccomp(SECCOMP_SET_MODE_FILTER)`). Needs `no_new_privs` first.
+    install_seccomp: *const fn (context: *anyopaque, program: []const bpf.Insn) Error!void,
+    /// Replaces the process. Returns only on failure in the real host; the simulator returns
+    /// success to model a command that started.
+    exec: *const fn (context: *anyopaque, request: ExecRequest) Error!void,
+    gid: *const fn (context: *anyopaque) u32,
+    /// The value of an environment variable of this process, or null if it is not set.
+    environment: *const fn (context: *anyopaque, name: []const u8) ?[]const u8,
+    /// The `index`th variable of the process environment, in the order the process has them, or
+    /// null past the last. Only a bundle lists the environment (with the values redacted).
+    environment_at: *const fn (context: *anyopaque, index: u32) ?EnvironmentEntry,
+    random_bytes: *const fn (context: *anyopaque, buffer: []u8) Error!void,
+    /// Runs a helper program to its end and waits for it. Its output (stdout and stderr, joined)
+    /// is kept up to `output.len` bytes. The helper is run with the environment in the request.
+    run_helper: *const fn (
+        context: *anyopaque,
+        request: ExecRequest,
+        output: []u8,
+    ) Error!HelperResult,
+    /// Blocks (or unblocks) INT, TERM, HUP, QUIT, CHLD and WINCH, so that they wait to be read by
+    /// `wait_event` instead of acting.
+    block_signals: *const fn (context: *anyopaque, block: bool) Error!void,
+    /// Waits for the child to end or for a forwarded signal; the signals must be blocked. With a
+    /// `timeout_ms` above zero it also ends, with `.timeout`, when that long has passed.
+    wait_event: *const fn (context: *anyopaque, pid: Pid, timeout_ms: u32) Error!Event,
+    /// Like `wait_event`, and also ends, with `.output`, as soon as one of `watch` can be read
+    /// (bytes, or the end of the stream). A signal that has arrived is delivered before output.
+    wait_event_watching: *const fn (
+        context: *anyopaque,
+        pid: Pid,
+        timeout_ms: u32,
+        watch: []const Handle,
+    ) Error!Event,
+    /// This process's id.
+    own_pid: *const fn (context: *anyopaque) Pid,
+    /// The current working directory, as an absolute path, written into `buffer`.
+    working_directory: *const fn (context: *anyopaque, buffer: []u8) Error![]const u8,
+    /// Sleeps at least `ms` milliseconds (the library's polls and graces use it).
+    sleep_ms: *const fn (context: *anyopaque, ms: u32) void,
+    /// A clock that only goes forward, in milliseconds, for measuring waits.
+    monotonic_ms: *const fn (context: *anyopaque) u64,
+    /// Forks a supervisor: a new process, detached from the terminal and the caller's session,
+    /// with its standard streams on /dev/null, that goes on with the same memory. The caller
+    /// must be single-threaded. The real host's supervisor ends with `exit_now`.
+    fork_supervisor: *const fn (context: *anyopaque) Error!Role,
+    /// Waits for the first of `pids` (children of this process) to end, by pidfd, and reaps it.
+    /// Null when `timeout_ms` (above zero) passed first.
+    wait_any: *const fn (context: *anyopaque, pids: []const Pid, timeout_ms: u32) Error!?Reaped,
+    /// Ends the process now with `code`. The real host does not return; the simulator does, so
+    /// that a test can look at what the supervisor left behind.
+    exit_now: *const fn (context: *anyopaque, code: u8) void,
+    signal_state: *const fn (context: *anyopaque, pid: Pid) Error!SignalState,
+    /// Seconds since the epoch.
+    time_now: *const fn (context: *anyopaque) u64,
+    /// Creates the file with `mode` or empties it, and writes all of `bytes`.
+    write_file: *const fn (
+        context: *anyopaque,
+        path: [:0]const u8,
+        bytes: []const u8,
+        mode: u16,
+    ) Error!void,
+    rename: *const fn (context: *anyopaque, from: [:0]const u8, to: [:0]const u8) Error!void,
+    remove_file: *const fn (context: *anyopaque, path: [:0]const u8) Error!void,
+    list_directory: *const fn (
+        context: *anyopaque,
+        path: [:0]const u8,
+        listing: *DirListing,
+    ) Error!void,
+    /// Makes a write to a pipe with no reader fail with `EPIPE` instead of killing the process.
+    ignore_broken_pipe: *const fn (context: *anyopaque, ignore: bool) void,
+    /// With `catch_it`, SIGINT and SIGTERM stop ending the process and record the signal that
+    /// `interrupt_signal` reads, and a blocked wait returns `Interrupted` (no restart); without,
+    /// they act as they did before (an inherited ignore is kept throughout). A command that
+    /// holds state to release (a build's roots) polls it. A signal can arrive at any moment,
+    /// the moment after catching starts included.
+    catch_interrupts: *const fn (context: *anyopaque, catch_it: bool) void,
+    /// The first SIGINT or SIGTERM that arrived since `catch_interrupts(true)`, 0 for none.
+    interrupt_signal: *const fn (context: *anyopaque) u8,
+    /// Connects a stream socket to the unix socket at `path` (the user's D-Bus socket). The
+    /// handle is close-on-exec and is read and written like a pipe's.
+    socket_connect: *const fn (context: *anyopaque, path: [:0]const u8) Error!Handle,
+    /// Like `read`, but waits at most `timeout_ms` for the first byte: `TimedOut` if none came.
+    read_timeout: *const fn (
+        context: *anyopaque,
+        handle: Handle,
+        buffer: []u8,
+        timeout_ms: u32,
+    ) Error!u32,
+    begin_step: *const fn (context: *anyopaque, index: u32) void,
+    /// Opens `/proc/<pid>/ns/<kind>`, close-on-exec. Null when the process is in this process's
+    /// own namespace of that kind (a container that shares the host's network): there is
+    /// nothing to join, and joining it would need a privilege the user lacks.
+    open_namespace: *const fn (context: *anyopaque, pid: Pid, kind: NamespaceKind) Error!?Handle,
+    /// `setns` into the namespace `handle` names; only in a single-threaded child.
+    join_namespace: *const fn (context: *anyopaque, handle: Handle, kind: NamespaceKind) Error!void,
+    /// A new pseudo-terminal of the devpts whose `ptmx` is at `ptmx` (opened, unlocked, and its
+    /// peer opened by `TIOCGPTPEER`).
+    open_terminal: *const fn (context: *anyopaque, ptmx: [:0]const u8) Error!Terminal,
+    /// Gives `master` the window size of this process's terminal (`TIOCGWINSZ` on standard
+    /// input, `TIOCSWINSZ` on `master`). A size that cannot be read leaves `master` as it is.
+    copy_window_size: *const fn (context: *anyopaque, master: Handle) Error!void,
+    /// With `raw`, saves the settings of the terminal on standard input into `saved` and makes
+    /// it raw (no echo, no line editing, no signals from keys: the bytes go to the container's
+    /// terminal, which does all that). Without, puts `saved` back.
+    input_raw: *const fn (context: *anyopaque, raw: bool, saved: *TerminalSaved) Error!void,
+    /// In a child: a session of its own, whose controlling terminal is `peer`, which becomes its
+    /// standard input, output and error.
+    attach_terminal: *const fn (context: *anyopaque, peer: Handle) Error!void,
+    /// The handle of this process's standard input, for `wait_event_watching` and `read_some`.
+    standard_input: *const fn (context: *anyopaque) Handle,
+    /// Whether standard input is a terminal (`exec` gives its command one when standard input
+    /// and output both are).
+    input_is_terminal: *const fn (context: *anyopaque) bool,
+    /// The file-system half of the host, which the store is written against (`store/fs.zig`).
+    /// The simulator's, when a test gives it none, is a machine that is down: every call fails.
+    filesystem: *const fn (context: *anyopaque) store_fs.Fs,
+    /// The network half of the host, which the registry client is written against
+    /// (`registry/net.zig`). The simulator's, when a test gives it none, is a machine with no
+    /// network: every request fails to connect.
+    network: *const fn (context: *anyopaque) registry_net.Net,
+    /// The file system the container logs are kept on (`runtime/logfile.zig`). The real host's is
+    /// `filesystem`; the simulator's is a disk of the test's own, or one that takes writes and
+    /// keeps nothing, so a test that does not look at logs needs none.
+    log_files: *const fn (context: *anyopaque) store_fs.Fs,
+};
+
+/// What `read_prefix` found.
+pub const Prefix = struct {
+    bytes: []u8,
+    truncated: bool,
+};
+
+/// A variable of the process environment.
+pub const EnvironmentEntry = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const Host = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    /// Reads the whole file into `buffer` and returns the filled prefix. A file longer than
+    /// `buffer` is `FileTooLarge`; it is never silently truncated, because a truncated
+    /// /proc or /etc file could turn a failing check into a passing one.
+    pub fn read_file(host: Host, path: []const u8, buffer: []u8) Error![]u8 {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.file_bytes_max);
+        return host.read_whole(path, buffer);
+    }
+
+    /// Reads a whole run record, as `read_file` does, into a buffer of up to
+    /// `record_file_bytes_max` (M2b): a record with every knob set is larger than any other file
+    /// the host reads, and only records get the larger buffer.
+    pub fn read_record(host: Host, path: []const u8, buffer: []u8) Error![]u8 {
+        assert(buffer.len > constants.file_bytes_max);
+        assert(buffer.len <= constants.record_file_bytes_max);
+        return host.read_whole(path, buffer);
+    }
+
+    fn read_whole(host: Host, path: []const u8, buffer: []u8) Error![]u8 {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.record_file_bytes_max);
+        var path_z: PathZ = undefined;
+        const path_sentinel = try path_z.init(path);
+
+        const handle = try host.open_retrying(path_sentinel);
+        defer host.vtable.close(host.context, handle);
+
+        const length = try host.read_all(handle, buffer);
+        assert(length <= buffer.len);
+        return buffer[0..length];
+    }
+
+    /// The first `buffer.len` bytes of the file, and whether there was more. For a bundle, which
+    /// keeps what fits and says it cut the rest; never for a check, which must see the whole file.
+    pub fn read_prefix(host: Host, path: []const u8, buffer: []u8) Error!Prefix {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.file_bytes_max);
+        var path_z: PathZ = undefined;
+        const path_sentinel = try path_z.init(path);
+        const handle = try host.open_retrying(path_sentinel);
+        defer host.vtable.close(host.context, handle);
+        var truncated = false;
+        const length = host.read_all(handle, buffer) catch |err| switch (err) {
+            error.FileTooLarge => blk: {
+                truncated = true;
+                break :blk buffer.len;
+            },
+            else => return err,
+        };
+        assert(length <= buffer.len);
+        return .{ .bytes = buffer[0..length], .truncated = truncated };
+    }
+
+    pub fn write_all(host: Host, stream: Stream, bytes: []const u8) Error!void {
+        assert(bytes.len <= constants.output_bytes_max);
+        var written: u32 = 0;
+        var retries: u32 = 0;
+        var calls: u32 = 0;
+        // Interrupted calls do not count toward `calls` but are bounded by `retries`, which
+        // only a non-interrupted call resets, so the loop terminates.
+        while (calls < constants.write_calls_max) {
+            if (written == bytes.len) return;
+            assert(written < bytes.len);
+            const result = host.vtable.write(host.context, stream, bytes[written..]);
+            const count = result catch |err| switch (err) {
+                error.Interrupted => {
+                    retries += 1;
+                    if (retries > constants.eintr_retries_max) return error.IoFailed;
+                    continue;
+                },
+                else => return err,
+            };
+            retries = 0;
+            calls += 1;
+            assert(count <= bytes.len - written);
+            written += count;
+        }
+        // Each non-EINTR call that returned 0 made no progress; bounded loops end here.
+        return error.Stalled;
+    }
+
+    pub fn uname(host: Host) Error!Uname {
+        const result = try host.vtable.uname(host.context);
+        assert(result.release.len < constants.uname_field_bytes);
+        assert(result.machine.len < constants.uname_field_bytes);
+        return result;
+    }
+
+    pub fn stat(host: Host, path: []const u8) Error!Stat {
+        var path_z: PathZ = undefined;
+        const path_sentinel = try path_z.init(path);
+        assert(path_sentinel.len == path.len);
+        const result = try host.vtable.stat(host.context, path_sentinel);
+        assert(result.mode <= std.math.maxInt(u16)); // st_mode is 16 bits in the kernel ABI.
+        return result;
+    }
+
+    /// Returns the filled prefix of `buffer`.
+    pub fn read_capability(host: Host, path: []const u8, buffer: []u8) Error![]u8 {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.capability_bytes_max);
+        var path_z: PathZ = undefined;
+        const path_sentinel = try path_z.init(path);
+        const length = try host.vtable.read_capability(host.context, path_sentinel, buffer);
+        assert(length <= buffer.len);
+        return buffer[0..length];
+    }
+
+    pub fn seccomp_mode(host: Host) Error!u32 {
+        const mode = try host.vtable.seccomp_mode(host.context);
+        assert(mode <= 2); // The kernel's modes: disabled, strict, filter.
+        return mode;
+    }
+
+    pub fn is_terminal(host: Host, stream: Stream) bool {
+        return host.vtable.is_terminal(host.context, stream);
+    }
+
+    /// Colour only when the stream is a terminal and NO_COLOR is unset. Output must read
+    /// correctly without colour, so this is never required for meaning.
+    pub fn color_enabled(host: Host, stream: Stream) bool {
+        if (!host.is_terminal(stream)) return false;
+        return !host.vtable.no_color(host.context);
+    }
+
+    pub fn uid(host: Host) u32 {
+        const id = host.vtable.uid(host.context);
+        assert(id != std.math.maxInt(u32)); // (uid_t)-1 means "no change", never a real id.
+        return id;
+    }
+
+    /// The errno of the most recent failed host call, or 0 if the last call succeeded. Meaningful
+    /// right after a call that returned an error that came from the kernel; errors made inside
+    /// this file (`Stalled`, `InvalidPath`, ...) have no errno and callers must not ask.
+    pub fn last_errno(host: Host) u16 {
+        const errno = host.vtable.last_errno(host.context);
+        assert(errno < 4096); // The kernel's errno range.
+        return errno;
+    }
+
+    pub fn probe(host: Host, kind: ProbeKind) Error!ProbeOutcome {
+        assert(kind != .idmap); // It needs a path: `probe_idmap`.
+        return host.vtable.probe(host.context, kind);
+    }
+
+    pub fn probe_idmap(host: Host, path: [:0]const u8) Error!ProbeOutcome {
+        assert(path.len > 0);
+        assert(path[0] == '/');
+        return host.vtable.probe_idmap(host.context, path);
+    }
+
+    // ---- Containers ----
+
+    /// Creates a pipe whose ends are both close-on-exec.
+    pub fn pipe(host: Host) Error!Pipe {
+        const result = try host.vtable.pipe(host.context);
+        assert(result.read != result.write);
+        assert(host.vtable.last_errno(host.context) == 0); // A success leaves no errno behind.
+        return result;
+    }
+
+    /// Reads at least one byte, or returns 0 at end of file, retrying interrupted calls.
+    pub fn read_some(host: Host, handle: Handle, buffer: []u8) Error!u32 {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.file_bytes_max);
+        for (0..constants.eintr_retries_max + 1) |_| {
+            const count = host.vtable.read(host.context, handle, buffer) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return err,
+            };
+            assert(count <= buffer.len);
+            return count;
+        }
+        return error.IoFailed;
+    }
+
+    /// Connects to the unix socket at `path`. A path longer than a socket address holds is
+    /// `PathTooLong`.
+    pub fn socket_connect(host: Host, path: []const u8) Error!Handle {
+        if (path.len == 0) return error.InvalidPath;
+        if (path.len > constants.dbus_socket_path_bytes_max) return error.PathTooLong;
+        if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+        var storage: [constants.dbus_socket_path_bytes_max + 1]u8 = undefined;
+        @memcpy(storage[0..path.len], path);
+        storage[path.len] = 0;
+        const path_z: [:0]const u8 = storage[0..path.len :0];
+        const handle = try host.vtable.socket_connect(host.context, path_z);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return handle;
+    }
+
+    /// Waits up to `timeout_ms` for bytes, then reads at least one, or returns 0 at end of file.
+    /// Interrupted waits are retried, so the wait can be a little longer than asked.
+    pub fn read_timeout(host: Host, handle: Handle, buffer: []u8, timeout_ms: u32) Error!u32 {
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.file_bytes_max);
+        comptime assert(constants.pasta_ready_timeout_ms <= constants.dbus_job_timeout_ms);
+        assert(timeout_ms <= constants.dbus_job_timeout_ms);
+        for (0..constants.eintr_retries_max + 1) |_| {
+            const count = host.vtable.read_timeout(
+                host.context,
+                handle,
+                buffer,
+                timeout_ms,
+            ) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return err,
+            };
+            assert(count <= buffer.len);
+            return count;
+        }
+        return error.IoFailed;
+    }
+
+    /// Writes every byte to a pipe, like `write_all` does for the standard streams.
+    pub fn write_handle_all(host: Host, handle: Handle, bytes: []const u8) Error!void {
+        assert(bytes.len > 0);
+        assert(bytes.len <= constants.output_bytes_max);
+        var written: u32 = 0;
+        var retries: u32 = 0;
+        var calls: u32 = 0;
+        // Bounded like `write_all`: interrupted calls by `retries`, the rest by `calls`.
+        while (calls < constants.write_calls_max) {
+            if (written == bytes.len) return;
+            const result = host.vtable.write_handle(host.context, handle, bytes[written..]);
+            const count = result catch |err| switch (err) {
+                error.Interrupted => {
+                    retries += 1;
+                    if (retries > constants.eintr_retries_max) return error.IoFailed;
+                    continue;
+                },
+                else => return err,
+            };
+            retries = 0;
+            calls += 1;
+            assert(count <= bytes.len - written);
+            written += count;
+        }
+        return error.Stalled;
+    }
+
+    pub fn close(host: Host, handle: Handle) void {
+        assert(handle < std.math.maxInt(i32));
+        assert(@intFromPtr(host.vtable) != 0);
+        host.vtable.close(host.context, handle);
+    }
+
+    pub fn spawn(
+        host: Host,
+        flags: SpawnFlags,
+        entry: ChildEntry,
+        entry_context: *anyopaque,
+    ) Error!Pid {
+        assert(flags.user); // Every other namespace is created owned by a new user namespace.
+        const pid = try host.vtable.spawn(host.context, flags, entry, entry_context);
+        assert(pid > 0);
+        return pid;
+    }
+
+    /// Forks the keeper of a container's cgroup scope: a process outside every namespace of the
+    /// container whose only job is to be in the scope, so that the scope is never empty (and the
+    /// manager never removes it) while zbx has still to read its counters. It blocks reading the
+    /// pipe end `hold`, and ends when the pipe's writers are all gone, when a read fails, or when
+    /// the process that started it ends (the kernel kills it then, `PR_SET_PDEATHSIG`). It closes
+    /// every descriptor it inherited but `hold`, so that it keeps no pipe, socket or terminal
+    /// open on behalf of zbx. The caller closes its own copy of `hold`, keeps the write end, and
+    /// ends the keeper by closing that, then reaps it with `wait_for`.
+    ///
+    /// The kernel sends the death signal when the *thread* that forked ends, not the process:
+    /// the thread that starts a run must be the one that waits for it, as `run.zig` requires.
+    pub fn start_keeper(host: Host, hold: Handle) Error!Pid {
+        assert(hold < std.math.maxInt(i32));
+        const pid = try host.vtable.start_keeper(host.context, hold);
+        assert(pid > 1);
+        return pid;
+    }
+
+    /// Starts `request` as a child of this process that goes on running: pasta. It has a session
+    /// of its own (a terminal's ^C or hang-up is not for it), the kernel kills it when this
+    /// thread dies (`PR_SET_PDEATHSIG`, so a SIGKILL of zbx releases what it holds), its stdin
+    /// is /dev/null, its stdout is `stdout` (a pipe's write end, which the caller then closes)
+    /// and its stderr is the file `log`, created or emptied with mode 0600, or /dev/null when
+    /// `log` is empty or cannot be made. The caller waits for it (`wait_for`) and is the one who
+    /// ends it.
+    pub fn start_program(
+        host: Host,
+        request: ExecRequest,
+        stdout: Handle,
+        log: [:0]const u8,
+    ) Error!Pid {
+        assert(request.path.len > 0);
+        assert(request.path[0] == '/');
+        assert(request.argv[0] != null);
+        if (log.len > 0) assert(log[0] == '/');
+        const pid = try host.vtable.start_program(host.context, request, stdout, log);
+        assert(pid > 1);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return pid;
+    }
+
+    /// Waits for the child to end, retrying interrupted waits. Returns once, with its status.
+    pub fn wait_for(host: Host, pid: Pid) Error!ExitStatus {
+        assert(pid > 0);
+        for (0..constants.wait_interrupts_max + 1) |_| {
+            const status = host.vtable.wait(host.context, pid) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return err,
+            };
+            switch (status) {
+                .exited => {},
+                .signaled => |number| assert(number > 0),
+            }
+            return status;
+        }
+        return error.IoFailed;
+    }
+
+    /// Sends a signal. Number 0 sends nothing and asks whether the process exists (and may be
+    /// signalled by this user): an error `NotFound` says it does not.
+    pub fn signal(host: Host, pid: Pid, number: u8) Error!void {
+        assert(pid > 0);
+        assert(number < constants.signal_number_max);
+        try host.vtable.signal(host.context, pid, number);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn write_id_map(host: Host, pid: Pid, kind: IdMapKind, bytes: []const u8) Error!void {
+        assert(pid > 0);
+        assert(bytes.len > 0);
+        assert(bytes.len <= constants.id_map_line_bytes_max);
+        if (kind == .setgroups) assert(std.mem.eql(u8, bytes, "deny")); // Never "allow".
+        try host.vtable.write_id_map(host.context, pid, kind, bytes);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn mount(host: Host, request: MountRequest) Error!void {
+        assert(request.target.len > 0);
+        assert(request.target[request.target.len] == 0);
+        switch (request.kind) {
+            .bind_tree, .bind_file, .overlay, .move, .user_tmpfs, .shm_tmpfs => {
+                assert(request.source != null);
+            },
+            else => assert(request.source == null),
+        }
+        try host.vtable.mount(host.context, request);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn unmount_detach(host: Host, path: [:0]const u8) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        try host.vtable.unmount_detach(host.context, path);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn pivot_root(host: Host, new_root: [:0]const u8, put_old: [:0]const u8) Error!void {
+        assert(new_root.len > 0);
+        assert(put_old.len > 0);
+        assert(new_root[new_root.len] == 0);
+        assert(put_old[put_old.len] == 0);
+        try host.vtable.pivot_root(host.context, new_root, put_old);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn change_directory(host: Host, path: [:0]const u8) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        try host.vtable.change_directory(host.context, path);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    /// Makes a directory. With `exist_ok`, a directory (or anything) that is already there is
+    /// success, and a later use of it reports whatever is wrong with it.
+    pub fn make_directory(host: Host, path: [:0]const u8, exist_ok: bool) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        try host.vtable.make_directory(host.context, path, exist_ok);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn remove_directory(host: Host, path: [:0]const u8) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        try host.vtable.remove_directory(host.context, path);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    /// Creates an empty file. It fails if the file exists, unless `exist_ok`: a mount point on a
+    /// fresh tmpfs is new, one in an image's tree may be there already (and is left as it is).
+    pub fn create_file(host: Host, path: [:0]const u8, exist_ok: bool) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        try host.vtable.create_file(host.context, path, exist_ok);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    /// Creates the channel a listener is handed over (`channel` in the vtable).
+    pub fn channel(host: Host) Error!Pipe {
+        const result = try host.vtable.channel(host.context);
+        assert(result.read != result.write);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return result;
+    }
+
+    /// Makes a TCP listener on the loopback of this process's network namespace.
+    pub fn listen_loopback(host: Host, port: u16) Error!Handle {
+        assert(port > 0);
+        const result = try host.vtable.listen_loopback(host.context, port);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return result;
+    }
+
+    /// Mounts a FUSE connection on `target` (`mount_fuse` in the vtable).
+    pub fn mount_fuse(host: Host, target: [:0]const u8) Error!Handle {
+        assert(target.len > 0);
+        assert(target[target.len] == 0);
+        const result = try host.vtable.mount_fuse(host.context, target);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return result;
+    }
+
+    /// Makes an unconnected IPv4 TCP socket in this process's network namespace.
+    pub fn tcp4_socket(host: Host) Error!Handle {
+        assert(@intFromPtr(host.vtable) != 0);
+        const result = try host.vtable.tcp4_socket(host.context);
+        assert(result < std.math.maxInt(i32));
+        assert(host.vtable.last_errno(host.context) == 0);
+        return result;
+    }
+
+    pub fn send_handle(host: Host, channel_end: Handle, handle: Handle) Error!void {
+        assert(channel_end != handle);
+        try host.vtable.send_handle(host.context, channel_end, handle);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn is_unix_stream(host: Host, handle: Handle) bool {
+        return host.vtable.is_unix_stream(host.context, handle);
+    }
+
+    pub fn receive_handle(host: Host, channel_end: Handle) Error!Handle {
+        const result = try host.vtable.receive_handle(host.context, channel_end);
+        assert(result != channel_end);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return result;
+    }
+
+    /// Brings `lo` up in this process's network namespace.
+    pub fn bring_up_loopback(host: Host) Error!void {
+        assert(@intFromPtr(host.vtable) != 0);
+        try host.vtable.bring_up_loopback(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn symlink(host: Host, target: [:0]const u8, link: [:0]const u8) Error!void {
+        assert(target.len > 0);
+        assert(link.len > 0);
+        assert(link[link.len] == 0);
+        try host.vtable.symlink(host.context, target, link);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn set_hostname(host: Host, name: []const u8) Error!void {
+        assert(name.len > 0);
+        assert(name.len <= constants.container_name_bytes_max);
+        try host.vtable.set_hostname(host.context, name);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn set_umask(host: Host, mask: u16) void {
+        assert(mask <= 0o777);
+        host.vtable.set_umask(host.context, mask);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn seal_descriptors(host: Host) Error!void {
+        assert(@intFromPtr(host.vtable) != 0);
+        try host.vtable.seal_descriptors(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn ensure_pipe_capacity(host: Host, handle: Handle, bytes_min: u32) Error!void {
+        assert(bytes_min > 0);
+        assert(bytes_min <= constants.pipe_capacity_bytes_max);
+        return host.vtable.pipe_capacity(host.context, handle, bytes_min);
+    }
+
+    pub fn pipe_has_reader(host: Host, handle: Handle) bool {
+        assert(handle < std.math.maxInt(i32));
+        assert(@intFromPtr(host.vtable) != 0);
+        return host.vtable.pipe_has_reader(host.context, handle);
+    }
+
+    pub fn die_with_parent(host: Host) Error!void {
+        assert(@intFromPtr(host.vtable) != 0);
+        try host.vtable.die_with_parent(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn restrict_capabilities(host: Host, keep: u64) Error!void {
+        assert(keep != 0); // A container keeps something, and the mask is never empty by policy.
+        try host.vtable.restrict_capabilities(host.context, keep);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn clear_ambient(host: Host) Error!void {
+        assert(@intFromPtr(host.vtable) != 0);
+        assert(@intFromPtr(host.context) != 0);
+        try host.vtable.clear_ambient(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn set_user(host: Host, user_id: u32, group_id: u32, keep_groups: bool) Error!void {
+        assert(user_id != std.math.maxInt(u32)); // (uid_t)-1 means "no change", never a real id.
+        assert(group_id != std.math.maxInt(u32));
+        try host.vtable.set_user(host.context, user_id, group_id, keep_groups);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn device_node(host: Host, path: []const u8) Error!DeviceNode {
+        var path_z: PathZ = undefined;
+        const path_sentinel = try path_z.init(path);
+        assert(path_sentinel.len == path.len);
+        const result = try host.vtable.device_node(host.context, path_sentinel);
+        assert(result.mode <= std.math.maxInt(u16));
+        return result;
+    }
+
+    pub fn no_new_privs(host: Host) Error!void {
+        assert(@intFromPtr(host.vtable) != 0);
+        assert(@intFromPtr(host.context) != 0);
+        try host.vtable.no_new_privs(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn get_rlimit(host: Host, resource: knobs.Resource) Error!knobs.Rlimit {
+        const result = try host.vtable.get_rlimit(host.context, resource);
+        assert(result.soft <= result.hard); // The kernel never holds a soft limit above the hard.
+        assert(host.vtable.last_errno(host.context) == 0);
+        return result;
+    }
+
+    pub fn set_rlimit(host: Host, resource: knobs.Resource, limit: knobs.Rlimit) Error!void {
+        assert(limit.soft <= limit.hard);
+        try host.vtable.set_rlimit(host.context, resource, limit);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn write_sysctl(host: Host, path: [:0]const u8, value: []const u8) Error!void {
+        assert(std.mem.startsWith(u8, path, knobs.proc_path_prefix));
+        assert(path.len <= knobs.proc_path_bytes_max);
+        assert(value.len > 0);
+        assert(value.len <= constants.sysctl_value_bytes_max);
+        try host.vtable.write_sysctl(host.context, path, value);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn unshare_cgroup(host: Host) Error!void {
+        assert(@intFromPtr(host.vtable) != 0);
+        assert(@intFromPtr(host.context) != 0);
+        try host.vtable.unshare_cgroup(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn install_seccomp(host: Host, program: []const bpf.Insn) Error!void {
+        assert(program.len > 0);
+        assert(program.len <= bpf.insns_max);
+        try host.vtable.install_seccomp(host.context, program);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn exec(host: Host, request: ExecRequest) Error!void {
+        assert(request.path.len > 0);
+        assert(request.path[request.path.len] == 0);
+        assert(request.argv[0] != null);
+        try host.vtable.exec(host.context, request);
+        // Only the simulator gets here: a real exec that succeeds does not return.
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn gid(host: Host) u32 {
+        const id = host.vtable.gid(host.context);
+        assert(id != std.math.maxInt(u32)); // (gid_t)-1 means "no change", never a real id.
+        return id;
+    }
+
+    /// The value of an environment variable, or null if unset or longer than `limit_bytes`.
+    pub fn environment(host: Host, name: []const u8, limit_bytes: u32) ?[]const u8 {
+        assert(name.len > 0);
+        assert(limit_bytes > 0);
+        const value = host.vtable.environment(host.context, name) orelse return null;
+        if (value.len > limit_bytes) return null;
+        return value;
+    }
+
+    /// The `index`th environment variable, or null past the end. Asserts a bounded walk.
+    pub fn environment_at(host: Host, index: u32) ?EnvironmentEntry {
+        assert(index <= constants.environment_entries_max);
+        const entry = host.vtable.environment_at(host.context, index) orelse return null;
+        assert(entry.name.len > 0);
+        return entry;
+    }
+
+    pub fn random_bytes(host: Host, buffer: []u8) Error!void {
+        assert(buffer.len > 0);
+        assert(buffer.len <= 256); // getrandom never returns short up to 256 bytes.
+        try host.vtable.random_bytes(host.context, buffer);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn run_helper(host: Host, request: ExecRequest, output: []u8) Error!HelperResult {
+        assert(request.path.len > 0);
+        assert(request.argv[0] != null);
+        assert(output.len > 0);
+        assert(output.len <= constants.helper_output_bytes_max);
+        const result = try host.vtable.run_helper(host.context, request, output);
+        assert(result.output_len <= output.len);
+        return result;
+    }
+
+    pub fn block_signals(host: Host, block: bool) Error!void {
+        try host.vtable.block_signals(host.context, block);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    /// Waits for the child or a forwarded signal, retrying interrupted waits.
+    pub fn wait_event(host: Host, pid: Pid, timeout_ms: u32) Error!Event {
+        assert(pid > 0);
+        assert(timeout_ms <= constants.wait_timeout_ms_max);
+        for (0..constants.wait_interrupts_max + 1) |_| {
+            const waited = host.vtable.wait_event(host.context, pid, timeout_ms);
+            const event = waited catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return err,
+            };
+            switch (event) {
+                .exited, .timeout => {},
+                .signal => |number| assert(number > 0),
+                .output => unreachable, // Nothing was watched.
+            }
+            return event;
+        }
+        return error.IoFailed;
+    }
+
+    /// `wait_event` that also returns `.output` when a handle of `watch` is ready.
+    pub fn wait_event_watching(
+        host: Host,
+        pid: Pid,
+        timeout_ms: u32,
+        watch: []const Handle,
+    ) Error!Event {
+        assert(pid > 0);
+        assert(timeout_ms <= constants.wait_timeout_ms_max);
+        assert(watch.len > 0);
+        assert(watch.len <= 32);
+        for (0..constants.wait_interrupts_max + 1) |_| {
+            const waited = host.vtable.wait_event_watching(host.context, pid, timeout_ms, watch);
+            const event = waited catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return err,
+            };
+            switch (event) {
+                .exited, .timeout => {},
+                .signal => |number| assert(number > 0),
+                .output => |mask| assert(mask != 0),
+            }
+            return event;
+        }
+        return error.IoFailed;
+    }
+
+    /// The file system of the container logs.
+    pub fn log_files(host: Host) store_fs.Fs {
+        const fs = host.vtable.log_files(host.context);
+        assert(@intFromPtr(fs.vtable) != 0);
+        return fs;
+    }
+
+    pub fn signal_state(host: Host, pid: Pid) Error!SignalState {
+        assert(pid > 0);
+        const state = try host.vtable.signal_state(host.context, pid);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return state;
+    }
+
+    pub fn own_pid(host: Host) Pid {
+        const pid = host.vtable.own_pid(host.context);
+        assert(pid > 0);
+        return pid;
+    }
+
+    /// The current working directory (absolute, no trailing slash except for the root).
+    pub fn working_directory(host: Host, buffer: []u8) Error![]const u8 {
+        assert(buffer.len > 1);
+        const path = try host.vtable.working_directory(host.context, buffer);
+        assert(path.len > 0);
+        assert(path[0] == '/');
+        return path;
+    }
+
+    pub fn sleep_ms(host: Host, ms: u32) void {
+        assert(ms > 0);
+        assert(ms <= constants.sleep_ms_max);
+        host.vtable.sleep_ms(host.context, ms);
+    }
+
+    pub fn monotonic_ms(host: Host) u64 {
+        const now = host.vtable.monotonic_ms(host.context);
+        assert(now < 1 << 50);
+        return now;
+    }
+
+    pub fn fork_supervisor(host: Host) Error!Role {
+        const role = try host.vtable.fork_supervisor(host.context);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return role;
+    }
+
+    /// The first of `pids` to end, reaped; null on timeout. `pids` holds at most 32.
+    pub fn wait_any(host: Host, pids: []const Pid, timeout_ms: u32) Error!?Reaped {
+        assert(pids.len > 0);
+        assert(pids.len <= 32);
+        assert(timeout_ms <= constants.wait_timeout_ms_max);
+        for (0..constants.wait_interrupts_max + 1) |_| {
+            const waited = host.vtable.wait_any(host.context, pids, timeout_ms);
+            const reaped = waited catch |err| switch (err) {
+                // A SIGINT or SIGTERM the caller asked to catch is its to see, not to retry.
+                error.Interrupted => if (host.vtable.interrupt_signal(host.context) != 0) {
+                    return err;
+                } else continue,
+                else => return err,
+            };
+            if (reaped) |found| assert(found.index < pids.len);
+            return reaped;
+        }
+        return error.IoFailed;
+    }
+
+    pub fn exit_now(host: Host, code: u8) void {
+        host.vtable.exit_now(host.context, code);
+    }
+
+    pub fn time_now(host: Host) u64 {
+        const seconds = host.vtable.time_now(host.context);
+        assert(seconds < 1 << 40); // Until the year 36812.
+        return seconds;
+    }
+
+    pub fn write_file(host: Host, path: [:0]const u8, bytes: []const u8) Error!void {
+        try host.write_file_mode(path, bytes, 0o600);
+    }
+
+    /// Like `write_file`, with the file's mode: a file the container's other users read
+    /// (`/etc/hosts`) is 0644, the records' 0600 would shut them out.
+    pub fn write_file_mode(
+        host: Host,
+        path: [:0]const u8,
+        bytes: []const u8,
+        mode: u16,
+    ) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        assert(bytes.len <= constants.write_bytes_max);
+        assert(mode <= 0o777);
+        try host.vtable.write_file(host.context, path, bytes, mode);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn rename(host: Host, from: [:0]const u8, to: [:0]const u8) Error!void {
+        assert(from.len > 0);
+        assert(to.len > 0);
+        assert(!std.mem.eql(u8, from, to));
+        try host.vtable.rename(host.context, from, to);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn remove_file(host: Host, path: [:0]const u8) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        try host.vtable.remove_file(host.context, path);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn list_directory(host: Host, path: [:0]const u8, listing: *DirListing) Error!void {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        listing.reset();
+        try host.vtable.list_directory(host.context, path, listing);
+        assert(listing.len <= listing.bytes.len);
+        assert(listing.count <= constants.dir_entries_max);
+    }
+
+    /// The parent writes one byte to a pipe whose reader may already be gone; that must be an
+    /// error it can report, not a signal that ends it. Set after `spawn`, so a child (which
+    /// inherits dispositions) never starts with the signal ignored.
+    pub fn ignore_broken_pipe(host: Host, ignore: bool) void {
+        assert(@intFromPtr(host.vtable) != 0);
+        host.vtable.ignore_broken_pipe(host.context, ignore);
+        assert(host.vtable.last_errno(host.context) < 4096);
+    }
+
+    pub fn catch_interrupts(host: Host, catch_it: bool) void {
+        assert(@intFromPtr(host.vtable) != 0);
+        // No assertion on the signal here: one may land the instant the handler is in place,
+        // and that is an outside event, not a fault of the program.
+        host.vtable.catch_interrupts(host.context, catch_it);
+        assert(host.vtable.last_errno(host.context) < 4096);
+    }
+
+    /// Whether a SIGINT or SIGTERM arrived since `catch_interrupts(true)`.
+    pub fn interrupt_pending(host: Host) bool {
+        return host.interrupt_signal() != 0;
+    }
+
+    /// The signal that arrived first since `catch_interrupts(true)`: 0 for none, else SIGINT's
+    /// or SIGTERM's number.
+    pub fn interrupt_signal(host: Host) u8 {
+        assert(@intFromPtr(host.vtable) != 0);
+        assert(@intFromPtr(host.context) != 0);
+        const number = host.vtable.interrupt_signal(host.context);
+        assert(interrupt_known(number));
+        return number;
+    }
+
+    /// Forks a child with no namespace of its own, which runs `entry` (the exec joiner); with
+    /// `sibling`, the child's parent is this process's parent (`SpawnFlags.sibling`).
+    pub fn fork_child(
+        host: Host,
+        sibling: bool,
+        entry: ChildEntry,
+        entry_context: *anyopaque,
+    ) Error!Pid {
+        const flags: SpawnFlags = .{
+            .user = false,
+            .mount = false,
+            .pid = false,
+            .uts = false,
+            .ipc = false,
+            .net = false,
+            .sibling = sibling,
+        };
+        const pid = try host.vtable.spawn(host.context, flags, entry, entry_context);
+        assert(pid > 1);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return pid;
+    }
+
+    /// See `VTable.open_namespace`.
+    pub fn open_namespace(host: Host, pid: Pid, kind: NamespaceKind) Error!?Handle {
+        assert(pid > 1);
+        assert(kind.file_name().len > 0);
+        const handle = try host.vtable.open_namespace(host.context, pid, kind);
+        assert(host.vtable.last_errno(host.context) == 0);
+        if (handle) |opened| assert(opened < std.math.maxInt(i32));
+        return handle;
+    }
+
+    pub fn join_namespace(host: Host, handle: Handle, kind: NamespaceKind) Error!void {
+        assert(handle < std.math.maxInt(i32));
+        assert(kind.file_name().len > 0);
+        try host.vtable.join_namespace(host.context, handle, kind);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn open_terminal(host: Host, ptmx: [:0]const u8) Error!Terminal {
+        assert(ptmx.len > 0);
+        assert(ptmx[0] == '/');
+        const terminal = try host.vtable.open_terminal(host.context, ptmx);
+        assert(terminal.master != terminal.peer);
+        assert(host.vtable.last_errno(host.context) == 0);
+        return terminal;
+    }
+
+    pub fn copy_window_size(host: Host, master: Handle) Error!void {
+        assert(master < std.math.maxInt(i32));
+        try host.vtable.copy_window_size(host.context, master);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn input_raw(host: Host, raw: bool, saved: *TerminalSaved) Error!void {
+        if (!raw) assert(saved.valid); // Only settings that were saved are put back.
+        try host.vtable.input_raw(host.context, raw, saved);
+        if (raw) assert(saved.valid);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn attach_terminal(host: Host, peer: Handle) Error!void {
+        assert(peer < std.math.maxInt(i32));
+        try host.vtable.attach_terminal(host.context, peer);
+        assert(host.vtable.last_errno(host.context) == 0);
+    }
+
+    pub fn input_is_terminal(host: Host) bool {
+        assert(@intFromPtr(host.vtable) != 0);
+        return host.vtable.input_is_terminal(host.context);
+    }
+
+    pub fn standard_input(host: Host) Handle {
+        const handle = host.vtable.standard_input(host.context);
+        assert(handle < std.math.maxInt(i32));
+        return handle;
+    }
+
+    /// Tells the host which plan step the calls that follow belong to (`step_none` when none
+    /// does). The real host ignores it: the kernel needs no hint. The simulator uses it to fail
+    /// exactly the first call of a chosen step, which is how the run fuzzer walks one injected
+    /// failure across every step of a plan and checks that the diagnostic names that step.
+    pub fn begin_step(host: Host, index: u32) void {
+        if (index != step_none) assert(index < constants.plan_steps_max);
+        host.vtable.begin_step(host.context, index);
+        assert(host.vtable.last_errno(host.context) < 4096);
+    }
+
+    /// The file system the store works on. Calls on it are made by the single-threaded child
+    /// that runs inside the user namespace, so the ids it sees are the container's.
+    pub fn filesystem(host: Host) store_fs.Fs {
+        const fs = host.vtable.filesystem(host.context);
+        assert(@intFromPtr(fs.vtable) != 0);
+        return fs;
+    }
+
+    /// The network, for the registry client. Its calls block (with their own timeouts), so a
+    /// caller makes them from the parent process, never from the namespace child.
+    pub fn network(host: Host) registry_net.Net {
+        const net = host.vtable.network(host.context);
+        assert(@intFromPtr(net.vtable) != 0);
+        return net;
+    }
+
+    fn open_retrying(host: Host, path: [:0]const u8) Error!Handle {
+        assert(path.len > 0);
+        assert(path[path.len] == 0);
+        for (0..constants.eintr_retries_max + 1) |_| {
+            return host.vtable.open_read(host.context, path) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => return err,
+            };
+        }
+        return error.IoFailed;
+    }
+
+    fn read_all(host: Host, handle: Handle, buffer: []u8) Error!u32 {
+        assert(buffer.len > 0);
+        assert(handle < std.math.maxInt(i32)); // Descriptors are non-negative i32.
+        var filled: u32 = 0;
+        var retries: u32 = 0;
+        var calls: u32 = 0;
+        // See `write_all` for why interrupted calls are bounded separately from `calls`.
+        while (calls < constants.read_calls_max) {
+            // When the buffer is full, one more byte decides between "exactly full" and
+            // "too large". The probe byte is read into scratch and discarded.
+            var scratch: [1]u8 = undefined;
+            const full = filled == buffer.len;
+            const target: []u8 = if (full) scratch[0..] else buffer[filled..];
+            const result = host.vtable.read(host.context, handle, target);
+            const count = result catch |err| switch (err) {
+                error.Interrupted => {
+                    retries += 1;
+                    if (retries > constants.eintr_retries_max) return error.IoFailed;
+                    continue;
+                },
+                else => return err,
+            };
+            retries = 0;
+            calls += 1;
+            assert(count <= target.len);
+            if (count == 0) return filled;
+            if (full) return error.FileTooLarge;
+            filled += count;
+        }
+        return error.Stalled;
+    }
+};
+
+/// A NUL-terminated copy of a caller path, on the caller's stack, so the vtable can pass
+/// sentinel-terminated slices to syscalls without allocating.
+const PathZ = struct {
+    storage: [constants.path_bytes_max + 1]u8,
+
+    fn init(path_z: *PathZ, path: []const u8) Error![:0]const u8 {
+        if (path.len == 0) return error.InvalidPath;
+        if (path.len > constants.path_bytes_max) return error.PathTooLong;
+        // An embedded NUL would silently shorten the path the kernel sees.
+        if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+        @memcpy(path_z.storage[0..path.len], path);
+        path_z.storage[path.len] = 0;
+        const result: [:0]const u8 = path_z.storage[0..path.len :0];
+        assert(result.len == path.len);
+        assert(result[result.len] == 0);
+        return result;
+    }
+};
+
+const repeat = @import("test_util.zig").repeat;
+
+test "Text round-trips and bounds its length" {
+    // Goal: Text keeps exactly the bytes given, up to the field size minus the NUL.
+    const text = Text.from_slice("6.18.44");
+    try std.testing.expectEqualStrings("6.18.44", text.slice());
+    const empty = Text.from_slice("");
+    try std.testing.expectEqual(@as(usize, 0), empty.slice().len);
+    const longest = Text.from_slice(repeat('a', constants.uname_field_bytes - 1));
+    try std.testing.expectEqual(@as(usize, constants.uname_field_bytes - 1), longest.slice().len);
+}
+
+test "PathZ refuses empty, over-long and NUL-containing paths" {
+    // Goal: the boundary where a path becomes invalid is exact, and refusals are errors.
+    var path_z: PathZ = undefined;
+    try std.testing.expectError(error.InvalidPath, path_z.init(""));
+    try std.testing.expectError(error.InvalidPath, path_z.init("/proc/self\x00/status"));
+    const longest = repeat('/', constants.path_bytes_max);
+    const accepted = try path_z.init(longest);
+    try std.testing.expectEqual(@as(usize, constants.path_bytes_max), accepted.len);
+    const too_long = repeat('/', constants.path_bytes_max + 1);
+    try std.testing.expectError(error.PathTooLong, path_z.init(too_long));
+}
+
+/// Whether `number` is what `interrupt_signal` may return: none, SIGINT or SIGTERM.
+fn interrupt_known(number: u8) bool {
+    return switch (number) {
+        0, constants.signal_interrupt, constants.signal_term => true,
+        else => false,
+    };
+}

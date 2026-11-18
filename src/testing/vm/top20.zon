@@ -1,0 +1,47 @@
+// The images the weekly top-20 run pulls and runs (docs/demos/m4.md, "The top-20 check"). It is
+// the twenty most-pulled official images of Docker Hub, read on `date` from the Hub's API:
+//   https://hub.docker.com/v2/repositories/library/?page_size=25&ordering=pull_count
+// Refresh it by reading that list again and changing `date`; a changed list is a reviewed change.
+//
+// An `env` is a variable the image's entrypoint asks for, given with `-e NAME=VALUE` (M6): the
+// three databases refuse to start without a root password. An empty `env` is none.
+//
+// Each image runs its default command for 45 s (zbx run --timeout). A server that is still up
+// then has run, and where it has a `probe` it must also answer: "port|send|expect" publishes the
+// container's port on host port port+20000 (--publish, M5) and has the guest connect there on
+// 127.0.0.1, write `send` (printf escapes) and find `expect` in the reply (an
+// empty `expect` is a connection alone, an empty probe none). An image that exits 0 passes; a
+// server without a probe passes by staying up (a database or broker whose protocol needs a client
+// the guest lacks is judged by its connection). An entry with a `known` reason is an image that
+// cannot run its default command as a rootless, unconfigured container: the run records that
+// reason instead of a failure, and the harness still runs it, so a note that is no longer true
+// shows as a pass with a NOTE line.
+// openjdk is deprecated on the Hub: it has no `latest` tag, only early-access ones, so this is the
+// newest slim JDK tag; if the Hub drops it the run says so (E0508) and the entry is replaced.
+// An empty `known` means the image must pass. A failure without a reason fails the whole run.
+.{
+    .date = "2026-10-27",
+    .source = "Docker Hub official images, ordered by pull count",
+    .images = .{
+        .{ .ref = "nginx:latest", .known = "", .probe = "80|GET / HTTP/1.0\\r\\n\\r\\n|HTTP/", .env = "" },
+        .{ .ref = "memcached:latest", .known = "", .probe = "11211|version\\r\\n|VERSION", .env = "" },
+        .{ .ref = "busybox:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "alpine:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "postgres:latest", .known = "", .probe = "5432||", .env = "POSTGRES_PASSWORD=top20-pass" },
+        .{ .ref = "redis:latest", .known = "", .probe = "6379|PING\\r\\n|PONG", .env = "" },
+        .{ .ref = "ubuntu:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "python:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "node:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "mysql:latest", .known = "", .probe = "3306||", .env = "MYSQL_ROOT_PASSWORD=top20-pass" },
+        .{ .ref = "mongo:latest", .known = "", .probe = "27017||", .env = "" },
+        .{ .ref = "httpd:latest", .known = "", .probe = "80|GET / HTTP/1.0\\r\\n\\r\\n|HTTP/", .env = "" },
+        .{ .ref = "rabbitmq:latest", .known = "", .probe = "5672||", .env = "" },
+        .{ .ref = "docker:latest", .known = "its entrypoint starts dockerd, which mounts filesystems and opens raw sockets: mount is refused by the seccomp profile and the user namespace holds no CAP_SYS_ADMIN of the host, so a daemon cannot run in a rootless container", .probe = "", .env = "" },
+        .{ .ref = "traefik:latest", .known = "", .probe = "80|GET / HTTP/1.0\\r\\n\\r\\n|HTTP/", .env = "" },
+        .{ .ref = "hello-world:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "mariadb:latest", .known = "", .probe = "3306||", .env = "MARIADB_ROOT_PASSWORD=top20-pass" },
+        .{ .ref = "golang:latest", .known = "", .probe = "", .env = "" },
+        .{ .ref = "openjdk:28-ea-jdk-slim", .known = "", .probe = "", .env = "" },
+        .{ .ref = "registry:latest", .known = "", .probe = "5000|GET /v2/ HTTP/1.0\\r\\n\\r\\n|200", .env = "" },
+    },
+}

@@ -1,0 +1,29 @@
+.{
+    // The release the upgrade test of `demo-m3` starts from: no release is tagged, so it is the
+    // merged M2 commit. Its `zbx` is built from a git worktree of this commit and has to leave
+    // state (version 3 run records) that M3's `zbx` reads. Replace it by a tag when there is one.
+    .commit = "95ba1da",
+    // The same for `demo-m4`: the merge of PR #9, the merged M3. Its `zbx` imports a tree, runs
+    // it by digest and commits it; M4's `zbx` has to read that store and its run records.
+    .m4_commit = "47b436b",
+    // The same for `demo-m5`: the merge of PR #10, the merged M4. Its `zbx` pulls alpine:3.20,
+    // runs it and commits; M5's `zbx` has to read the store, the records and the lock it leaves.
+    .m5_commit = "cd5adbc",
+    // The same for `demo-m6`: fd48d38, the merge of PR #11, the merged M5. Its `zbx` pulls
+    // alpine:3.20, runs it with `--net user`, commits and pulls postgres:16; M6's `zbx` has to read
+    // the store, the version-2 image records, the lock and the version-4 run records it leaves.
+    .m6_commit = "fd48d38",
+    // The same for `demo-m6b`: bf57ec8, the merge of PR #12, the merged M6. Its `zbx` pulls
+    // alpine:3.20 and starts a detached container with a `--state` volume; M6b's `zbx` has to read
+    // the store, the version-7 run record and the volume, `exec` into that container and stop it.
+    .m6b_commit = "bf57ec8",
+    // The same for `demo-m7`: 6da1ff2, "Version 0.2.0". Its `zbx` pulls alpine:3.20 and starts a
+    // container; M7's `zbx` has to read the store, the lock and the version-8 run record it leaves.
+    .m7_commit = "6da1ff2",
+    // The same for `demo-m8`: the latest tag, v0.3.1. Its `zbx` has no trust commands; this `zbx`
+    // has to read its store, lock, run record and build cache.
+    .m8_tag = "v0.3.1",
+    // The same for `demo-m2b`: v0.5.2, the release before M2b. Its `zbx` starts a detached
+    // container (a version-9 run record); this `zbx` lists it, stops it and reads its record.
+    .m2b_tag = "v0.5.2",
+}

@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Diagnostic codes · Zigbox</title>
+<meta name="description" content="Every diagnostic code zbx can show">
+<link rel="canonical" href="https://zigbox.github.io/zigbox/errors/index.html">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+<style>
+:root{color-scheme:light}
+:root{
+  --bg:#f6f5f1; --surface:#ffffff; --fg:#1d1b16; --muted:#6a6558; --line:#e2ded2;
+  --accent:#b86a00; --term:#1e1c18; --term-fg:#e9e4d6; --term-accent:#f2b13c;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#15140f; --surface:#1d1c17; --fg:#ece8dc; --muted:#a39d8c; --line:#2e2c25;
+  --accent:#f2b13c; --term:#0e0d0a; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#15140f; --surface:#1d1c17; --fg:#ece8dc; --muted:#a39d8c; --line:#2e2c25;
+  --accent:#f2b13c; --term:#0e0d0a; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;
+  line-height:1.6;margin:0}
+.wrap{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px))}
+a{color:var(--accent)} a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2{font-family:var(--display);line-height:1.15;margin:0;text-wrap:balance}
+h1{font-size:clamp(2rem,6vw,2.8rem);font-family:var(--mono);font-weight:500;
+  letter-spacing:-.01em}
+h2{font-size:1.3rem;margin:32px 0 8px}
+code,pre{font-family:var(--mono);font-size:.9em}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--muted)}
+header.top{border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:20px;padding-block:12px;flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;font-size:1.2rem;color:var(--fg);
+  text-decoration:none;display:flex;gap:8px;align-items:center}
+.brand .mark{width:20px;height:20px;border:2px solid var(--accent);border-radius:3px;
+  position:relative}
+.brand .mark::after{content:"";position:absolute;inset:4px;background:var(--accent);
+  border-radius:1px}
+nav{margin-left:auto;font-size:.9rem}
+main{padding-block:40px 56px}
+.summary{font-size:1.25rem;margin:10px 0 24px}
+.facts{display:flex;gap:32px;flex-wrap:wrap;margin:0 0 8px;padding:16px 0;
+  border-block:1px solid var(--line)}
+.facts div{min-width:0} .facts dt{font-family:var(--mono);font-size:.72rem;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.facts dd{margin:2px 0 0;font-family:var(--mono)}
+p{margin:0 0 14px;max-width:68ch}
+.term{background:var(--term);color:var(--term-fg);border-radius:10px;margin:0;
+  padding:12px 16px;overflow-x:auto;white-space:pre}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:8px 12px 8px 0;border-bottom:1px solid var(--line);
+  vertical-align:top}
+th{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);font-weight:500}
+td.code{font-family:var(--mono);white-space:nowrap}
+footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
+  font-size:.85rem}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../"><span class="mark" aria-hidden="true"></span>Zigbox</a>
+  <nav aria-label="Diagnostics"><a href="./">All diagnostic codes</a></nav>
+</div></header>
+<main class="wrap">
+<p class="eyebrow">Reference</p>
+<h1>Diagnostic codes</h1>
+<p class="summary">Every failure zbx reports has one of these codes. <code>zbx explain &lt;code&gt;</code> prints the same text offline.</p>
+<table>
+<tr><th>Code</th><th>Summary</th><th>Blame</th></tr>
+<tr><td class="code"><a href="E0001.html">ZBX-E0001</a></td><td>unknown command</td><td>user</td></tr>
+<tr><td class="code"><a href="E0002.html">ZBX-E0002</a></td><td>no command given</td><td>user</td></tr>
+<tr><td class="code"><a href="E0003.html">ZBX-E0003</a></td><td>unexpected arguments</td><td>user</td></tr>
+<tr><td class="code"><a href="E0004.html">ZBX-E0004</a></td><td>unknown option</td><td>user</td></tr>
+<tr><td class="code"><a href="E0005.html">ZBX-E0005</a></td><td>option has a missing or invalid value</td><td>user</td></tr>
+<tr><td class="code"><a href="E0006.html">ZBX-E0006</a></td><td>missing argument</td><td>user</td></tr>
+<tr><td class="code"><a href="E0007.html">ZBX-E0007</a></td><td>unknown diagnostic code</td><td>user</td></tr>
+<tr><td class="code"><a href="E0008.html">ZBX-E0008</a></td><td>command line exceeds the supported limits</td><td>user</td></tr>
+<tr><td class="code"><a href="E0009.html">ZBX-E0009</a></td><td>can't write output</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0010.html">ZBX-E0010</a></td><td>can't use this -e option</td><td>user</td></tr>
+<tr><td class="code"><a href="E0011.html">ZBX-E0011</a></td><td>-e names a variable that is not set</td><td>user</td></tr>
+<tr><td class="code"><a href="E0012.html">ZBX-E0012</a></td><td>not a valid --tmpfs, --bind or --secret value</td><td>user</td></tr>
+<tr><td class="code"><a href="E0013.html">ZBX-E0013</a></td><td>mounts that cannot go together</td><td>user</td></tr>
+<tr><td class="code"><a href="E0014.html">ZBX-E0014</a></td><td>not a valid --mount value</td><td>user</td></tr>
+<tr><td class="code"><a href="E0015.html">ZBX-E0015</a></td><td>not a valid --user value</td><td>user</td></tr>
+<tr><td class="code"><a href="E0101.html">ZBX-E0101</a></td><td>can't create a user namespace</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0102.html">ZBX-E0102</a></td><td>kernel version is unsupported or unknown</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0103.html">ZBX-E0103</a></td><td>cgroup v2 is not set up for this user</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0104.html">ZBX-E0104</a></td><td>can't mount overlayfs in a user namespace</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0105.html">ZBX-E0105</a></td><td>uid and gid mapping is not set up</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0106.html">ZBX-E0106</a></td><td>seccomp is not available</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0101.html">ZBX-W0101</a></td><td>user namespaces work, but only for unconfined users</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0102.html">ZBX-W0102</a></td><td>--net user is not available</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0201.html">ZBX-E0201</a></td><td>the rootfs is missing or not a directory</td><td>user</td></tr>
+<tr><td class="code"><a href="E0202.html">ZBX-E0202</a></td><td>can't run the command in the rootfs</td><td>user</td></tr>
+<tr><td class="code"><a href="E0203.html">ZBX-E0203</a></td><td>can't create the container's namespaces</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0204.html">ZBX-E0204</a></td><td>writing the id maps failed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0205.html">ZBX-E0205</a></td><td>a container setup step failed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0206.html">ZBX-E0206</a></td><td>invalid container name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0207.html">ZBX-E0207</a></td><td>can't restrict the container's capabilities</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0208.html">ZBX-E0208</a></td><td>can't install the container's seccomp filter</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0209.html">ZBX-E0209</a></td><td>can't set up the read-only rootfs</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0210.html">ZBX-E0210</a></td><td>a --bind or --secret source can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0211.html">ZBX-E0211</a></td><td>can't set up a --tmpfs, --bind or --secret mount</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0212.html">ZBX-E0212</a></td><td>a --mount source is outside the project</td><td>user</td></tr>
+<tr><td class="code"><a href="E0213.html">ZBX-E0213</a></td><td>a --mount needs the container to run as root</td><td>user</td></tr>
+<tr><td class="code"><a href="E0214.html">ZBX-E0214</a></td><td>a --mount source can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0215.html">ZBX-E0215</a></td><td>can't set up a --mount</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0216.html">ZBX-E0216</a></td><td>the --user is not in the image</td><td>user</td></tr>
+<tr><td class="code"><a href="E0217.html">ZBX-E0217</a></td><td>the container has no log</td><td>user</td></tr>
+<tr><td class="code"><a href="E0218.html">ZBX-E0218</a></td><td>can't read the container's log</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0219.html">ZBX-E0219</a></td><td>bad value for a logs option</td><td>user</td></tr>
+<tr><td class="code"><a href="E0220.html">ZBX-E0220</a></td><td>the container is not running</td><td>user</td></tr>
+<tr><td class="code"><a href="E0221.html">ZBX-E0221</a></td><td>can't join the running container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0222.html">ZBX-E0222</a></td><td>can't put the command in the container's cgroup</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0223.html">ZBX-E0223</a></td><td>the working directory is not in the container</td><td>user</td></tr>
+<tr><td class="code"><a href="E0224.html">ZBX-E0224</a></td><td>can't give the command a terminal</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0225.html">ZBX-E0225</a></td><td>can't bind that device into the container</td><td>user</td></tr>
+<tr><td class="code"><a href="E0226.html">ZBX-E0226</a></td><td>can't use a CDI spec</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0227.html">ZBX-E0227</a></td><td>a CDI device needs an edit or a combination zbx does not apply</td><td>user</td></tr>
+<tr><td class="code"><a href="E0228.html">ZBX-E0228</a></td><td>--gpu found no GPU device to give</td><td>user</td></tr>
+<tr><td class="code"><a href="E0229.html">ZBX-E0229</a></td><td>devices are not available on this platform</td><td>user</td></tr>
+<tr><td class="code"><a href="E0230.html">ZBX-E0230</a></td><td>no CDI spec has that device</td><td>user</td></tr>
+<tr><td class="code"><a href="W0201.html">ZBX-W0201</a></td><td>mapping only your own id into the container</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0202.html">ZBX-W0202</a></td><td>can't save the run record</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0203.html">ZBX-W0203</a></td><td>skipped a run record that can't be read</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0204.html">ZBX-W0204</a></td><td>the container's output is not being kept</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0205.html">ZBX-W0205</a></td><td>older output of the container was dropped</td><td>user</td></tr>
+<tr><td class="code"><a href="W0206.html">ZBX-W0206</a></td><td>the terminal was not logged</td><td>user</td></tr>
+<tr><td class="code"><a href="W0207.html">ZBX-W0207</a></td><td>the exec was not noted in the container's history</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0208.html">ZBX-W0208</a></td><td>driver libraries found through LD_LIBRARY_PATH</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0209.html">ZBX-W0209</a></td><td>groups show as nogroup inside the container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0301.html">ZBX-E0301</a></td><td>can't reach the systemd user manager over D-Bus</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0302.html">ZBX-E0302</a></td><td>the user bus refused to authenticate this user</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0303.html">ZBX-E0303</a></td><td>the user bus answered in a way zbx can't use</td><td>external</td></tr>
+<tr><td class="code"><a href="E0304.html">ZBX-E0304</a></td><td>systemd refused the container's scope, or its job failed</td><td>external</td></tr>
+<tr><td class="code"><a href="E0305.html">ZBX-E0305</a></td><td>a scope with this container's name already exists</td><td>user</td></tr>
+<tr><td class="code"><a href="E0306.html">ZBX-E0306</a></td><td>invalid resource limit</td><td>user</td></tr>
+<tr><td class="code"><a href="E0307.html">ZBX-E0307</a></td><td>a limit needs a cgroup scope, and none can be made</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0308.html">ZBX-E0308</a></td><td>can't write a limit to the container's cgroup</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0309.html">ZBX-E0309</a></td><td>can't make the container's cgroup</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0310.html">ZBX-E0310</a></td><td>a --ulimit is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0311.html">ZBX-E0311</a></td><td>--ulimit is above your own hard limit</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0312.html">ZBX-E0312</a></td><td>can't check or set a --ulimit</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0313.html">ZBX-E0313</a></td><td>a --shm-size is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0314.html">ZBX-E0314</a></td><td>--shm-size is larger than --memory</td><td>user</td></tr>
+<tr><td class="code"><a href="E0315.html">ZBX-E0315</a></td><td>a --sysctl is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0316.html">ZBX-E0316</a></td><td>a --sysctl is a host setting</td><td>user</td></tr>
+<tr><td class="code"><a href="E0317.html">ZBX-E0317</a></td><td>a --sysctl net.* key with --net host</td><td>user</td></tr>
+<tr><td class="code"><a href="E0318.html">ZBX-E0318</a></td><td>the kernel refused a --sysctl</td><td>user</td></tr>
+<tr><td class="code"><a href="E0319.html">ZBX-E0319</a></td><td>a host setting is not what --require-host asks</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0320.html">ZBX-E0320</a></td><td>a --require-host is not a requirement zbx knows</td><td>user</td></tr>
+<tr><td class="code"><a href="E0321.html">ZBX-E0321</a></td><td>a host setting --require-host asks for can't be read</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0322.html">ZBX-E0322</a></td><td>the container could not take a cgroup namespace</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0323.html">ZBX-E0323</a></td><td>the container's cgroup view could not be mounted</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0301.html">ZBX-W0301</a></td><td>running without a cgroup scope</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0302.html">ZBX-W0302</a></td><td>the container's cgroup scope was left behind</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0401.html">ZBX-E0401</a></td><td>a time is not a number of milliseconds</td><td>user</td></tr>
+<tr><td class="code"><a href="E0402.html">ZBX-E0402</a></td><td>no container with that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0403.html">ZBX-E0403</a></td><td>can't signal the container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0404.html">ZBX-E0404</a></td><td>the container did not stop in time</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0405.html">ZBX-E0405</a></td><td>can't start the supervisor of a detached run</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0406.html">ZBX-E0406</a></td><td>no schema for that command</td><td>user</td></tr>
+<tr><td class="code"><a href="E0410.html">ZBX-E0410</a></td><td>no tree with that digest</td><td>user</td></tr>
+<tr><td class="code"><a href="E0411.html">ZBX-E0411</a></td><td>that digest prefix matches more than one tree</td><td>user</td></tr>
+<tr><td class="code"><a href="E0412.html">ZBX-E0412</a></td><td>not a digest</td><td>user</td></tr>
+<tr><td class="code"><a href="E0413.html">ZBX-E0413</a></td><td>can't use the store: its format is unknown</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0414.html">ZBX-E0414</a></td><td>can't read the directory to import</td><td>user</td></tr>
+<tr><td class="code"><a href="E0415.html">ZBX-E0415</a></td><td>the directory tree is bigger than an import limit</td><td>user</td></tr>
+<tr><td class="code"><a href="E0416.html">ZBX-E0416</a></td><td>the disk is full while writing the store</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0417.html">ZBX-E0417</a></td><td>can't write the store</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0418.html">ZBX-E0418</a></td><td>a file changed while it was being imported</td><td>user</td></tr>
+<tr><td class="code"><a href="E0419.html">ZBX-E0419</a></td><td>can't run the store worker</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0420.html">ZBX-E0420</a></td><td>that tree is not a root</td><td>user</td></tr>
+<tr><td class="code"><a href="E0421.html">ZBX-E0421</a></td><td>no data directory to keep the store in</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0422.html">ZBX-E0422</a></td><td>a tree in the store is missing or damaged</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0423.html">ZBX-E0423</a></td><td>can't read the store</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0424.html">ZBX-E0424</a></td><td>a file name in the store has too many links</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0425.html">ZBX-E0425</a></td><td>overlayfs can't be mounted for this container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0426.html">ZBX-E0426</a></td><td>the container has no layer to commit</td><td>user</td></tr>
+<tr><td class="code"><a href="E0427.html">ZBX-E0427</a></td><td>the container is still running</td><td>user</td></tr>
+<tr><td class="code"><a href="E0428.html">ZBX-E0428</a></td><td>the upper layer uses an overlayfs feature a commit can't follow</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0429.html">ZBX-E0429</a></td><td>a file in the store is damaged</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0430.html">ZBX-E0430</a></td><td>the store failed verification</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0431.html">ZBX-E0431</a></td><td>the store changed since that gc plan was made</td><td>user</td></tr>
+<tr><td class="code"><a href="E0432.html">ZBX-E0432</a></td><td>a restore would overwrite something that is back in the store</td><td>user</td></tr>
+<tr><td class="code"><a href="E0433.html">ZBX-E0433</a></td><td>no trash with that id</td><td>user</td></tr>
+<tr><td class="code"><a href="E0434.html">ZBX-E0434</a></td><td>the trash is missing things the gc moved into it</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0435.html">ZBX-E0435</a></td><td>a root record can't be used</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0436.html">ZBX-E0436</a></td><td>the store is in use by another zbx command</td><td>user</td></tr>
+<tr><td class="code"><a href="E0437.html">ZBX-E0437</a></td><td>an image record from a peer was not taken</td><td>user</td></tr>
+<tr><td class="code"><a href="W0410.html">ZBX-W0410</a></td><td>a file was left out of the import</td><td>user</td></tr>
+<tr><td class="code"><a href="W0411.html">ZBX-W0411</a></td><td>an extended attribute was left out of the import</td><td>user</td></tr>
+<tr><td class="code"><a href="W0412.html">ZBX-W0412</a></td><td>some files have an owner or group that could not be mapped</td><td>user</td></tr>
+<tr><td class="code"><a href="W0413.html">ZBX-W0413</a></td><td>a container's upper layer could not be removed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0501.html">ZBX-E0501</a></td><td>not an image reference</td><td>user</td></tr>
+<tr><td class="code"><a href="E0502.html">ZBX-E0502</a></td><td>the registry's name does not resolve</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0503.html">ZBX-E0503</a></td><td>can't reach the registry</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0504.html">ZBX-E0504</a></td><td>the registry's certificate can't be trusted</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0505.html">ZBX-E0505</a></td><td>the registry answered with an error</td><td>external</td></tr>
+<tr><td class="code"><a href="E0506.html">ZBX-E0506</a></td><td>the registry is rate limiting this host</td><td>external</td></tr>
+<tr><td class="code"><a href="E0507.html">ZBX-E0507</a></td><td>the registry refused anonymous access</td><td>external</td></tr>
+<tr><td class="code"><a href="E0508.html">ZBX-E0508</a></td><td>the registry has no such image</td><td>user</td></tr>
+<tr><td class="code"><a href="E0509.html">ZBX-E0509</a></td><td>the image has no build for this platform</td><td>user</td></tr>
+<tr><td class="code"><a href="E0510.html">ZBX-E0510</a></td><td>the registry sent a type of document zbx does not read</td><td>external</td></tr>
+<tr><td class="code"><a href="E0511.html">ZBX-E0511</a></td><td>downloaded bytes do not match their digest</td><td>external</td></tr>
+<tr><td class="code"><a href="E0512.html">ZBX-E0512</a></td><td>the registry's answer can't be used</td><td>external</td></tr>
+<tr><td class="code"><a href="E0513.html">ZBX-E0513</a></td><td>the registry's answer ended early</td><td>external</td></tr>
+<tr><td class="code"><a href="E0514.html">ZBX-E0514</a></td><td>not a registry mirror</td><td>user</td></tr>
+<tr><td class="code"><a href="E0515.html">ZBX-E0515</a></td><td>a layer entry would leave the image's root</td><td>external</td></tr>
+<tr><td class="code"><a href="E0516.html">ZBX-E0516</a></td><td>a layer can't be unpacked</td><td>external</td></tr>
+<tr><td class="code"><a href="E0517.html">ZBX-E0517</a></td><td>an image's configuration can't be used</td><td>external</td></tr>
+<tr><td class="code"><a href="E0518.html">ZBX-E0518</a></td><td>zbx.lock can't be read</td><td>user</td></tr>
+<tr><td class="code"><a href="E0519.html">ZBX-E0519</a></td><td>zbx.lock and the store disagree about an image</td><td>user</td></tr>
+<tr><td class="code"><a href="E0520.html">ZBX-E0520</a></td><td>the image zbx.lock names is not in the store</td><td>user</td></tr>
+<tr><td class="code"><a href="E0521.html">ZBX-E0521</a></td><td>the image's user is not in the image</td><td>external</td></tr>
+<tr><td class="code"><a href="E0522.html">ZBX-E0522</a></td><td>no image of that name is locked or in the store</td><td>user</td></tr>
+<tr><td class="code"><a href="E0523.html">ZBX-E0523</a></td><td>the image's user needs more ids than this run maps</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0524.html">ZBX-E0524</a></td><td>the image has no command to run</td><td>user</td></tr>
+<tr><td class="code"><a href="E0525.html">ZBX-E0525</a></td><td>zbx.lock can't be written</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0526.html">ZBX-E0526</a></td><td>there is no zbx.lock for this project</td><td>user</td></tr>
+<tr><td class="code"><a href="E0527.html">ZBX-E0527</a></td><td>there are no AWS credentials to pull from Amazon ECR</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0528.html">ZBX-E0528</a></td><td>AWS refused the credentials</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0529.html">ZBX-E0529</a></td><td>the clock of this machine is too far from AWS's</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0530.html">ZBX-E0530</a></td><td>the AWS identity may not get an ECR authorization token</td><td>user</td></tr>
+<tr><td class="code"><a href="E0531.html">ZBX-E0531</a></td><td>the ECR repository may not be read by this identity</td><td>user</td></tr>
+<tr><td class="code"><a href="E0532.html">ZBX-E0532</a></td><td>the ECR repository does not exist</td><td>user</td></tr>
+<tr><td class="code"><a href="E0533.html">ZBX-E0533</a></td><td>the web identity token file can't be read</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0534.html">ZBX-E0534</a></td><td>this Amazon ECR registry is not supported yet</td><td>user</td></tr>
+<tr><td class="code"><a href="E0535.html">ZBX-E0535</a></td><td>the ECR registry did not accept its authorization token</td><td>external</td></tr>
+<tr><td class="code"><a href="E0550.html">ZBX-E0550</a></td><td>the source cannot be packed into an image</td><td>user</td></tr>
+<tr><td class="code"><a href="E0551.html">ZBX-E0551</a></td><td>the destination cannot be pushed to</td><td>user</td></tr>
+<tr><td class="code"><a href="E0552.html">ZBX-E0552</a></td><td>the registry wants credentials and none were given</td><td>user</td></tr>
+<tr><td class="code"><a href="E0553.html">ZBX-E0553</a></td><td>the registry or its token service refused the credentials</td><td>user</td></tr>
+<tr><td class="code"><a href="E0554.html">ZBX-E0554</a></td><td>the token service is on a host the password may not be sent to</td><td>external</td></tr>
+<tr><td class="code"><a href="E0555.html">ZBX-E0555</a></td><td>the registry refused a blob upload</td><td>external</td></tr>
+<tr><td class="code"><a href="E0556.html">ZBX-E0556</a></td><td>the registry refused the manifest</td><td>external</td></tr>
+<tr><td class="code"><a href="E0557.html">ZBX-E0557</a></td><td>the export directory exists and is not empty</td><td>user</td></tr>
+<tr><td class="code"><a href="E0558.html">ZBX-E0558</a></td><td>the password file or input is unsafe or unusable</td><td>user</td></tr>
+<tr><td class="code"><a href="E0560.html">ZBX-E0560</a></td><td>there are no Google credentials to pull from this registry</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0561.html">ZBX-E0561</a></td><td>the Google credentials file cannot be read</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0562.html">ZBX-E0562</a></td><td>service account key files are not supported</td><td>user</td></tr>
+<tr><td class="code"><a href="E0563.html">ZBX-E0563</a></td><td>the Google credentials file is not one zbx supports</td><td>user</td></tr>
+<tr><td class="code"><a href="E0564.html">ZBX-E0564</a></td><td>the subject token for workload identity cannot be read</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0565.html">ZBX-E0565</a></td><td>Google refused the workload identity token exchange</td><td>external</td></tr>
+<tr><td class="code"><a href="E0566.html">ZBX-E0566</a></td><td>Google refused to impersonate the service account</td><td>user</td></tr>
+<tr><td class="code"><a href="E0567.html">ZBX-E0567</a></td><td>the registry refused the Google access token</td><td>external</td></tr>
+<tr><td class="code"><a href="E0568.html">ZBX-E0568</a></td><td>the identity may not read the repository, or it does not exist</td><td>user</td></tr>
+<tr><td class="code"><a href="E0569.html">ZBX-E0569</a></td><td>the repository does not exist</td><td>user</td></tr>
+<tr><td class="code"><a href="E0570.html">ZBX-E0570</a></td><td>the Google registry host is not one zbx authenticates to</td><td>user</td></tr>
+<tr><td class="code"><a href="E0571.html">ZBX-E0571</a></td><td>workforce pools are not supported</td><td>user</td></tr>
+<tr><td class="code"><a href="E0572.html">ZBX-E0572</a></td><td>a Google credential service failed</td><td>external</td></tr>
+<tr><td class="code"><a href="W0501.html">ZBX-W0501</a></td><td>device nodes in a layer were left out</td><td>external</td></tr>
+<tr><td class="code"><a href="W0502.html">ZBX-W0502</a></td><td>extended attributes in a layer were left out</td><td>external</td></tr>
+<tr><td class="code"><a href="W0503.html">ZBX-W0503</a></td><td>no zbx.lock was found, so one was written</td><td>user</td></tr>
+<tr><td class="code"><a href="W0504.html">ZBX-W0504</a></td><td>warnings from unpacking an image were not shown</td><td>external</td></tr>
+<tr><td class="code"><a href="W0551.html">ZBX-W0551</a></td><td>the image's tree annotation is not the tree its layers unpack to</td><td>external</td></tr>
+<tr><td class="code"><a href="W0552.html">ZBX-W0552</a></td><td>the push succeeded but this host did not record the tag</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0600.html">ZBX-E0600</a></td><td>--publish is not a usable HOST:CONTAINER</td><td>user</td></tr>
+<tr><td class="code"><a href="E0601.html">ZBX-E0601</a></td><td>pasta is not installed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0602.html">ZBX-E0602</a></td><td>pasta is too old</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0603.html">ZBX-E0603</a></td><td>pasta failed to start</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0604.html">ZBX-E0604</a></td><td>a published host port is already in use</td><td>user</td></tr>
+<tr><td class="code"><a href="E0605.html">ZBX-E0605</a></td><td>the host lets users bind no port this low</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0606.html">ZBX-E0606</a></td><td>--listen is refused with these options</td><td>user</td></tr>
+<tr><td class="code"><a href="E0607.html">ZBX-E0607</a></td><td>--listen takes 127.0.0.1 and a port from 1 to 65535</td><td>user</td></tr>
+<tr><td class="code"><a href="E0608.html">ZBX-E0608</a></td><td>the listener could not be made inside the container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0609.html">ZBX-E0609</a></td><td>the listener could not be handed on to --listen-send</td><td>user</td></tr>
+<tr><td class="code"><a href="E0610.html">ZBX-E0610</a></td><td>a socket can be made only in a container with --net none</td><td>user</td></tr>
+<tr><td class="code"><a href="E0611.html">ZBX-E0611</a></td><td>a socket could not be made inside the container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0612.html">ZBX-E0612</a></td><td>the hosts file cannot be bound at /etc/hosts</td><td>user</td></tr>
+<tr><td class="code"><a href="E0701.html">ZBX-E0701</a></td><td>no state directory to keep bundles and run records in</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0702.html">ZBX-E0702</a></td><td>can't write the bundle</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0703.html">ZBX-E0703</a></td><td>no run record with that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0704.html">ZBX-E0704</a></td><td>no runs are recorded yet</td><td>user</td></tr>
+<tr><td class="code"><a href="E0705.html">ZBX-E0705</a></td><td>not a valid state volume name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0706.html">ZBX-E0706</a></td><td>the state volume is in use</td><td>user</td></tr>
+<tr><td class="code"><a href="E0707.html">ZBX-E0707</a></td><td>no state volume with that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0708.html">ZBX-E0708</a></td><td>a state volume with that name exists already</td><td>user</td></tr>
+<tr><td class="code"><a href="E0709.html">ZBX-E0709</a></td><td>no state volume with that name in the trash</td><td>user</td></tr>
+<tr><td class="code"><a href="E0710.html">ZBX-E0710</a></td><td>the state volume's trash has expired</td><td>user</td></tr>
+<tr><td class="code"><a href="E0711.html">ZBX-E0711</a></td><td>can't make or read the state directory</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0712.html">ZBX-E0712</a></td><td>can't read a state volume's record</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0713.html">ZBX-E0713</a></td><td>can't mount a state volume in the container</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0714.html">ZBX-E0714</a></td><td>won't write the archive to a terminal</td><td>user</td></tr>
+<tr><td class="code"><a href="E0715.html">ZBX-E0715</a></td><td>can't write the archive</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0716.html">ZBX-E0716</a></td><td>can't read the state volume to export it</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0701.html">ZBX-W0701</a></td><td>writing a bundle without redaction</td><td>user</td></tr>
+<tr><td class="code"><a href="W0702.html">ZBX-W0702</a></td><td>a state volume's size could not be counted</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0703.html">ZBX-W0703</a></td><td>a file was left out of the export</td><td>user</td></tr>
+<tr><td class="code"><a href="E0801.html">ZBX-E0801</a></td><td>can't read the build file</td><td>user</td></tr>
+<tr><td class="code"><a href="E0802.html">ZBX-E0802</a></td><td>the build graph is invalid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0803.html">ZBX-E0803</a></td><td>a build input is refused</td><td>user</td></tr>
+<tr><td class="code"><a href="E0804.html">ZBX-E0804</a></td><td>a build step's base is not locked</td><td>user</td></tr>
+<tr><td class="code"><a href="E0805.html">ZBX-E0805</a></td><td>a build step failed</td><td>user</td></tr>
+<tr><td class="code"><a href="E0806.html">ZBX-E0806</a></td><td>a build step's output is refused</td><td>user</td></tr>
+<tr><td class="code"><a href="E0807.html">ZBX-E0807</a></td><td>the image can't be made as declared</td><td>user</td></tr>
+<tr><td class="code"><a href="E0808.html">ZBX-E0808</a></td><td>the build was stopped by a signal</td><td>user</td></tr>
+<tr><td class="code"><a href="W0801.html">ZBX-W0801</a></td><td>the build has steps that use the network</td><td>user</td></tr>
+<tr><td class="code"><a href="E0817.html">ZBX-E0817</a></td><td>a user, group or owner id cannot be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0818.html">ZBX-E0818</a></td><td>a glob matched more paths than one import can hold</td><td>user</td></tr>
+<tr><td class="code"><a href="E0820.html">ZBX-E0820</a></td><td>a fetch could not be downloaded</td><td>external</td></tr>
+<tr><td class="code"><a href="E0821.html">ZBX-E0821</a></td><td>the fetched bytes do not match their pinned hash</td><td>external</td></tr>
+<tr><td class="code"><a href="W0802.html">ZBX-W0802</a></td><td>the build has steps with cache mounts</td><td>user</td></tr>
+<tr><td class="code"><a href="E0810.html">ZBX-E0810</a></td><td>the Dockerfile can't be read</td><td>user</td></tr>
+<tr><td class="code"><a href="E0811.html">ZBX-E0811</a></td><td>a Dockerfile instruction or flag is not supported</td><td>user</td></tr>
+<tr><td class="code"><a href="E0812.html">ZBX-E0812</a></td><td>a Dockerfile variable has no value</td><td>user</td></tr>
+<tr><td class="code"><a href="E0813.html">ZBX-E0813</a></td><td>a Dockerfile stage can't be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0814.html">ZBX-E0814</a></td><td>--hermetic refused a step</td><td>user</td></tr>
+<tr><td class="code"><a href="E0815.html">ZBX-E0815</a></td><td>the Dockerfile is larger than a build file holds</td><td>user</td></tr>
+<tr><td class="code"><a href="E0816.html">ZBX-E0816</a></td><td>the build file can't be written</td><td>user</td></tr>
+<tr><td class="code"><a href="W0810.html">ZBX-W0810</a></td><td>the import has steps that are not hermetic</td><td>user</td></tr>
+<tr><td class="code"><a href="W0811.html">ZBX-W0811</a></td><td>parts of the Dockerfile did not carry over</td><td>user</td></tr>
+<tr><td class="code"><a href="E0822.html">ZBX-E0822</a></td><td>a pinned step's output differs from its pin</td><td>external</td></tr>
+<tr><td class="code"><a href="W0803.html">ZBX-W0803</a></td><td>a pinned step drifted, and its new output was used</td><td>external</td></tr>
+<tr><td class="code"><a href="E0901.html">ZBX-E0901</a></td><td>the key cannot be used</td><td>user</td></tr>
+<tr><td class="code"><a href="E0902.html">ZBX-E0902</a></td><td>a key with that name already exists</td><td>user</td></tr>
+<tr><td class="code"><a href="E0903.html">ZBX-E0903</a></td><td>a signature record in the store is damaged or newer</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0904.html">ZBX-E0904</a></td><td>a policy file cannot be read or is not a policy</td><td>user</td></tr>
+<tr><td class="code"><a href="E0905.html">ZBX-E0905</a></td><td>no trusted signature covers what was to run</td><td>user</td></tr>
+<tr><td class="code"><a href="E0906.html">ZBX-E0906</a></td><td>no trusted signed provenance covers what was to run</td><td>user</td></tr>
+<tr><td class="code"><a href="E0907.html">ZBX-E0907</a></td><td>a file of the image in the store was changed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0908.html">ZBX-E0908</a></td><td>zbx verify found a broken link</td><td>user</td></tr>
+<tr><td class="code"><a href="E0909.html">ZBX-E0909</a></td><td>a trust bundle was refused</td><td>user</td></tr>
+<tr><td class="code"><a href="E0910.html">ZBX-E0910</a></td><td>signing was refused</td><td>user</td></tr>
+<tr><td class="code"><a href="E0911.html">ZBX-E0911</a></td><td>the key's passphrase is missing, unusable or wrong</td><td>user</td></tr>
+<tr><td class="code"><a href="W0901.html">ZBX-W0901</a></td><td>the provenance store is full, so this result has no provenance record</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0902.html">ZBX-W0902</a></td><td>a damaged trust record was kept; its tree is in the store</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0903.html">ZBX-W0903</a></td><td>zbx verify could not check an input that is not in the store</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1001.html">ZBX-E1001</a></td><td>this zbx is not allowed to run virtual machines</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1002.html">ZBX-E1002</a></td><td>the virtual machine did not start</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1003.html">ZBX-E1003</a></td><td>the virtual machine did not answer in time</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1004.html">ZBX-E1004</a></td><td>another process holds the virtual machine</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1005.html">ZBX-E1005</a></td><td>can't make or write the VM directory</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1006.html">ZBX-E1006</a></td><td>no virtual machine is running</td><td>user</td></tr>
+<tr><td class="code"><a href="E1007.html">ZBX-E1007</a></td><td>the virtual machine's size is out of range</td><td>user</td></tr>
+<tr><td class="code"><a href="E1008.html">ZBX-E1008</a></td><td>can't read the virtual machine's settings</td><td>environment</td></tr>
+<tr><td class="code"><a href="W1001.html">ZBX-W1001</a></td><td>replacing a virtual machine of another version</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1009.html">ZBX-E1009</a></td><td>the connection to the virtual machine was lost</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1010.html">ZBX-E1010</a></td><td>the virtual machine's command service did not answer</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1011.html">ZBX-E1011</a></td><td>the virtual machine could not be set up for this user</td><td>environment</td></tr>
+<tr><td class="code"><a href="W1002.html">ZBX-W1002</a></td><td>the virtual machine has no network</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1012.html">ZBX-E1012</a></td><td>the virtual machine's disk cannot be made smaller</td><td>user</td></tr>
+<tr><td class="code"><a href="E1013.html">ZBX-E1013</a></td><td>a directory or path is not shared with the virtual machine</td><td>user</td></tr>
+<tr><td class="code"><a href="E1014.html">ZBX-E1014</a></td><td>the virtual machine's disk is full</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1015.html">ZBX-E1015</a></td><td>the Mac has no room for the virtual machine's disk</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1016.html">ZBX-E1016</a></td><td>Rosetta is not installed on this Mac</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1017.html">ZBX-E1017</a></td><td>a published port cannot be opened on the Mac</td><td>user</td></tr>
+<tr><td class="code"><a href="W1003.html">ZBX-W1003</a></td><td>the Mac has no IPv4 DNS server, so the machine asks public ones</td><td>environment</td></tr>
+<tr><td class="code"><a href="W1201.html">ZBX-W1201</a></td><td>the image has no lazy index: pulling it whole</td><td>external</td></tr>
+<tr><td class="code"><a href="E1201.html">ZBX-E1201</a></td><td>lazy start is not possible on this host</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1202.html">ZBX-E1202</a></td><td>the image's lazy index was refused</td><td>external</td></tr>
+<tr><td class="code"><a href="W1202.html">ZBX-W1202</a></td><td>a source sent a chunk that does not match its hash</td><td>external</td></tr>
+<tr><td class="code"><a href="E1203.html">ZBX-E1203</a></td><td>a chunk could not be fetched in time: the read got EIO</td><td>external</td></tr>
+<tr><td class="code"><a href="E1206.html">ZBX-E1206</a></td><td>the store's disk is too full to keep fetched chunks</td><td>environment</td></tr>
+<tr><td class="code"><a href="E1207.html">ZBX-E1207</a></td><td>the image is too large for lazy start</td><td>user</td></tr>
+<tr><td class="code"><a href="E1208.html">ZBX-E1208</a></td><td>--lazy does not work with another option given</td><td>user</td></tr>
+<tr><td class="code"><a href="W1203.html">ZBX-W1203</a></td><td>lazy start (--lazy) is not possible on this host</td><td>environment</td></tr>
+<tr><td class="code"><a href="B0001.html">ZBX-B0001</a></td><td>zbx hit an internal error</td><td>internal</td></tr>
+</table>
+</main>
+<footer><div class="wrap">
+Generated from the diagnostic registry by <code>zig build errors-site</code>.
+The same text is printed offline by <code>zbx explain</code>.
+</div></footer>
+</body>
+</html>

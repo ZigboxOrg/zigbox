@@ -1,0 +1,2492 @@
+//! The plan: everything a container run does, as a fixed list of steps built by a pure function
+//! from the run's input (docs/briefs/M1-shell.md, "Setup as a plan").
+//!
+//! The list interleaves the two processes in the order things happen: the parent creates the
+//! pipes and the child (`spawn`), writes the id maps and lets the child go; the child sets up the
+//! container and runs the command; the parent collects the child's report and waits. Each step
+//! belongs to one side (`side_of`) and is one call into `host.zig` (a few are two tiny ones), so
+//! the simulator can fail exactly one step and the diagnostic can name it by its index and kind.
+//!
+//! Everything the child needs is made here, in the parent, before `spawn`: every path, the map
+//! lines, the hostname, and the whole exec image (argv, environment and the path candidates).
+//! The child therefore never allocates or formats text. The plan holds pointers into itself
+//! (the exec image), so it is built in place and never moved or copied.
+
+const std = @import("std");
+const cdi_mod = @import("cdi.zig");
+const assert = std.debug.assert;
+const constants = @import("../constants.zig");
+const netfiles = @import("netfiles.zig");
+const spec = @import("spec.zig");
+const knobs = @import("knobs.zig");
+
+/// The environment a run passes: the image's, `-e`s and the CDI devices' variables, and slack.
+const envp_count_max = constants.environment_count_max + constants.env_vars_count_max +
+    constants.cdi_run_env_max + 2;
+/// The `LD_LIBRARY_PATH` value: the CDI directories, each with its separator, and slack.
+const ld_line_bytes_max = constants.cdi_run_dirs_max * (constants.cdi_path_bytes_max + 1) + 64;
+
+pub const Side = enum { parent, child };
+
+/// The steps that give the container a /sys: the host's, bound, or a sysfs of its own.
+pub fn is_sys(kind: Kind) bool {
+    assert(@backingInt(kind) <= @backingInt(Kind.exec));
+    if (kind == .bind_sys) assert(side_of(kind) == .child);
+    return kind == .make_sys_dir or kind == .bind_sys or kind == .remount_sys or
+        kind == .mount_sysfs;
+}
+
+/// The steps that give the container its generated /etc/hosts and /etc/resolv.conf. Each acts
+/// on one of the three files (`Step.index`, a `netfiles.File`).
+pub fn is_etc(kind: Kind) bool {
+    assert(@backingInt(kind) <= @backingInt(Kind.exec));
+    return switch (kind) {
+        .make_etc_dir, .create_etc_file, .stage_etc_file => true,
+        .bind_etc_file, .remount_etc_file, .unstage_etc_file => true,
+        else => false,
+    };
+}
+
+/// The steps that mount the state volumes (M6). Each acts on one volume (`Step.index`). Before
+/// the new root is entered: the volume's `data` directory is made, in the container's user
+/// namespace as its root (so that its owner is the container's root, and a `chown` inside the
+/// container owns it through the id map); a hidden directory is made in the container's fresh
+/// /dev, the volume is bound there, and made read-only for `:ro`. After the new root is entered,
+/// so that the target is read as the container reads it (a symlink in the image resolves inside
+/// the container, never on the host): the target is made with its parents, the volume is moved
+/// onto it, and the hidden directory removed.
+/// The steps that loop over the CDI devices' items (`cdi_steps.zig`).
+pub fn is_cdi(kind: Kind) bool {
+    assert(@backingInt(kind) <= @backingInt(Kind.exec));
+    return switch (kind) {
+        .bind_cdi_nodes, .stage_cdi_mounts, .move_cdi_mounts => true,
+        else => false,
+    };
+}
+
+pub fn is_state(kind: Kind) bool {
+    assert(@backingInt(kind) <= @backingInt(Kind.exec));
+    return switch (kind) {
+        .make_state_data, .make_state_stage, .bind_state, .remount_state => true,
+        .make_state_target, .move_state, .remove_state_stage => true,
+        else => false,
+    };
+}
+
+/// The steps that make the other mounts (`--tmpfs`, `--bind`, `--secret`; M6). Each acts on one
+/// mount (`Step.index`). A bind or a secret is staged before the new root is entered: a hidden
+/// directory or file in the container's fresh /dev, on which the host's path is bound
+/// (read-only), or for a secret a copy of the file made with mode 0400 and bound on itself
+/// (read-only), so that it can be moved. After the new root is entered, so that the target is
+/// read as the container reads it: the target is made with its parents, the mount moved onto it,
+/// and the hidden name removed. A tmpfs needs no staging: the target is made and mounted.
+pub fn is_mount(kind: Kind) bool {
+    assert(@backingInt(kind) <= @backingInt(Kind.exec));
+    return switch (kind) {
+        .make_mount_stage_dir, .make_mount_stage_file, .copy_secret => true,
+        .bind_mount_dir, .bind_mount_file, .remount_mount, .remount_mount_tree => true,
+        .make_mount_target_dir, .make_mount_target_file, .move_mount => true,
+        .remove_mount_stage_dir, .remove_mount_stage_file, .mount_user_tmpfs => true,
+        else => false,
+    };
+}
+
+/// The failure group of a tolerant step: 0 for none. The steps of one generated file are a
+/// group: when one fails the rest of the group is skipped, so one file makes one note and not
+/// a note per step.
+pub fn group_of(step: *const Step) u8 {
+    if (!is_etc(step.kind)) return 0;
+    assert(step.index < 3);
+    // The caller's hosts file (ZB-6) is bound by non-tolerant etc steps: its failure fails the
+    // start, and it has no group, since there is no generated copy to fall back on.
+    if (!step.tolerant) return 0;
+    return step.index + 1;
+}
+
+/// What a step does. Parent steps first in the declaration, then the child's.
+pub const Kind = enum {
+    // The parent.
+    make_pipes,
+    spawn,
+    deny_setgroups,
+    write_gid_map,
+    write_uid_map,
+    run_newuidmap,
+    run_newgidmap,
+    /// In a plan built with a scope: forks the scope's keeper (`Host.start_keeper`), which is
+    /// put in the scope beside the container so that the scope cannot be removed while zbx
+    /// has still to read its counters.
+    spawn_keeper,
+    /// Asks the user's systemd manager for the container's scope and waits for its job; only in
+    /// a plan built with a scope.
+    start_scope,
+    /// In a plan with `--net user`: starts pasta, attached to the child's namespaces by its
+    /// pid, once the id maps are written (so that pasta is root in the container's user
+    /// namespace when it joins it). zbx's own child, killed by the kernel if zbx dies.
+    start_pasta,
+    /// ... and waits, within `pasta_ready_timeout_ms`, for pasta to report the interface
+    /// configured and the host's ports bound. Only then is the child let go.
+    await_pasta,
+    release_child,
+    /// In a lazy plan: receives the FUSE descriptor the child mounted (`send_fuse`), answers
+    /// `INIT` and starts the serving threads (the caller's `Session.Fuse`). Before
+    /// `await_report`: the child's overlay mount waits in the kernel until `INIT` is answered,
+    /// and reads the FUSE root, so the server must answer while the child still runs its steps.
+    serve_fuse,
+    await_report,
+    /// In a plan with a listener (`--listen`): receives the listener the child made and sent
+    /// (`send_listener`). After `await_report`, so the child's own failure is read first.
+    receive_listener,
+    reap,
+    // The child.
+    die_with_parent,
+    await_release,
+    /// In a plan with a scope (M2b): the child, now in the container's cgroup, takes a cgroup
+    /// namespace of its own (`unshare(CLONE_NEWCGROUP)`), whose root is that cgroup. Not
+    /// tolerant: E0322.
+    unshare_cgroup,
+    set_hostname,
+    /// Only when the input asks: the file mode creation mask the command inherits.
+    set_umask,
+    make_mounts_private,
+    bind_rootfs,
+    /// In a lazy plan: opens `/dev/fuse` and mounts it on the overlay's lower layer, then sends
+    /// the descriptor to the parent over the channel and closes its own.
+    mount_fuse,
+    send_fuse,
+    /// In a plan that runs a tree from the store: the overlay replaces the bind of a rootfs.
+    mount_overlay,
+    make_proc_dir,
+    mount_proc,
+    make_dev_dir,
+    mount_dev,
+    create_device_file,
+    bind_device,
+    /// The devices of `--device` (M10), after M1's six: each is made a mount point (with the
+    /// directories above it that are missing) and bound at its own path, as M1's six are.
+    create_user_device,
+    bind_user_device,
+    /// The CDI devices (M10 slice 2), each one step that loops over the run's resolved items
+    /// (`Plan.cdi`): the nodes bound at their own path below `/dev` ...
+    bind_cdi_nodes,
+    /// ... the mounts staged in hidden names below the rootfs's `/dev`, read-only (before the
+    /// new root is entered), and moved to their container paths (after it) ...
+    stage_cdi_mounts,
+    move_cdi_mounts,
+    /// ... and, once they are in place, the image's own `ldconfig` over the directories the
+    /// spec's `update-ldcache` hook names. Tolerant: an image without one gets W0208.
+    run_ldconfig,
+    make_shm_dir,
+    mount_shm,
+    make_pts_dir,
+    mount_pts,
+    link_dev,
+    /// The host's /sys bound read-only (the M4 decision, until M5's network namespace gives the
+    /// container a sysfs of its own). All three are tolerant: a root file system that cannot take
+    /// the directory, or a host that will not bind it, gives a container without /sys, with a
+    /// note.
+    make_sys_dir,
+    bind_sys,
+    remount_sys,
+    /// In a plan with a network namespace of its own: brings `lo` up. Before the capabilities
+    /// are restricted, since changing an interface needs CAP_NET_ADMIN.
+    bring_up_loopback,
+    /// In a plan with a listener, right after: makes the TCP listener on the loopback
+    /// (`Host.listen_loopback`), then sends it to the parent over the channel and closes the
+    /// child's copies. After this the workload could never hold it: the child never `exec`s
+    /// with it open, and it is close-on-exec besides.
+    make_listener,
+    send_listener,
+    /// ... and there a sysfs of the container's own replaces the three /sys steps above but
+    /// the first. A sysfs shows the devices of the network namespace it is mounted in.
+    mount_sysfs,
+    /// ... and, in a plan with a scope (M2b), a read-only cgroup2 on `<rootfs>/sys/fs/cgroup`,
+    /// on top of either /sys: the container's own cgroup, seen from the namespace
+    /// `unshare_cgroup` made. Not tolerant (E0323), but not tried when /sys is missing (a /sys
+    /// step failed with its note): no /sys, no view, as before.
+    mount_cgroup,
+    /// The generated /etc files (`netfiles.zig`). Their mount points are made first, where the
+    /// image's own tree is not written: in the overlay's extra lower layer for a tree from the
+    /// store, in the rootfs for a directory. The text is staged in a hidden file of the
+    /// container's /dev, bound read-only over the mount point, and the staged name removed so
+    /// that only the bound file is left. All are tolerant, a file at a time.
+    make_etc_dir,
+    create_etc_file,
+    stage_etc_file,
+    bind_etc_file,
+    remount_etc_file,
+    unstage_etc_file,
+    /// The state volumes (`is_state`): before the new root is entered...
+    make_state_data,
+    make_state_stage,
+    bind_state,
+    /// (only for `:ro`)
+    remount_state,
+    /// ... and after.
+    make_state_target,
+    move_state,
+    remove_state_stage,
+    /// The other mounts (`is_mount`): before the new root is entered, the hidden directory or
+    /// file in /dev (a secret's is written by `copy_secret`), the bind, and the read-only
+    /// remount (of the tree, for a directory) ...
+    make_mount_stage_dir,
+    make_mount_stage_file,
+    copy_secret,
+    bind_mount_dir,
+    bind_mount_file,
+    remount_mount,
+    remount_mount_tree,
+    /// ... and after: the target, the move, the hidden name removed; or for a tmpfs the target
+    /// and the mount.
+    make_mount_target_dir,
+    make_mount_target_file,
+    move_mount,
+    remove_mount_stage_dir,
+    remove_mount_stage_file,
+    mount_user_tmpfs,
+    /// Only in a plan with a working directory: makes it (and its parents) if the image lacks
+    /// it, and goes there. After the new root is entered.
+    enter_workdir,
+    /// Only in a read-only plan: scratch space on tmpfs, then the rootfs itself read-only.
+    make_tmp_dir,
+    mount_tmp,
+    make_run_dir,
+    mount_run,
+    remount_readonly,
+    enter_rootfs,
+    pivot_root,
+    detach_old_root,
+    enter_new_root,
+    seal_descriptors,
+    /// The sysctls of `--sysctl` (M2b), one step each (`Step.index` is its place in the list):
+    /// the value written to `/proc/sys/<key>` beneath the container's own /proc, once it is the
+    /// root. Before the capabilities are restricted: a namespaced sysctl needs CAP_NET_ADMIN or
+    /// CAP_SYS_ADMIN over the namespace's user namespace, which the child holds until then.
+    write_sysctl,
+    /// The resource limits of `--ulimit` (M2b), one step per resource set (`Step.index` is the
+    /// `knobs.Resource`): after the mounts, before the capabilities and the filter.
+    set_rlimit,
+    /// The hardening, in the order the kernel needs it: capabilities first (dropping the bounding
+    /// set needs CAP_SETPCAP), then `no_new_privs` (a filter needs it once CAP_SYS_ADMIN is
+    /// gone), and the filter last, so that it is the last thing the child does but `execve`.
+    restrict_capabilities,
+    clear_ambient,
+    /// Only in a plan for an image that runs as a user: becomes that user and group, after the
+    /// capabilities are restricted (so the bounding set is already as it will stay) and before
+    /// the filter.
+    set_user,
+    /// After `set_user`: asks again to die with zbx (a change of credentials clears the request),
+    /// then ends the child at once if zbx is already gone (no reader left on the report pipe).
+    rearm_death_signal,
+    set_no_new_privs,
+    install_seccomp,
+    exec,
+};
+
+pub fn side_of(kind: Kind) Side {
+    const side: Side = switch (kind) {
+        .make_pipes, .spawn, .deny_setgroups, .write_gid_map, .write_uid_map => .parent,
+        .run_newuidmap, .run_newgidmap, .spawn_keeper, .start_scope => .parent,
+        .start_pasta, .await_pasta => .parent,
+        .release_child, .serve_fuse, .await_report, .receive_listener, .reap => .parent,
+        else => .child,
+    };
+    // The kinds are declared parent first, so the order of the enum says which side a kind is.
+    assert((side == .parent) == (@backingInt(kind) <= @backingInt(Kind.reap)));
+    return side;
+}
+
+/// The devices bound from the host into the container's `/dev`.
+pub const devices = [constants.container_devices_count][]const u8{
+    "null", "zero", "full", "random", "urandom", "tty",
+};
+
+pub const Link = struct {
+    name: []const u8,
+    target: []const u8,
+};
+
+/// The symlinks of the container's `/dev`. `ptmx` points into the private devpts.
+pub const links = [constants.container_links_count]Link{
+    .{ .name = "fd", .target = "/proc/self/fd" },
+    .{ .name = "stdin", .target = "/proc/self/fd/0" },
+    .{ .name = "stdout", .target = "/proc/self/fd/1" },
+    .{ .name = "stderr", .target = "/proc/self/fd/2" },
+    .{ .name = "ptmx", .target = "pts/ptmx" },
+};
+
+/// The child's steps: forty-one that happen once (four of them the hardening, three the /sys
+/// or the loopback and the sysfs, fifteen the /etc files), and two per device and one per link. A
+/// read-only plan has `read_only_steps_count` more, one with a working directory, two with a
+/// user (the user and the death signal asked for again). A plan with a network namespace of its
+/// own has one /sys step fewer and the loopback.
+pub const child_steps_count: u32 = 41 + 2 * constants.container_devices_count +
+    constants.container_links_count;
+
+/// The steps a listener adds: making it and sending it in the child, receiving it in the parent.
+pub const listener_steps_count: u32 = 3;
+
+/// The steps a lazy plan adds: mounting and sending in the child, serving in the parent.
+pub const lazy_steps_count: u32 = 3;
+
+/// The steps a scope adds to the parent's: the keeper and the scope itself.
+pub const scope_steps_count: u32 = 2;
+
+/// The steps a scope adds to the child's: the cgroup namespace and the cgroup2 view (M2b).
+pub const cgroup_view_steps_count: u32 = 2;
+
+/// The steps `--net user` adds to the parent's: pasta's start and the wait for it to be ready.
+pub const pasta_steps_count: u32 = 2;
+
+/// The steps a read-only rootfs adds: `/tmp` and `/run` on tmpfs, and the remount.
+pub const read_only_steps_count: u32 = 5;
+
+/// The one step more a read-only plan has: the hostname's bind is not under the rootfs's
+/// non-recursive remount, so it is made read-only of its own (#117).
+pub const read_only_hostname_steps_count: u32 = 1;
+
+/// The steps each state volume adds, and the one more of a `:ro` volume (`is_state`).
+pub const state_steps_count: u32 = 6;
+pub const state_read_only_steps_count: u32 = 1;
+
+/// The steps each `--device` adds: its mount point and its bind (`create_user_device`,
+/// `bind_user_device`).
+pub const user_device_steps_count: u32 = 2;
+
+/// The steps CDI devices add at most: the nodes, the stage and the move of the mounts, ldconfig.
+pub const cdi_steps_count_max: u32 = 4;
+
+/// The hidden name in /dev a CDI mount is staged at, followed by the mount's index in decimal.
+pub const cdi_stage_prefix = "/dev/.zbx-cdi-";
+
+/// The hidden name in the container's /dev a volume is bound at before it is moved to its target,
+/// followed by the volume's index.
+pub const state_stage_prefix = "/dev/.zbx-state-";
+
+/// The hidden name in /dev an other mount is staged at: `constants.mount_stage_prefix` and the
+/// mount's index. The steps each shape of mount adds: a tmpfs two, the others six.
+pub const mount_steps_tmpfs: u32 = 2;
+pub const mount_steps_staged: u32 = 6;
+/// A writable mount has no read-only remount: the stage, the bind, and after the new root the
+/// target, the move and the removal of the stage.
+pub const mount_steps_writable: u32 = 5;
+
+/// Steps of a plan with the single-id map: the parent has eight (it denies setgroups and
+/// writes both maps itself), the child has `child_steps_count`.
+pub const steps_count_single: u32 = 8 + child_steps_count;
+
+/// Steps of a plan that uses the helpers: the parent has seven (one step per helper). A plan with
+/// a scope has two more (the keeper and the scope), whichever map it uses.
+pub const steps_count_full: u32 = 7 + child_steps_count;
+
+/// How the container's ids are mapped to the host's.
+pub const Mapping = union(enum) {
+    /// Only the container's root, to the user's own id. Written directly, with setgroups denied.
+    single,
+    /// Root to the user's own id, and ids 1 to 65536 to a range of subordinate ids, written by
+    /// the setuid helpers.
+    full: Helpers,
+};
+
+pub const Helpers = struct {
+    /// Paths of `newuidmap` and `newgidmap`.
+    newuidmap: []const u8,
+    newgidmap: []const u8,
+    /// The first subordinate id of the range for users and for groups.
+    uid_start: u32,
+    gid_start: u32,
+};
+
+/// A string stored in the plan's text area. NUL-terminated there, `len` without the NUL.
+pub const Text = struct {
+    offset: u32,
+    len: u32,
+};
+
+pub const Step = struct {
+    kind: Kind,
+    /// The step's main text: a path, or for the map steps the bytes to write.
+    target: Text,
+    /// A second text: the source of a bind, the destination of a link.
+    source: Text,
+    /// Which device or link the step is about.
+    index: u8,
+    /// A failure of this step is noted and the run goes on (the devpts mount).
+    tolerant: bool,
+};
+
+/// What a scoped run needs from the user's systemd manager: the version it reported (which
+/// decides unit property or cgroupfs file for each limit) and the limits.
+pub const ScopeInput = struct {
+    version: u32,
+    limits: spec.Limits,
+};
+
+pub const User = spec.User;
+
+pub const Input = struct {
+    rootfs: []const u8,
+    name: []const u8,
+    command: []const []const u8,
+    term: ?[]const u8,
+    /// The user and group ids of zbx itself, the ones the container's root maps to.
+    uid: u32,
+    gid: u32,
+    mapping: Mapping,
+    /// Null: no scope, as in M1 (no `start_scope` step, and no limits).
+    scope: ?ScopeInput = null,
+    /// The rootfs is remounted read-only, with tmpfs at `/tmp` and `/run`.
+    read_only: bool = false,
+    /// Added to the container's environment, replacing a default of the same name.
+    env: []const spec.Label = &.{},
+    /// The directory the command starts in; made if the image lacks it. Empty: the root.
+    workdir: []const u8 = "",
+    /// The user and group the command runs as; null (or 0 and 0) leaves it root.
+    user: ?User = null,
+    /// Set for a run of a tree from the store: `rootfs` is then the empty directory the overlay
+    /// is mounted on, and the layers are these.
+    overlay: ?Overlay = null,
+    /// What the container can reach.
+    network: spec.Network = .none,
+    /// The host's `resolv.conf`, whole lines within `etc_file_bytes_max`; read for `--net host`.
+    host_resolv: []const u8 = "",
+    /// The caller's file bound read-only at /etc/hosts (ZB-6); empty: the generated one. Only
+    /// with `network` `none`; the caller has looked at it (`run.check_hosts_file`).
+    hosts_file: []const u8 = "",
+    /// Set exactly when `network` is `user`: how pasta is started.
+    pasta: ?PastaInput = null,
+    /// The state volumes, in the order given (`spec.zig`'s `state` rules hold for them).
+    state: []const StateInput = &.{},
+    /// The other mounts, in the order given, each already looked at (`mounts.resolve`).
+    mounts: []const MountInput = &.{},
+    /// The paths of the host devices bound at the same path in the container (`--device`),
+    /// each already looked at (`devices.resolve`); at most `constants.run_devices_max`.
+    devices: []const []const u8 = &.{},
+    /// What the CDI devices of the run resolved to (`cdi.Resolved`, owned by the caller, which
+    /// keeps it alive and in place until the run has ended: the child reads it after `fork`).
+    cdi: ?*const cdi_mod.Resolved = null,
+    /// The run asked for a device by path or by CDI name: the user's groups carry over.
+    keep_groups: bool = false,
+    /// The hostname, when it is not the name (a build step's, M7).
+    hostname: ?[]const u8 = null,
+    /// The file mode creation mask the command starts with; null leaves the caller's.
+    umask: ?u16 = null,
+    /// The size of the container's `/dev/shm` (`--shm-size`), at least `shm_bytes_min`.
+    shm_bytes: u64 = constants.shm_bytes_default,
+    /// The resource limits set in the child (`--ulimit`); a null one is inherited.
+    rlimits: knobs.Rlimits = .{},
+    /// The sysctls written in the child (`--sysctl`), each a key of the allowlist; `net` keys only
+    /// with a network namespace of the container's own (`knobs.list_problem` passed).
+    sysctls: []const knobs.Sysctl = &.{},
+    /// The port of the TCP listener on the container's loopback that is handed to the caller
+    /// (`--listen`, M8b); only with `network` `none`.
+    listen: ?u16 = null,
+    /// The overlay's lower layer is a FUSE mount served by the parent (`--lazy`, S2) rather than
+    /// the tree's materialized farm; only with `overlay`.
+    lazy: bool = false,
+
+    fn hostname_text(input: *const Input) []const u8 {
+        const result = input.hostname orelse input.name;
+        assert(result.len > 0);
+        assert(spec.name_problem(result) == null);
+        return result;
+    }
+};
+
+/// What a mount is, once the host has been looked at: a bind of a directory or of a file are
+/// two different sequences of steps.
+pub const MountShape = enum {
+    tmpfs,
+    bind_dir,
+    bind_file,
+    secret,
+    /// `--mount` (M6b): a bind that stays writable, of a directory or of a file.
+    mount_dir,
+    mount_file,
+};
+
+/// One other mount as the plan needs it. `source` is the host path (empty for a tmpfs).
+pub const MountInput = struct {
+    shape: MountShape,
+    source: []const u8,
+    target: []const u8,
+    size_bytes: u64,
+};
+
+/// The flag, source and target of a mount, as a plan keeps them for its diagnostics.
+pub const MountNames = struct { shape: MountShape, source: []const u8, target: []const u8 };
+
+/// One state volume as the plan needs it: the host's directory that holds its files (already
+/// made by the parent up to its parent: the child makes `data` itself), where it goes in the
+/// container, and whether read-only. `name` is for the diagnostics.
+/// A volume's name and target, as a plan keeps them for its diagnostics.
+pub const StateNames = struct { name: []const u8, target: []const u8 };
+
+pub const StateInput = struct {
+    name: []const u8,
+    data: []const u8,
+    target: []const u8,
+    read_only: bool,
+};
+
+/// What the parent needs to start pasta: its path, the file its standard error goes to (empty:
+/// nowhere, when the run has no state directory), and the forwards.
+pub const PastaInput = struct {
+    path: []const u8,
+    log: []const u8,
+    publish: []const spec.Publish,
+};
+
+/// The layers of an overlay (docs/briefs/M3-store.md, "Materialize and run"). The lower layer
+/// is the tree's materialized directory and is never written: a container's writes go to the
+/// upper layer by copy-up. A read-only run has no upper layer (and no work directory); the
+/// kernel wants two lower layers then, so the second is an empty directory.
+pub const Overlay = struct {
+    /// The topmost lower layer: a directory of zbx's own with the mount points of the generated
+    /// /etc files, so that the image's tree and the upper layer (which a commit reads) are not
+    /// written for them.
+    net: []const u8,
+    lower: []const u8,
+    upper: ?[]const u8,
+    work: ?[]const u8,
+    /// An empty directory; set exactly when there is no upper layer.
+    empty: ?[]const u8,
+};
+
+const empty_text: Text = .{ .offset = 0, .len = 0 };
+
+/// The longest `/dev/shm` mount data: "mode=1777,size=" and a u64 in decimal.
+pub const shm_data_bytes_max: u32 = constants.shm_data_bytes_max;
+
+pub const Plan = struct {
+    steps: [constants.plan_steps_max]Step,
+    count: u32,
+    /// Whether the ids are mapped through the helpers (`Mapping.full`).
+    full: bool,
+    /// Whether the rootfs is remounted read-only.
+    read_only: bool,
+    /// Whether the rootfs is an overlay of a tree from the store.
+    overlay: bool,
+    /// Whether the command starts in a working directory, and whether it runs as a user.
+    has_workdir: bool,
+    workdir: Text,
+    /// The container's hostname: its name, unless the input gave another.
+    hostname_ref: Text,
+    /// Whether the child sets the file mode creation mask, and to what.
+    has_umask: bool,
+    umask: u16,
+    has_user: bool,
+    user_uid: u32,
+    user_gid: u32,
+    /// Whether the plan has a `start_scope` step, and what it is made with.
+    scoped: bool,
+    scope_name: Text,
+    scope_description: Text,
+    scope_version: u32,
+    scope_limits: spec.Limits,
+    /// What the container can reach, and the text of the three generated /etc files.
+    network: spec.Network,
+    /// The `/dev/shm` tmpfs's mount data: its mode and its size in bytes.
+    shm_data: Text,
+    /// The resource limits the child sets, one `set_rlimit` step each; a null one is inherited.
+    rlimits: knobs.Rlimits,
+    /// The sysctls the child writes, one `write_sysctl` step each (path in `target`, value in
+    /// `source`).
+    sysctl_count: u32,
+    etc_texts: [3]Text,
+    /// A plan with `--net user` starts pasta: its path, its log (empty: none) and the forwards.
+    has_pasta: bool,
+    pasta_path: Text,
+    pasta_log: Text,
+    publish: [constants.publish_count_max]spec.Publish,
+    publish_count: u32,
+    /// A plan with a listener: its port (zero: none).
+    has_listener: bool,
+    listen_port: u16,
+    /// A lazy plan: the overlay's lower layer is a FUSE mount the parent serves.
+    lazy: bool,
+    /// The state volumes: how many, how many of them read-only, and each one's name and target.
+    state_count: u32,
+    state_read_only_count: u32,
+    state_names: [constants.state_volumes_max]Text,
+    state_targets: [constants.state_volumes_max]Text,
+    /// The other mounts: how many, the steps they add, and each one's shape, source and target.
+    mount_count: u32,
+    mount_steps: u32,
+    /// Whether the caller's hosts file is bound at /etc/hosts (ZB-6), and its host path.
+    hosts_file: bool,
+    hosts_path: Text,
+    mount_shapes: [constants.mounts_max]MountShape,
+    mount_sources: [constants.mounts_max]Text,
+    mount_targets: [constants.mounts_max]Text,
+    /// The host devices of the run: how many, and each one's path.
+    device_count: u32,
+    device_paths: [constants.run_devices_max]Text,
+    /// Whether the command's user keeps the supplementary groups of zbx (any device asked for).
+    keep_groups: bool,
+    /// The CDI devices' resolved items, or null: how many nodes, mounts and ldcache directories
+    /// the steps loop over, and the rootfs the node and stage paths are below.
+    cdi: ?*const cdi_mod.Resolved,
+    /// What it holds, kept apart: the steps are counted from these after `cdi` is not valid.
+    cdi_nodes: u32,
+    cdi_mounts: u32,
+    cdi_dirs: u32,
+    cdi_rootfs: Text,
+    /// `LD_LIBRARY_PATH=...` for an image whose library cache cannot be updated (empty: none),
+    /// and whether it replaces an entry of the environment of that name.
+    ld_library_path: Text,
+    paths: [constants.plan_paths_bytes_max]u8,
+    paths_len: u32,
+    name: Text,
+    /// Where the command is looked for: its own path if it has a slash, else one path per
+    /// directory of the container's PATH.
+    candidates: [constants.candidates_max]Text,
+    candidates_count: u32,
+    strings: [constants.exec_strings_bytes_max]u8,
+    strings_len: u32,
+    argv: [constants.command_words_count_max + 1]?[*:0]const u8,
+    envp: [envp_count_max]?[*:0]const u8,
+
+    /// Builds the plan in place. The input must have passed the checks in `spec.zig`.
+    pub fn build(plan: *Plan, input: *const Input) void {
+        assert(spec.rootfs_problem(input.rootfs) == null);
+        assert(spec.name_problem(input.name) == null);
+        assert(spec.command_problem(input.command) == null);
+        assert(spec.env_problem(input.env, input.command) == null);
+        plan.count = 0;
+        plan.full = input.mapping == .full;
+        plan.scoped = input.scope != null;
+        plan.read_only = input.read_only;
+        plan.overlay = input.overlay != null;
+        plan.network = input.network;
+        plan.has_listener = input.listen != null;
+        plan.listen_port = input.listen orelse 0;
+        plan.hosts_file = input.hosts_file.len > 0;
+        if (plan.hosts_file) assert(input.network == .none);
+        if (plan.has_listener) assert(input.network == .none);
+        if (plan.has_listener) assert(plan.listen_port > 0);
+        plan.lazy = input.lazy;
+        if (plan.lazy) assert(input.overlay != null);
+        plan.has_workdir = input.workdir.len > 0;
+        plan.has_umask = input.umask != null;
+        plan.umask = input.umask orelse 0;
+        if (plan.has_umask) assert(plan.umask <= 0o777);
+        plan.has_user = if (input.user) |user| user.uid != 0 or user.gid != 0 else false;
+        plan.user_uid = if (input.user) |user| user.uid else 0;
+        plan.user_gid = if (input.user) |user| user.gid else 0;
+        plan.rlimits = input.rlimits;
+        assert(plan.rlimits.problem() == null);
+        plan.sysctl_count = @intCast(input.sysctls.len);
+        assert(plan.sysctl_count <= constants.sysctls_max);
+        assert(knobs.list_problem(input.sysctls, input.network.isolated()) == null);
+        assert(input.shm_bytes >= constants.shm_bytes_min);
+        plan.paths_len = 0;
+        plan.strings_len = 0;
+        plan.candidates_count = 0;
+        // Offset 0 is the empty text, so a step with nothing to say has a valid reference.
+        assert(plan.add_text(&.{""}).offset == 0);
+        plan.hosts_path = if (plan.hosts_file) plan.add_text(&.{input.hosts_file}) else empty_text;
+        plan.name = plan.add_text(&.{input.name});
+        plan.hostname_ref = plan.add_text(&.{input.hostname_text()});
+        plan.workdir = plan.add_text(&.{input.workdir});
+        plan.shm_data = plan.add_shm_data(input.shm_bytes);
+        plan.build_etc_texts(input);
+        plan.build_scope(input);
+        plan.build_pasta(input);
+        plan.build_state(input);
+        plan.build_mounts(input);
+        plan.build_devices(input);
+        plan.build_cdi(input);
+        plan.build_exec_image(input);
+        plan.push_parent_start(input);
+        assert(plan.count == plan.first_child());
+        plan.push_child_steps(input);
+        if (plan.lazy) plan.push(.serve_fuse, empty_text, empty_text, 0);
+        plan.push(.await_report, empty_text, empty_text, 0);
+        if (plan.has_listener) plan.push(.receive_listener, empty_text, empty_text, 0);
+        plan.push(.reap, empty_text, empty_text, 0);
+        assert(plan.count == plan.steps_expected());
+        plan.check();
+    }
+
+    /// Structural invariants of a built plan, also checked by the tests and the fuzzer.
+    pub fn check(plan: *const Plan) void {
+        assert(plan.count == plan.steps_expected());
+        assert(plan.count <= constants.plan_steps_max);
+        assert(plan.steps[0].kind == .make_pipes);
+        assert(plan.steps[1].kind == .spawn);
+        assert(plan.steps[plan.count - 1].kind == .reap);
+        const tail = plan.tail_count();
+        const lazy: u32 = @intFromBool(plan.lazy);
+        assert((plan.steps[plan.count - tail].kind == .serve_fuse) == plan.lazy);
+        assert(plan.steps[plan.count - tail + lazy].kind == .await_report);
+        assert((plan.steps[plan.count - 2].kind == .receive_listener) == plan.has_listener);
+        // The child's steps are one contiguous run, between `release_child` and `await_report`.
+        const child_start = plan.first_child();
+        assert(plan.steps[child_start - 1].kind == .release_child);
+        assert((plan.steps[child_start - 2].kind == .start_scope) == plan.scoped);
+        assert((plan.steps[child_start - 3].kind == .spawn_keeper) == plan.scoped);
+        for (plan.steps[0..child_start]) |step| assert(side_of(step.kind) == .parent);
+        for (plan.steps[child_start .. plan.count - tail]) |step| {
+            assert(side_of(step.kind) == .child);
+        }
+        assert(plan.steps[plan.count - tail - 1].kind == .exec);
+        // The exec image points into the plan itself: a copy of the plan would break it.
+        const first_argument = plan.argv[0].?;
+        assert(@intFromPtr(first_argument) >= @intFromPtr(&plan.strings[0]));
+        assert(@intFromPtr(first_argument) < @intFromPtr(&plan.strings[0]) + plan.strings.len);
+        assert(plan.candidates_count > 0);
+        // pasta's two steps are the last of the parent's start before the scope's, exactly in
+        // a plan for `--net user`.
+        assert(plan.has_pasta == (plan.network == .user));
+        const pasta_at = child_start - 1 - scope_steps_count * @intFromBool(plan.scoped);
+        assert((plan.steps[pasta_at - 1].kind == .await_pasta) == plan.has_pasta);
+        assert((plan.steps[pasta_at - 2].kind == .start_pasta) == plan.has_pasta);
+        if (!plan.has_pasta) assert(plan.publish_count == 0);
+    }
+
+    /// The parent's steps after the child's: `await_report` and `reap`, the listener's, and
+    /// `serve_fuse` in a lazy plan.
+    pub fn tail_count(plan: *const Plan) u32 {
+        return 2 + @as(u32, @intFromBool(plan.has_listener)) + @intFromBool(plan.lazy);
+    }
+
+    pub fn steps_expected(plan: *const Plan) u32 {
+        assert(plan.count <= constants.plan_steps_max);
+        const base = if (plan.full) steps_count_full else steps_count_single;
+        const read_only: u32 = if (plan.read_only)
+            read_only_steps_count + read_only_hostname_steps_count
+        else
+            0;
+        const extras: u32 = @as(u32, @intFromBool(plan.has_workdir)) +
+            2 * @as(u32, @intFromBool(plan.has_user)) + @as(u32, @intFromBool(plan.has_umask));
+        const pasta = pasta_steps_count * @as(u32, @intFromBool(plan.has_pasta));
+        const state = state_steps_count * plan.state_count +
+            state_read_only_steps_count * plan.state_read_only_count;
+        const listener = listener_steps_count * @as(u32, @intFromBool(plan.has_listener));
+        const lazy = lazy_steps_count * @as(u32, @intFromBool(plan.lazy));
+        const scope = (scope_steps_count + cgroup_view_steps_count) * @intFromBool(plan.scoped);
+        const given_hosts: u32 = if (plan.hosts_file) 2 else 0; // The hosts file's stage/unstage.
+        const user_devices = user_device_steps_count * plan.device_count;
+        return plan.cdi_steps() + base + scope + read_only + extras + pasta + state +
+            plan.mount_steps + listener + user_devices + lazy + plan.knob_steps() - given_hosts;
+    }
+
+    /// The steps the CDI devices add: the nodes (one), the mounts (two), ldconfig (one).
+    pub fn cdi_steps(plan: *const Plan) u32 {
+        const nodes: u32 = @intFromBool(plan.cdi_nodes > 0);
+        const mounts: u32 = 2 * @as(u32, @intFromBool(plan.cdi_mounts > 0));
+        const ldconfig: u32 = @intFromBool(plan.cdi_dirs > 0);
+        const total = nodes + mounts + ldconfig;
+        assert(total <= cdi_steps_count_max);
+        return total;
+    }
+
+    /// The index of the first of the child's steps: after the parent's start, which ends with
+    /// `release_child`.
+    pub fn first_child(plan: *const Plan) u32 {
+        assert(plan.count <= constants.plan_steps_max);
+        const parent: u32 = if (plan.full) 5 else 6;
+        const pasta = pasta_steps_count * @as(u32, @intFromBool(plan.has_pasta));
+        return parent + scope_steps_count * @intFromBool(plan.scoped) + pasta;
+    }
+
+    /// Whether the container has a network namespace of its own.
+    /// Whether the plan hands descriptors over the channel: a listener, a FUSE descriptor, or
+    /// both (the FUSE descriptor first).
+    pub fn has_channel(plan: *const Plan) bool {
+        return plan.has_listener or plan.lazy;
+    }
+
+    pub fn isolated(plan: *const Plan) bool {
+        assert(plan.count <= constants.plan_steps_max);
+        const result = plan.network.isolated();
+        if (!result) assert(plan.network == .host);
+        if (plan.has_pasta) assert(result);
+        return result;
+    }
+
+    pub fn publish_slice(plan: *const Plan) []const spec.Publish {
+        assert(plan.publish_count <= constants.publish_count_max);
+        if (plan.publish_count > 0) assert(plan.has_pasta);
+        return plan.publish[0..plan.publish_count];
+    }
+
+    fn build_pasta(plan: *Plan, input: *const Input) void {
+        plan.has_pasta = input.pasta != null;
+        plan.pasta_path = empty_text;
+        plan.pasta_log = empty_text;
+        plan.publish_count = 0;
+        assert(plan.has_pasta == (input.network == .user));
+        const pasta = input.pasta orelse return;
+        assert(pasta.path.len > 0);
+        assert(pasta.path[0] == '/');
+        assert(spec.publish_problem(.user, pasta.publish) == null);
+        plan.pasta_path = plan.add_text(&.{pasta.path});
+        plan.pasta_log = plan.add_text(&.{pasta.log});
+        @memcpy(plan.publish[0..pasta.publish.len], pasta.publish);
+        plan.publish_count = @intCast(pasta.publish.len);
+    }
+
+    fn build_state(plan: *Plan, input: *const Input) void {
+        assert(input.state.len <= constants.state_volumes_max);
+        plan.state_count = @intCast(input.state.len);
+        plan.state_read_only_count = 0;
+        for (input.state, 0..) |volume, index| {
+            assert(volume.data.len > 0);
+            assert(volume.data[0] == '/');
+            assert(volume.target.len > 1);
+            assert(volume.target[0] == '/');
+            plan.state_names[index] = plan.add_text(&.{volume.name});
+            plan.state_targets[index] = plan.add_text(&.{volume.target});
+            plan.state_read_only_count += @intFromBool(volume.read_only);
+        }
+        assert(plan.state_read_only_count <= plan.state_count);
+    }
+
+    /// The name and target of the volume a state step acts on, for a diagnostic.
+    pub fn state_of(plan: *const Plan, step: *const Step) StateNames {
+        assert(is_state(step.kind));
+        assert(step.index < plan.state_count);
+        return .{
+            .name = plan.text(plan.state_names[step.index]),
+            .target = plan.text(plan.state_targets[step.index]),
+        };
+    }
+
+    fn build_mounts(plan: *Plan, input: *const Input) void {
+        assert(input.mounts.len <= constants.mounts_max);
+        plan.mount_count = @intCast(input.mounts.len);
+        plan.mount_steps = 0;
+        for (input.mounts, 0..) |mount, index| {
+            assert(mount.target.len > 1);
+            assert(mount.target[0] == '/');
+            assert((mount.shape == .tmpfs) == (mount.source.len == 0));
+            if (mount.shape != .tmpfs) assert(mount.source[0] == '/');
+            if (mount.shape == .tmpfs) assert(mount.size_bytes >= constants.tmpfs_mount_bytes_min);
+            plan.mount_shapes[index] = mount.shape;
+            plan.mount_sources[index] = plan.add_text(&.{mount.source});
+            plan.mount_targets[index] = plan.add_text(&.{mount.target});
+            const steps: u32 = switch (mount.shape) {
+                .tmpfs => mount_steps_tmpfs,
+                .mount_dir, .mount_file => mount_steps_writable,
+                .bind_dir, .bind_file, .secret => mount_steps_staged,
+            };
+            plan.mount_steps += steps;
+        }
+        assert(plan.mount_steps <= constants.mounts_max * mount_steps_staged);
+    }
+
+    fn build_devices(plan: *Plan, input: *const Input) void {
+        assert(input.devices.len <= constants.run_devices_max);
+        plan.device_count = @intCast(input.devices.len);
+        for (input.devices, 0..) |path, index| {
+            assert(std.mem.startsWith(u8, path, "/dev/"));
+            assert(path.len <= constants.device_path_bytes_max);
+            plan.device_paths[index] = plan.add_text(&.{path});
+        }
+    }
+
+    /// What the CDI steps loop over (null: no CDI device in the run), and what a tolerant
+    /// `run_ldconfig` leaves for the exec: the `LD_LIBRARY_PATH` entry.
+    fn build_cdi(plan: *Plan, input: *const Input) void {
+        assert(input.devices.len <= constants.run_devices_max);
+        assert(plan.count <= constants.plan_steps_max);
+        plan.keep_groups = input.keep_groups or input.devices.len > 0;
+        plan.cdi = null;
+        plan.cdi_nodes = 0;
+        plan.cdi_mounts = 0;
+        plan.cdi_dirs = 0;
+        plan.cdi_rootfs = empty_text;
+        plan.ld_library_path = empty_text;
+        const resolved = input.cdi orelse return;
+        if (resolved.is_empty()) return;
+        plan.keep_groups = true;
+        plan.cdi = resolved;
+        plan.cdi_nodes = resolved.nodes_count;
+        plan.cdi_mounts = resolved.mounts_count;
+        plan.cdi_dirs = resolved.dirs_count;
+        plan.cdi_rootfs = plan.add_text(&.{input.rootfs});
+        if (resolved.dirs_count == 0) return;
+        var line: [ld_line_bytes_max]u8 = undefined;
+        var at: usize = 0;
+        const head = "LD_LIBRARY_PATH=";
+        @memcpy(line[0..head.len], head);
+        at += head.len;
+        for (resolved.dirs[0..resolved.dirs_count], 0..) |dir, index| {
+            if (index > 0) {
+                line[at] = ':';
+                at += 1;
+            }
+            const text_of_dir = resolved.text(dir);
+            @memcpy(line[at..][0..text_of_dir.len], text_of_dir);
+            at += text_of_dir.len;
+        }
+        plan.ld_library_path = plan.add_text(&.{line[0..at]});
+    }
+
+    /// The host path of the device a device step acts on, for a diagnostic.
+    pub fn device_of(plan: *const Plan, step: *const Step) []const u8 {
+        const is_device_step = step.kind == .create_user_device or step.kind == .bind_user_device;
+        assert(is_device_step);
+        assert(step.index < plan.device_count);
+        return plan.text(plan.device_paths[step.index]);
+    }
+
+    /// The shape, source and target of the mount an other-mount step acts on, for a diagnostic.
+    pub fn mount_of(plan: *const Plan, step: *const Step) MountNames {
+        assert(is_mount(step.kind));
+        assert(step.index < plan.mount_count);
+        return .{
+            .shape = plan.mount_shapes[step.index],
+            .source = plan.text(plan.mount_sources[step.index]),
+            .target = plan.text(plan.mount_targets[step.index]),
+        };
+    }
+
+    fn build_etc_texts(plan: *Plan, input: *const Input) void {
+        var buffer: netfiles.Buffer = undefined;
+        plan.etc_texts[0] = plan.add_text(&.{netfiles.hosts(&buffer, input.hostname_text())});
+        const resolv = netfiles.resolv_conf(input.network, input.host_resolv);
+        plan.etc_texts[1] = plan.add_text(&.{resolv});
+        plan.etc_texts[2] = plan.add_text(&.{netfiles.hostname(&buffer, input.hostname_text())});
+        assert(plan.etc_texts[0].len > 0);
+        assert(plan.etc_texts[1].len > 0);
+        assert(plan.etc_texts[2].len > 0);
+    }
+
+    /// The unit name and description of a scoped plan: "zbx-<name>.scope" and "zbx: <name>".
+    fn build_scope(plan: *Plan, input: *const Input) void {
+        plan.scope_name = empty_text;
+        plan.scope_description = empty_text;
+        plan.scope_version = 0;
+        plan.scope_limits = .{};
+        const scope = input.scope orelse return;
+        assert(scope.version > 0);
+        assert(spec.limits_problem(scope.limits) == null);
+        const parts = [_][]const u8{ constants.scope_prefix, input.name, constants.scope_suffix };
+        plan.scope_name = plan.add_text(&parts);
+        plan.scope_description = plan.add_text(&.{ "zbx: ", input.name });
+        plan.scope_version = scope.version;
+        plan.scope_limits = scope.limits;
+        assert(plan.text(plan.scope_name).len <= constants.scope_name_bytes_max);
+    }
+
+    pub fn text(plan: *const Plan, ref: Text) [:0]const u8 {
+        assert(ref.offset + ref.len < plan.paths_len);
+        assert(plan.paths[ref.offset + ref.len] == 0);
+        return plan.paths[ref.offset..][0..ref.len :0];
+    }
+
+    pub fn hostname(plan: *const Plan) []const u8 {
+        const name = plan.text(plan.hostname_ref);
+        assert(name.len > 0);
+        assert(name.len <= constants.container_name_bytes_max);
+        return name;
+    }
+
+    pub fn candidate_slice(plan: *const Plan) []const Text {
+        assert(plan.candidates_count > 0);
+        assert(plan.candidates_count <= plan.candidates.len);
+        return plan.candidates[0..plan.candidates_count];
+    }
+
+    /// Appends the parts as one NUL-terminated text. There is always room: the inputs are
+    /// bounded by `spec.zig` and the arena by a comptime relationship in `constants.zig`.
+    fn add_text(plan: *Plan, parts: []const []const u8) Text {
+        var length: u32 = 0;
+        for (parts) |part| length += @intCast(part.len);
+        assert(plan.paths_len + length + 1 <= plan.paths.len);
+        const offset = plan.paths_len;
+        var at = offset;
+        for (parts) |part| {
+            @memcpy(plan.paths[at..][0..part.len], part);
+            at += @intCast(part.len);
+        }
+        plan.paths[at] = 0;
+        plan.paths_len = at + 1;
+        assert(at - offset == length);
+        return .{ .offset = offset, .len = length };
+    }
+
+    fn push(plan: *Plan, kind: Kind, target: Text, source: Text, index: u8) void {
+        assert(plan.count < constants.plan_steps_max);
+        assert(target.offset + target.len < plan.paths_len);
+        assert(source.offset + source.len < plan.paths_len);
+        plan.steps[plan.count] = .{
+            .kind = kind,
+            .target = target,
+            .source = source,
+            .index = index,
+            .tolerant = kind == .mount_pts or is_sys(kind) or is_etc(kind) or kind == .run_ldconfig,
+        };
+        plan.count += 1;
+    }
+
+    fn push_parent_start(plan: *Plan, input: *const Input) void {
+        plan.push(.make_pipes, empty_text, empty_text, 0);
+        plan.push(.spawn, empty_text, empty_text, 0);
+        switch (input.mapping) {
+            .single => plan.push_direct_maps(input),
+            .full => |helpers| plan.push_helper_maps(input, helpers),
+        }
+        // pasta joins the namespaces as root of the user namespace, so after the maps; it is
+        // outside the scope (its memory and processes are not the container's).
+        if (plan.has_pasta) plan.push(.start_pasta, plan.pasta_path, plan.pasta_log, 0);
+        if (plan.has_pasta) plan.push(.await_pasta, empty_text, empty_text, 0);
+        // The scope exists before the child may run its first step, and so before its command;
+        // the keeper is forked first, so that it can be put in the scope with the child.
+        if (plan.scoped) plan.push(.spawn_keeper, empty_text, empty_text, 0);
+        if (plan.scoped) plan.push(.start_scope, plan.scope_name, plan.scope_description, 0);
+        plan.push(.release_child, empty_text, empty_text, 0);
+        assert(plan.steps[plan.count - 1].kind == .release_child);
+        assert(side_of(plan.steps[plan.count - 1].kind) == .parent);
+    }
+
+    /// The parent writes the maps itself: setgroups denied first, then the group and user map.
+    fn push_direct_maps(plan: *Plan, input: *const Input) void {
+        var line: [constants.id_map_line_bytes_max]u8 = undefined;
+        plan.push(.deny_setgroups, plan.add_text(&.{"deny"}), empty_text, 0);
+        // Cannot fail: "0 4294967295 1\n" is 15 bytes and the buffer is 32.
+        const gid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{input.gid}) catch unreachable;
+        plan.push(.write_gid_map, plan.add_text(&.{gid_line}), empty_text, 0);
+        // Cannot fail: same bound as above.
+        const uid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{input.uid}) catch unreachable;
+        plan.push(.write_uid_map, plan.add_text(&.{uid_line}), empty_text, 0);
+    }
+
+    /// The helpers write them: each is told the child's pid when it runs, and these words.
+    fn push_helper_maps(plan: *Plan, input: *const Input, helpers: Helpers) void {
+        var words: [constants.helper_map_bytes_max]u8 = undefined;
+        const range = constants.subid_range_min;
+        const format = "0 {d} 1 1 {d} {d}";
+        // Cannot fail: six numbers of at most ten digits and the spaces fit 64 bytes.
+        const uid_words = std.fmt.bufPrint(
+            &words,
+            format,
+            .{ input.uid, helpers.uid_start, range },
+        ) catch
+            unreachable; // Same bound as above.
+        plan.push(
+            .run_newuidmap,
+            plan.add_text(&.{helpers.newuidmap}),
+            plan.add_text(&.{uid_words}),
+            0,
+        );
+        // Cannot fail: same bound as above.
+        const gid_words = std.fmt.bufPrint(
+            &words,
+            format,
+            .{ input.gid, helpers.gid_start, range },
+        ) catch
+            unreachable; // Same bound as above.
+        plan.push(
+            .run_newgidmap,
+            plan.add_text(&.{helpers.newgidmap}),
+            plan.add_text(&.{gid_words}),
+            0,
+        );
+    }
+
+    fn push_child_steps(plan: *Plan, input: *const Input) void {
+        const rootfs_text = input.rootfs;
+        const overlay = input.overlay;
+        assert(plan.count == plan.first_child()); // After the parent's start.
+        assert(rootfs_text.len > 0);
+        const rootfs = plan.add_text(&.{rootfs_text});
+        const dev = plan.add_text(&.{ rootfs_text, "/dev" });
+        const proc = plan.add_text(&.{ rootfs_text, "/proc" });
+        plan.push(.die_with_parent, empty_text, empty_text, 0);
+        plan.push(.await_release, empty_text, empty_text, 0);
+        if (plan.scoped) plan.push(.unshare_cgroup, empty_text, empty_text, 0);
+        plan.push(.set_hostname, plan.hostname_ref, empty_text, 0);
+        if (plan.has_umask) plan.push(.set_umask, empty_text, empty_text, 0);
+        plan.push(.make_mounts_private, plan.add_text(&.{"/"}), empty_text, 0);
+        if (plan.isolated()) plan.push(.bring_up_loopback, empty_text, empty_text, 0);
+        // The FUSE descriptor goes over the channel before the listener: the parent takes them
+        // in that order (`serve_fuse` before `receive_listener`).
+        if (plan.lazy) plan.push(.mount_fuse, plan.add_text(&.{overlay.?.lower}), empty_text, 0);
+        if (plan.lazy) plan.push(.send_fuse, empty_text, empty_text, 0);
+        if (plan.has_listener) plan.push(.make_listener, empty_text, empty_text, 0);
+        if (plan.has_listener) plan.push(.send_listener, empty_text, empty_text, 0);
+        if (overlay) |layers| {
+            plan.push_etc_mount_points(layers.net);
+            plan.push(.mount_overlay, rootfs, plan.overlay_options(layers), 0);
+        } else {
+            plan.push(.bind_rootfs, rootfs, rootfs, 0);
+            plan.push_etc_mount_points(rootfs_text);
+        }
+        plan.push(.make_proc_dir, proc, empty_text, 0);
+        plan.push(.mount_proc, proc, empty_text, 0);
+        plan.push(.make_dev_dir, dev, empty_text, 0);
+        plan.push(.mount_dev, dev, empty_text, 0);
+        plan.push_devices(rootfs_text);
+        plan.push_user_devices(rootfs_text);
+        plan.push_cdi_nodes();
+        plan.push_dev_mounts(rootfs_text);
+        plan.push_links(rootfs_text);
+        plan.push_etc_files(rootfs_text);
+        plan.push_sys(rootfs_text);
+        plan.push_state_stages(input.state, rootfs_text);
+        plan.push_mount_stages(input.mounts, rootfs_text);
+        plan.push_cdi_stages();
+        if (plan.read_only) plan.push_read_only(rootfs, rootfs_text);
+        const here = plan.add_text(&.{"."});
+        plan.push(.enter_rootfs, rootfs, empty_text, 0);
+        plan.push(.pivot_root, here, here, 0);
+        plan.push(.detach_old_root, here, empty_text, 0);
+        plan.push(.enter_new_root, plan.add_text(&.{"/"}), empty_text, 0);
+        plan.push_state_moves(input.state);
+        plan.push_mount_moves(input.mounts);
+        plan.push_cdi_moves();
+        if (plan.has_workdir) plan.push(.enter_workdir, plan.workdir, empty_text, 0);
+        plan.push(.seal_descriptors, empty_text, empty_text, 0);
+        plan.push_knobs(input.sysctls);
+        plan.push(.restrict_capabilities, empty_text, empty_text, 0);
+        plan.push(.clear_ambient, empty_text, empty_text, 0);
+        if (plan.has_user) plan.push(.set_user, empty_text, empty_text, 0);
+        if (plan.has_user) plan.push(.rearm_death_signal, empty_text, empty_text, 0);
+        plan.push(.set_no_new_privs, empty_text, empty_text, 0);
+        plan.push(.install_seccomp, empty_text, empty_text, 0);
+        plan.push_cdi_ldconfig();
+        plan.push(.exec, empty_text, empty_text, 0);
+        assert(plan.steps[plan.count - 1].kind == .exec);
+        // The parent's tail remains.
+        assert(plan.count == plan.steps_expected() - plan.tail_count());
+    }
+
+    /// The sysctls, then the resource limits: after the new root is entered (the sysctls are
+    /// written beneath the container's own /proc) and before the capabilities are restricted.
+    fn push_knobs(plan: *Plan, sysctls: []const knobs.Sysctl) void {
+        assert(sysctls.len == plan.sysctl_count);
+        const start = plan.count;
+        for (sysctls, 0..) |sysctl, index| {
+            var buffer: [knobs.proc_path_bytes_max]u8 = undefined;
+            const path = plan.add_text(&.{knobs.proc_path(sysctl.key, &buffer)});
+            plan.push(.write_sysctl, path, plan.add_text(&.{sysctl.value}), @intCast(index));
+        }
+        for (std.enums.values(knobs.Resource)) |resource| {
+            if (plan.rlimits.get(resource) == null) continue;
+            plan.push(.set_rlimit, empty_text, empty_text, @backingInt(resource));
+        }
+        assert(plan.count == start + plan.knob_steps());
+    }
+
+    /// The steps the knobs add: one per sysctl and one per resource limit set.
+    pub fn knob_steps(plan: *const Plan) u32 {
+        assert(plan.sysctl_count <= constants.sysctls_max);
+        return plan.sysctl_count + plan.rlimits.count();
+    }
+
+    /// The `/dev/shm` mount data: mode 1777 and the size in bytes, which tmpfs rounds up to whole
+    /// pages.
+    fn add_shm_data(plan: *Plan, shm_bytes: u64) Text {
+        assert(shm_bytes >= constants.shm_bytes_min);
+        var buffer: [shm_data_bytes_max]u8 = undefined;
+        const format = "mode=1777,size={d}";
+        // The buffer holds the fixed text and the longest u64 in decimal, so it cannot be short.
+        const data = std.fmt.bufPrint(&buffer, format, .{shm_bytes}) catch unreachable;
+        assert(data.len > "mode=1777,size=".len);
+        return plan.add_text(&.{data});
+    }
+
+    /// The CDI nodes bound below the rootfs's /dev, after the user's devices.
+    fn push_cdi_nodes(plan: *Plan) void {
+        assert(plan.count < constants.plan_steps_max);
+        assert(plan.cdi_nodes <= constants.cdi_run_nodes_max);
+        if (plan.cdi_nodes == 0) return;
+        plan.push(.bind_cdi_nodes, plan.cdi_rootfs, empty_text, 0);
+    }
+
+    /// The CDI mounts staged, before the new root is entered.
+    fn push_cdi_stages(plan: *Plan) void {
+        assert(plan.count < constants.plan_steps_max);
+        assert(plan.cdi_mounts <= constants.cdi_run_mounts_max);
+        if (plan.cdi_mounts == 0) return;
+        plan.push(.stage_cdi_mounts, plan.cdi_rootfs, empty_text, 0);
+    }
+
+    /// The library cache, which reads the directories the mounts brought. It runs the image's
+    /// own program, so it comes last, after the descriptors are sealed, the capabilities
+    /// dropped and the seccomp filter installed: it gets the sandbox the command gets.
+    fn push_cdi_ldconfig(plan: *Plan) void {
+        assert(plan.count < constants.plan_steps_max);
+        assert(plan.cdi_dirs <= constants.cdi_run_dirs_max);
+        if (plan.cdi_dirs > 0) plan.push(.run_ldconfig, empty_text, empty_text, 0);
+    }
+
+    /// The CDI mounts moved to their paths in the new root.
+    fn push_cdi_moves(plan: *Plan) void {
+        assert(plan.count < constants.plan_steps_max);
+        assert(plan.cdi_dirs <= constants.cdi_run_dirs_max);
+        if (plan.cdi_mounts > 0) plan.push(.move_cdi_mounts, empty_text, empty_text, 0);
+    }
+
+    /// Each volume's `data` made, a hidden directory in the container's /dev, the volume bound
+    /// there (read-only for `:ro`). The paths are the host's: the old root is still there.
+    fn push_state_stages(plan: *Plan, state: []const StateInput, rootfs: []const u8) void {
+        const start = plan.count;
+        defer assert(plan.count == start + state_steps_count / 2 * plan.state_count +
+            plan.state_read_only_count);
+        assert(state.len == plan.state_count);
+        for (state, 0..) |volume, index| {
+            const number = [1]u8{'0' + @as(u8, @intCast(index))};
+            const stage = plan.add_text(&.{ rootfs, state_stage_prefix, &number });
+            const data = plan.add_text(&.{volume.data});
+            const at: u8 = @intCast(index);
+            plan.push(.make_state_data, data, empty_text, at);
+            plan.push(.make_state_stage, stage, empty_text, at);
+            plan.push(.bind_state, stage, data, at);
+            if (volume.read_only) plan.push(.remount_state, stage, empty_text, at);
+        }
+    }
+
+    /// In the new root: each target made, the volume moved onto it, the hidden directory gone.
+    fn push_state_moves(plan: *Plan, state: []const StateInput) void {
+        const start = plan.count;
+        defer assert(plan.count == start + state_steps_count / 2 * plan.state_count);
+        for (state, 0..) |volume, index| {
+            const number = [1]u8{'0' + @as(u8, @intCast(index))};
+            const stage = plan.add_text(&.{ state_stage_prefix, &number });
+            const at: u8 = @intCast(index);
+            plan.push(.make_state_target, plan.state_targets[index], empty_text, at);
+            plan.push(.move_state, plan.state_targets[index], stage, at);
+            plan.push(.remove_state_stage, stage, empty_text, at);
+            assert(std.mem.eql(u8, plan.text(plan.state_targets[index]), volume.target));
+        }
+    }
+
+    /// Each bind and secret staged in the container's /dev, below the rootfs's path: the host's
+    /// paths are the old root's, still there.
+    fn push_mount_stages(plan: *Plan, mounts: []const MountInput, rootfs: []const u8) void {
+        const start = plan.count;
+        assert(mounts.len == plan.mount_count);
+        for (mounts, 0..) |mount, index| {
+            const number = [1]u8{'0' + @as(u8, @intCast(index))};
+            const stage = plan.add_text(&.{ rootfs, constants.mount_stage_prefix, &number });
+            const source = plan.mount_sources[index];
+            const at: u8 = @intCast(index);
+            switch (mount.shape) {
+                .tmpfs => {},
+                .bind_dir => {
+                    plan.push(.make_mount_stage_dir, stage, empty_text, at);
+                    plan.push(.bind_mount_dir, stage, source, at);
+                    plan.push(.remount_mount_tree, stage, empty_text, at);
+                },
+                .bind_file => {
+                    plan.push(.make_mount_stage_file, stage, empty_text, at);
+                    plan.push(.bind_mount_file, stage, source, at);
+                    plan.push(.remount_mount, stage, empty_text, at);
+                },
+                .mount_dir => {
+                    plan.push(.make_mount_stage_dir, stage, empty_text, at);
+                    plan.push(.bind_mount_dir, stage, source, at);
+                },
+                .mount_file => {
+                    plan.push(.make_mount_stage_file, stage, empty_text, at);
+                    plan.push(.bind_mount_file, stage, source, at);
+                },
+                .secret => {
+                    plan.push(.copy_secret, stage, source, at);
+                    plan.push(.bind_mount_file, stage, stage, at);
+                    plan.push(.remount_mount, stage, empty_text, at);
+                },
+            }
+        }
+        const staged = plan.count - start;
+        assert(staged <= mounts.len * mount_steps_staged / 2);
+    }
+
+    /// In the new root: each target made, the mount moved onto it and its hidden name removed;
+    /// a tmpfs is made at its target.
+    fn push_mount_moves(plan: *Plan, mounts: []const MountInput) void {
+        assert(mounts.len <= constants.mounts_max);
+        assert(plan.count < constants.plan_steps_max);
+        const start = plan.count;
+        for (mounts, 0..) |mount, index| {
+            const number = [1]u8{'0' + @as(u8, @intCast(index))};
+            const stage = plan.add_text(&.{ constants.mount_stage_prefix, &number });
+            const target = plan.mount_targets[index];
+            const at: u8 = @intCast(index);
+            switch (mount.shape) {
+                .tmpfs => {
+                    var options: [constants.tmpfs_options_bytes_max]u8 = undefined;
+                    const text_ = tmpfs_options(&options, mount.size_bytes);
+                    plan.push(.make_mount_target_dir, target, empty_text, at);
+                    plan.push(.mount_user_tmpfs, target, plan.add_text(&.{text_}), at);
+                },
+                .bind_dir, .mount_dir => {
+                    plan.push(.make_mount_target_dir, target, empty_text, at);
+                    plan.push(.move_mount, target, stage, at);
+                    plan.push(.remove_mount_stage_dir, stage, empty_text, at);
+                },
+                .bind_file, .mount_file, .secret => {
+                    plan.push(.make_mount_target_file, target, empty_text, at);
+                    plan.push(.move_mount, target, stage, at);
+                    plan.push(.remove_mount_stage_file, stage, empty_text, at);
+                },
+            }
+        }
+        assert(plan.count - start <= mounts.len * mount_steps_staged / 2);
+    }
+
+    /// The mount data of an overlay: `userxattr` (a mount made from a user namespace keeps its
+    /// metadata in user.* attributes), then the layers. The paths hold no comma, colon or
+    /// backslash (`spec.overlay_path_problem`), which the kernel would read as separators.
+    fn overlay_options(plan: *Plan, layers: Overlay) Text {
+        assert(spec.overlay_path_problem(layers.lower) == null);
+        assert(spec.overlay_path_problem(layers.net) == null);
+        assert((layers.upper == null) == (layers.work == null));
+        assert((layers.upper == null) == (layers.empty != null));
+        if (layers.upper) |upper| {
+            assert(spec.overlay_path_problem(upper) == null);
+            assert(spec.overlay_path_problem(layers.work.?) == null);
+            const work = layers.work.?;
+            return plan.add_text(&.{
+                "userxattr,lowerdir=", layers.net, ":",         layers.lower,
+                ",upperdir=",          upper,      ",workdir=", work,
+            });
+        }
+        assert(spec.overlay_path_problem(layers.empty.?) == null);
+        return plan.add_text(&.{
+            "userxattr,lowerdir=", layers.net, ":", layers.lower, ":", layers.empty.?,
+        });
+    }
+
+    /// `/tmp` and `/run` as tmpfs (their mount points are made first, while the rootfs is still
+    /// writable), then the rootfs bind mount read-only.
+    fn push_read_only(plan: *Plan, rootfs: Text, rootfs_text: []const u8) void {
+        assert(plan.read_only);
+        assert(rootfs_text.len > 0);
+        const start = plan.count;
+        defer assert(plan.count == start + read_only_steps_count);
+        const tmp = plan.add_text(&.{ rootfs_text, "/tmp" });
+        const run = plan.add_text(&.{ rootfs_text, "/run" });
+        plan.push(.make_tmp_dir, tmp, empty_text, 0);
+        plan.push(.mount_tmp, tmp, empty_text, 0);
+        plan.push(.make_run_dir, run, empty_text, 0);
+        plan.push(.mount_run, run, empty_text, 0);
+        plan.push(.remount_readonly, rootfs, empty_text, 0);
+    }
+
+    fn push_devices(plan: *Plan, rootfs: []const u8) void {
+        const start = plan.count;
+        defer assert(plan.count == start + 2 * constants.container_devices_count);
+        for (devices, 0..) |name, index| {
+            const inside = plan.add_text(&.{ rootfs, "/dev/", name });
+            const outside = plan.add_text(&.{ "/dev/", name });
+            plan.push(.create_device_file, inside, empty_text, @intCast(index));
+            plan.push(.bind_device, inside, outside, @intCast(index));
+        }
+    }
+
+    /// Each `--device`, after M1's six: below the rootfs's /dev, at the host's own path.
+    fn push_user_devices(plan: *Plan, rootfs: []const u8) void {
+        const start = plan.count;
+        assert(plan.device_count <= constants.run_devices_max);
+        defer assert(plan.count == start + user_device_steps_count * plan.device_count);
+        for (0..plan.device_count) |index| {
+            const outside = plan.device_paths[index];
+            const inside = plan.add_text(&.{ rootfs, plan.text(outside) });
+            plan.push(.create_user_device, inside, empty_text, @intCast(index));
+            plan.push(.bind_user_device, inside, outside, @intCast(index));
+        }
+    }
+
+    fn push_dev_mounts(plan: *Plan, rootfs: []const u8) void {
+        const start = plan.count;
+        defer assert(plan.count == start + 4);
+        const shm = plan.add_text(&.{ rootfs, "/dev/shm" });
+        const pts = plan.add_text(&.{ rootfs, "/dev/pts" });
+        plan.push(.make_shm_dir, shm, empty_text, 0);
+        plan.push(.mount_shm, shm, plan.shm_data, 0);
+        plan.push(.make_pts_dir, pts, empty_text, 0);
+        plan.push(.mount_pts, pts, empty_text, 0);
+    }
+
+    /// The mount points of the three generated files below `base` (the rootfs, or the overlay's
+    /// net layer): `base/etc`, then the three files, each left alone if it is there already.
+    fn push_etc_mount_points(plan: *Plan, base: []const u8) void {
+        const start = plan.count;
+        defer assert(plan.count == start + 4);
+        assert(base.len > 0);
+        const directory = plan.add_text(&.{ base, "/etc" });
+        plan.push(.make_etc_dir, directory, empty_text, 0);
+        for (std.enums.values(netfiles.File)) |file| {
+            const path = plan.add_text(&.{ base, "/etc/", file.etc_name() });
+            plan.push(.create_etc_file, path, empty_text, @backingInt(file));
+        }
+    }
+
+    /// Writes each generated file to the container's /dev, binds it over its mount point in
+    /// the rootfs (read-only, but for the hostname, unless the plan is read-only) and removes the
+    /// staged name. The /dev is a
+    /// fresh tmpfs by now.
+    fn push_etc_files(plan: *Plan, rootfs: []const u8) void {
+        const start = plan.count;
+        const given: u32 = if (plan.hosts_file) 2 else 0; // No stage, no unstage.
+        defer assert(plan.count == start + 11 - given + read_only_hostname_steps_count *
+            @intFromBool(plan.read_only));
+        assert(rootfs.len > 0);
+        assert(plan.etc_texts[0].offset != plan.etc_texts[1].offset);
+        assert(plan.etc_texts[1].offset != plan.etc_texts[2].offset);
+        for (std.enums.values(netfiles.File)) |file| {
+            const index: u8 = @backingInt(file);
+            const staged = plan.add_text(&.{ rootfs, "/dev/", file.stage_name() });
+            const inside = plan.add_text(&.{ rootfs, "/etc/", file.etc_name() });
+            if (file == .hosts and plan.hosts_file) {
+                plan.push_given_hosts(inside);
+                continue;
+            }
+            plan.push(.stage_etc_file, staged, plan.etc_texts[index], index);
+            plan.push(.bind_etc_file, inside, staged, index);
+            // The hostname stays writable, a program may rewrite it and what it writes is the
+            // container's own copy, but `--read-only` covers it as Docker's does: the rootfs
+            // remount is not recursive and does not reach this bind.
+            if (file != .hostname or plan.read_only) {
+                plan.push(.remount_etc_file, inside, empty_text, index);
+            }
+            plan.push(.unstage_etc_file, staged, empty_text, index);
+        }
+    }
+
+    /// The caller's hosts file (ZB-6) in place of the generated one: the host's file itself,
+    /// bound over the mount point and made read-only, with no staged copy. Not tolerant: the
+    /// caller asked for this file, and a container that would resolve names from another is a
+    /// failed start.
+    fn push_given_hosts(plan: *Plan, inside: Text) void {
+        const start = plan.count;
+        defer assert(plan.count == start + 2);
+        assert(plan.hosts_file);
+        assert(plan.hosts_path.len > 0);
+        const index: u8 = @backingInt(netfiles.File.hosts);
+        plan.push(.bind_etc_file, inside, plan.hosts_path, index);
+        plan.steps[plan.count - 1].tolerant = false;
+        plan.push(.remount_etc_file, inside, empty_text, index);
+        plan.steps[plan.count - 1].tolerant = false;
+    }
+
+    /// The container's /sys: the host's, bound recursively and made read-only, when it shares
+    /// the host's network namespace; a sysfs of its own, read-only, when it has one.
+    /// /sys, and then, in a plan with a scope, the cgroup view on top of it (either /sys).
+    fn push_sys(plan: *Plan, rootfs: []const u8) void {
+        const start = plan.count;
+        const sys: u32 = if (plan.isolated()) 2 else 3;
+        const expected = sys + @as(u32, @intFromBool(plan.scoped));
+        defer assert(plan.count == start + expected);
+        assert(rootfs.len > 0);
+        assert(plan.count < constants.plan_steps_max);
+        const inside = plan.add_text(&.{ rootfs, "/sys" });
+        plan.push(.make_sys_dir, inside, empty_text, 0);
+        if (plan.isolated()) {
+            plan.push(.mount_sysfs, inside, empty_text, 0);
+        } else {
+            plan.push(.bind_sys, inside, plan.add_text(&.{"/sys"}), 0);
+            plan.push(.remount_sys, inside, empty_text, 0);
+        }
+        if (!plan.scoped) return;
+        const cgroup = plan.add_text(&.{ rootfs, "/sys/fs/cgroup" });
+        plan.push(.mount_cgroup, cgroup, empty_text, 0);
+    }
+
+    fn push_links(plan: *Plan, rootfs: []const u8) void {
+        const start = plan.count;
+        defer assert(plan.count == start + constants.container_links_count);
+        for (links, 0..) |link, index| {
+            const inside = plan.add_text(&.{ rootfs, "/dev/", link.name });
+            const target = plan.add_text(&.{link.target});
+            plan.push(.link_dev, inside, target, @intCast(index));
+        }
+    }
+
+    // ---- The exec image ----
+
+    fn add_string(plan: *Plan, parts: []const []const u8) [*:0]const u8 {
+        var length: u32 = 0;
+        for (parts) |part| length += @intCast(part.len);
+        assert(length <= constants.exec_strings_bytes_max);
+        assert(plan.strings_len + length + 1 <= plan.strings.len);
+        const start = plan.strings_len;
+        var at = start;
+        for (parts) |part| {
+            @memcpy(plan.strings[at..][0..part.len], part);
+            at += @intCast(part.len);
+        }
+        plan.strings[at] = 0;
+        plan.strings_len = at + 1;
+        assert(at - start == length);
+        return @ptrCast(&plan.strings[start]);
+    }
+
+    fn build_exec_image(plan: *Plan, input: *const Input) void {
+        for (input.command, 0..) |word, index| plan.argv[index] = plan.add_string(&.{word});
+        plan.argv[input.command.len] = null;
+        var count: usize = 0;
+        const path_variable = "PATH=" ++ constants.container_path;
+        if (!overridden(input.env, "PATH")) {
+            plan.envp[count] = plan.add_string(&.{path_variable});
+            count += 1;
+        }
+        if (!overridden(input.env, "HOME")) {
+            plan.envp[count] = plan.add_string(&.{"HOME=/root"});
+            count += 1;
+        }
+        if (!overridden(input.env, "HOSTNAME")) {
+            plan.envp[count] = plan.add_string(&.{ "HOSTNAME=", input.hostname_text() });
+            count += 1;
+        }
+        if (input.term) |term| {
+            assert(term.len <= constants.term_bytes_max);
+            if (!overridden(input.env, "TERM")) {
+                plan.envp[count] = plan.add_string(&.{ "TERM=", term });
+                count += 1;
+            }
+        }
+        assert(count <= constants.environment_count_max);
+        for (input.env) |variable| {
+            plan.envp[count] = plan.add_string(&.{ variable.key, "=", variable.value });
+            count += 1;
+        }
+        count = plan.add_cdi_env(count);
+        plan.envp[count] = null;
+        const bound = constants.environment_count_max + constants.env_vars_count_max;
+        assert(count <= bound + constants.cdi_run_env_max);
+        plan.build_candidates(input.command[0], search_path_of(input.env));
+    }
+
+    /// The environment the CDI devices set, after the rest: a name already there (the default's,
+    /// or one the caller set) stays as it is, so the user's own choice wins.
+    fn add_cdi_env(plan: *Plan, start: usize) usize {
+        const resolved = plan.cdi orelse return start;
+        assert(resolved.env_count <= constants.cdi_run_env_max);
+        var count = start;
+        for (resolved.env[0..resolved.env_count]) |item| {
+            const entry = resolved.text(item);
+            const equals = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            if (plan.env_has(count, entry[0 .. equals + 1])) continue;
+            plan.envp[count] = plan.add_string(&.{entry});
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Whether one of the first `count` entries of the environment starts with `key_equals`.
+    fn env_has(plan: *const Plan, count: usize, key_equals: []const u8) bool {
+        assert(key_equals.len > 1);
+        assert(key_equals[key_equals.len - 1] == '=');
+        for (plan.envp[0..count]) |entry| {
+            if (std.mem.startsWith(u8, std.mem.span(entry.?), key_equals)) return true;
+        }
+        return false;
+    }
+
+    /// The PATH a program is looked for in: the image's if the caller set one, else the default.
+    fn search_path_of(env: []const spec.Label) []const u8 {
+        assert(env.len <= constants.env_vars_count_max);
+        for (env) |variable| {
+            if (std.mem.eql(u8, variable.key, "PATH") and variable.value.len > 0) {
+                return variable.value;
+            }
+        }
+        return constants.container_path;
+    }
+
+    fn overridden(env: []const spec.Label, name: []const u8) bool {
+        assert(name.len > 0);
+        for (env) |variable| {
+            if (std.mem.eql(u8, variable.key, name)) return true;
+        }
+        return false;
+    }
+
+    /// A program with a slash in its name is run as named; any other is looked up in the
+    /// container's PATH, in order, as a shell does.
+    fn build_candidates(plan: *Plan, program: []const u8, search_path: []const u8) void {
+        assert(program.len > 0);
+        if (std.mem.indexOfScalar(u8, program, '/') != null) {
+            plan.candidates[0] = plan.add_text(&.{program});
+            plan.candidates_count = 1;
+            return;
+        }
+        var directories = std.mem.splitScalar(u8, search_path, ':');
+        while (directories.next()) |directory| {
+            if (directory.len == 0 or directory[0] != '/') continue;
+            if (plan.candidates_count == constants.candidates_max) break;
+            // The image's own PATH may be long and the words long: the room is checked.
+            const room = plan.paths.len - plan.paths_len;
+            if (directory.len + 1 + program.len + 1 + 1024 > room) break;
+            plan.candidates[plan.candidates_count] = plan.add_text(&.{ directory, "/", program });
+            plan.candidates_count += 1;
+        }
+        assert(plan.candidates_count > 0);
+        if (search_path.ptr == constants.container_path.ptr) {
+            assert(plan.candidates_count == constants.container_path_dirs_count);
+        }
+    }
+};
+
+// ---- Naming a step ----
+
+fn etc_name(index: u8) []const u8 {
+    assert(index < 3);
+    const file: netfiles.File = @fromBackingInt(@intCast(index));
+    return file.etc_name();
+}
+
+/// A short phrase for the step, for the cause line of a diagnostic: "mounting a fresh /proc".
+/// Formats into `buffer`, so it is for the parent only.
+/// What a step of the parent's does, for `describe`.
+fn parent_phrase(kind: Kind) []const u8 {
+    assert(side_of(kind) == .parent);
+    const phrase: []const u8 = switch (kind) {
+        .make_pipes => "creating the pipes between zbx and the container",
+        .spawn => "creating the container's namespaces",
+        .deny_setgroups => "denying setgroups in the container's user namespace",
+        .write_gid_map => "writing the container's gid map",
+        .write_uid_map => "writing the container's uid map",
+        .run_newuidmap => "running newuidmap to write the container's uid map",
+        .run_newgidmap => "running newgidmap to write the container's gid map",
+        .spawn_keeper => "starting the process that keeps the container's cgroup scope alive",
+        .start_scope => "starting the container's cgroup scope",
+        .start_pasta => "starting pasta for the container's network",
+        .await_pasta => "waiting for pasta to configure the container's network",
+        .release_child => "letting the container continue",
+        .serve_fuse => "serving the image's tree to the container over FUSE",
+        .receive_listener => "receiving the listener the container made",
+        .await_report => "waiting for the container to start its command",
+        .reap => "waiting for the container to end",
+        else => unreachable, // The child's steps; asserted above.
+    };
+    assert(phrase.len > 0);
+    return phrase;
+}
+
+/// The options of a user tmpfs: world-writable and sticky, as /tmp is, and the size.
+pub fn tmpfs_options(buffer: *[constants.tmpfs_options_bytes_max]u8, size_bytes: u64) []const u8 {
+    assert(size_bytes >= constants.tmpfs_mount_bytes_min);
+    assert(size_bytes <= constants.tmpfs_mount_bytes_max);
+    // Cannot fail: the longest size has thirteen digits (a comptime relation in constants.zig).
+    return std.fmt.bufPrint(buffer, "mode=1777,size={d}", .{size_bytes}) catch unreachable;
+}
+
+/// What a step of the state volumes or of the other mounts does, as a diagnostic says it.
+fn volume_phrase(kind: Kind) []const u8 {
+    if (is_mount(kind)) assert(!is_state(kind));
+    if (!is_mount(kind)) assert(is_state(kind));
+    return switch (kind) {
+        .make_state_data => "creating the state volume's data directory",
+        .make_state_stage => "creating the state volume's mount point in the container's /dev",
+        .bind_state => "binding the state volume",
+        .remount_state => "making the state volume read-only",
+        .make_state_target => "creating the state volume's mount point in the container",
+        .move_state => "moving the state volume onto its mount point",
+        .remove_state_stage => "removing the state volume's mount point in /dev",
+
+        .make_mount_stage_dir => "creating the mount's staging directory in the container's /dev",
+        .make_mount_stage_file => "creating the mount's staging file in the container's /dev",
+        .copy_secret => "copying the secret into the container's /dev",
+        .bind_mount_dir => "binding the host directory",
+        .bind_mount_file => "binding the file",
+        .remount_mount => "making the mounted file read-only",
+        .remount_mount_tree => "making the mounted directory read-only",
+        .make_mount_target_dir => "creating the mount point in the container",
+        .make_mount_target_file => "creating the mount point file in the container",
+        .move_mount => "moving the mount onto its mount point",
+        .remove_mount_stage_dir => "removing the mount's staging directory in /dev",
+        .remove_mount_stage_file => "removing the mount's staging file in /dev",
+        .mount_user_tmpfs => "mounting the tmpfs",
+        else => unreachable, // The assertion above said so.
+    };
+}
+
+/// What a CDI device's step does, for `describe`.
+fn cdi_phrase(kind: Kind) []const u8 {
+    assert(@backingInt(kind) <= @backingInt(Kind.exec));
+    assert(@backingInt(kind) >= 0);
+    return switch (kind) {
+        .bind_cdi_nodes => "bind-mounting the device nodes of a CDI device into /dev",
+        .stage_cdi_mounts => "staging the mounts of a CDI device in /dev",
+        .move_cdi_mounts => "moving the mounts of a CDI device to their paths",
+        else => "updating the library cache for a CDI device",
+    };
+}
+
+fn cgroup_phrase(kind: Kind) []const u8 {
+    if (kind != .unshare_cgroup) assert(kind == .mount_cgroup);
+    assert(side_of(kind) == .child);
+    return switch (kind) {
+        .unshare_cgroup => "taking a cgroup namespace of the container's own",
+        else => "mounting the container's cgroup read-only on /sys/fs/cgroup",
+    };
+}
+
+/// The name a step's phrase ends with: a device, an /etc file or a link; empty for the rest.
+fn step_name(step: *const Step) []const u8 {
+    assert(step.index < 256);
+    return switch (step.kind) {
+        .create_device_file, .bind_device => devices[step.index],
+        .create_etc_file, .stage_etc_file, .bind_etc_file => etc_name(step.index),
+        .remount_etc_file, .unstage_etc_file => etc_name(step.index),
+        .link_dev => links[step.index].name,
+        else => "",
+    };
+}
+
+pub fn describe(step: *const Step, buffer: []u8) []const u8 {
+    assert(buffer.len >= 128);
+    const phrase: []const u8 = switch (step.kind) {
+        .make_pipes, .spawn, .deny_setgroups, .write_gid_map => parent_phrase(step.kind),
+        .write_uid_map, .run_newuidmap, .run_newgidmap => parent_phrase(step.kind),
+        .spawn_keeper, .start_scope, .start_pasta => parent_phrase(step.kind),
+        .await_pasta, .release_child, .await_report, .reap => parent_phrase(step.kind),
+        .receive_listener, .serve_fuse => parent_phrase(step.kind),
+        .die_with_parent => "asking the kernel to end the container if zbx dies",
+        .await_release => "waiting for zbx to write the container's id maps",
+        .unshare_cgroup, .mount_cgroup => cgroup_phrase(step.kind),
+        .set_hostname => "setting the container's hostname",
+        .set_umask => "setting the file mode creation mask",
+        .make_mounts_private => "making the container's mounts private",
+        .bind_rootfs => "bind-mounting the rootfs onto itself",
+        .mount_overlay => "mounting the overlay filesystem of the tree",
+        .mount_fuse => "mounting the image's tree over FUSE",
+        .send_fuse => "handing the FUSE descriptor to zbx",
+        .make_proc_dir => "creating /proc in the rootfs",
+        .mount_proc => "mounting a fresh /proc",
+        .make_dev_dir => "creating /dev in the rootfs",
+        .mount_dev => "mounting a tmpfs on /dev",
+        .make_shm_dir => "creating /dev/shm",
+        .mount_shm => "mounting a tmpfs on /dev/shm",
+        .make_pts_dir => "creating /dev/pts",
+        .mount_pts => "mounting devpts on /dev/pts",
+        .make_sys_dir => "creating /sys in the rootfs",
+        .bind_sys => "binding the host's /sys",
+        .bring_up_loopback => "bringing up the loopback interface",
+        .make_listener => "making the listener on the container's loopback",
+        .send_listener => "handing the listener to zbx",
+        .mount_sysfs => "mounting a sysfs of the container's own",
+        .make_etc_dir => "creating the mount point directory for the generated /etc files",
+        .create_etc_file => "creating the mount point /etc/",
+        .stage_etc_file => "writing the generated /etc/",
+        .bind_etc_file => "binding the generated /etc/",
+        .remount_etc_file => "making the generated /etc file read-only: /etc/",
+        .unstage_etc_file => "removing the staged copy of /etc/",
+        .remount_sys => "making /sys read-only",
+        .enter_workdir => "entering the image's working directory",
+        .set_user => "becoming the image's user",
+        .rearm_death_signal => "asking the kernel again to end the container if zbx dies",
+        .enter_rootfs => "entering the rootfs directory",
+        .pivot_root => "pivot_root into the rootfs",
+        .detach_old_root => "unmounting the old root",
+        .enter_new_root => "changing to the new root",
+        .seal_descriptors => "closing the descriptors the command must not inherit",
+        .write_sysctl => "writing a --sysctl beneath the container's /proc/sys",
+        .set_rlimit => "setting a --ulimit resource limit",
+        .exec => "starting the command",
+        .create_device_file => "creating the mount point /dev/",
+        .bind_device => "bind-mounting /dev/",
+        .create_user_device => "creating the mount point of a --device in /dev",
+        .bind_user_device => "bind-mounting a --device into /dev",
+        .bind_cdi_nodes, .stage_cdi_mounts => cdi_phrase(step.kind),
+        .move_cdi_mounts, .run_ldconfig => cdi_phrase(step.kind),
+        .link_dev => "creating the link /dev/",
+        .make_tmp_dir => "creating /tmp in the rootfs",
+        .mount_tmp => "mounting a tmpfs on /tmp",
+        .make_run_dir => "creating /run in the rootfs",
+        .mount_run => "mounting a tmpfs on /run",
+        .remount_readonly => "making the rootfs read-only",
+        .restrict_capabilities => "dropping the capabilities the container does not keep",
+        .clear_ambient => "clearing the ambient capabilities",
+        .set_no_new_privs => "setting no_new_privs",
+        .install_seccomp => "installing the seccomp filter",
+        else => volume_phrase(step.kind), // The state volumes' steps and the other mounts'.
+    };
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ phrase, step_name(step) }) catch phrase;
+}
+
+comptime {
+    assert(steps_count_single <= constants.plan_steps_max);
+    // The longest plan: the single map, a scope, a read-only root, a working directory, a user
+    // (and the death signal asked for again after it) and pasta.
+    const longest = steps_count_single + scope_steps_count + cgroup_view_steps_count +
+        read_only_steps_count +
+        read_only_hostname_steps_count + 3 + pasta_steps_count +
+        (state_steps_count + state_read_only_steps_count) * constants.state_volumes_max +
+        mount_steps_staged * constants.mounts_max +
+        user_device_steps_count * constants.run_devices_max + cdi_steps_count_max;
+    assert(longest <= constants.plan_steps_max);
+    assert(steps_count_full + 1 == steps_count_single);
+    assert(devices.len == constants.container_devices_count);
+    assert(links.len == constants.container_links_count);
+    // A volume's stage name ends in one digit.
+    assert(constants.state_volumes_max <= 10);
+    // The failure record names a step in one byte, and a step's kind must be nameable too.
+    assert(steps_count_single <= std.math.maxInt(u8));
+    assert(constants.mounts_max <= 10);
+    assert(std.meta.fieldNames(Kind).len <= 128);
+}
+
+const testing = std.testing;
+
+fn test_input(command: []const []const u8) Input {
+    return .{
+        .rootfs = "/srv/alpine",
+        .name = "web-1",
+        .command = command,
+        .term = "xterm",
+        .uid = 1000,
+        .gid = 1001,
+        .mapping = .single,
+    };
+}
+
+const test_helpers: Helpers = .{
+    .newuidmap = "/usr/bin/newuidmap",
+    .newgidmap = "/usr/bin/newgidmap",
+    .uid_start = 100000,
+    .gid_start = 200000,
+};
+
+test "with the helpers the parent has one step per map, and the words are the ranges" {
+    // Goal: the full mapping's plan. It has one step fewer than the single-id plan (no
+    // setgroups), the helper steps come first after spawn, and each carries the helper's path and
+    // "0 <own id> 1 1 <first subordinate id> 65536".
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    input.mapping = .{ .full = test_helpers };
+    plan.build(&input);
+    try testing.expectEqual(steps_count_full, plan.count);
+    try testing.expectEqual(@as(u32, 65), plan.count);
+    try testing.expectEqual(Kind.run_newuidmap, plan.steps[2].kind);
+    try testing.expectEqual(Kind.run_newgidmap, plan.steps[3].kind);
+    try testing.expectEqual(Kind.release_child, plan.steps[4].kind);
+    try testing.expectEqualStrings("/usr/bin/newuidmap", plan.text(plan.steps[2].target));
+    try testing.expectEqualStrings("0 1000 1 1 100000 65536", plan.text(plan.steps[2].source));
+    try testing.expectEqualStrings("/usr/bin/newgidmap", plan.text(plan.steps[3].target));
+    try testing.expectEqualStrings("0 1001 1 1 200000 65536", plan.text(plan.steps[3].source));
+    for (plan.steps[0..plan.count]) |step| {
+        try testing.expect(
+            step.kind != .deny_setgroups,
+        ); // Never written: the helpers need no deny.
+        try testing.expect(step.kind != .write_uid_map);
+    }
+}
+
+test "the plan has the steps in order, parent and child interleaved, and all within bounds" {
+    // Goal: the shape every other module relies on. Method: build once and walk it; each step
+    // belongs to the side the order says, the device and link steps repeat per device and link,
+    // and only the devpts mount, the /sys steps and the generated /etc files' are tolerant.
+    var plan: Plan = undefined;
+    const input = test_input(&.{ "/bin/sh", "-c", "true" });
+    plan.build(&input);
+    try testing.expectEqual(steps_count_single, plan.count);
+    try testing.expectEqual(@as(u32, 66), plan.count);
+    var tolerant: u32 = 0;
+    var devices_seen: u32 = 0;
+    var links_seen: u32 = 0;
+    for (plan.steps[0..plan.count]) |step| {
+        if (step.tolerant) {
+            tolerant += 1;
+            const allowed = step.kind == .mount_pts or is_sys(step.kind) or is_etc(step.kind);
+            try testing.expect(allowed);
+        }
+        if (step.kind == .bind_device) devices_seen += 1;
+        if (step.kind == .link_dev) links_seen += 1;
+    }
+    // The devpts mount, the two /sys steps of a container with a sysfs of its own, and fifteen
+    // for the three generated files.
+    try testing.expectEqual(@as(u32, 18), tolerant);
+    try testing.expectEqual(constants.container_devices_count, devices_seen);
+    try testing.expectEqual(constants.container_links_count, links_seen);
+    // The mounts come in the order the kernel needs: private, bind, proc, dev, ... pivot, exec.
+    const order = [_]Kind{
+        .make_mounts_private, .bind_rootfs, .mount_proc, .mount_dev,
+        .mount_shm,           .mount_pts,   .pivot_root, .exec,
+    };
+    var at: usize = 0;
+    for (plan.steps[0..plan.count]) |step| {
+        if (at < order.len and step.kind == order[at]) at += 1;
+    }
+    try testing.expectEqual(order.len, at);
+}
+
+test "the plan's paths and texts are what the kernel will be given" {
+    // Goal: every derived path, the map lines with the right ids, and the hostname.
+    var plan: Plan = undefined;
+    const input = test_input(&.{"sh"});
+    plan.build(&input);
+    try testing.expectEqualStrings("web-1", plan.hostname());
+    var seen_bind = false;
+    for (plan.steps[0..plan.count]) |step| {
+        switch (step.kind) {
+            .deny_setgroups => try testing.expectEqualStrings("deny", plan.text(step.target)),
+            .write_gid_map => try testing.expectEqualStrings("0 1001 1\n", plan.text(step.target)),
+            .write_uid_map => try testing.expectEqualStrings("0 1000 1\n", plan.text(step.target)),
+            .mount_proc => {
+                try testing.expectEqualStrings("/srv/alpine/proc", plan.text(step.target));
+            },
+            .mount_pts => {
+                try testing.expectEqualStrings("/srv/alpine/dev/pts", plan.text(step.target));
+            },
+            .bind_device => {
+                if (step.index == 0) {
+                    try testing.expectEqualStrings("/srv/alpine/dev/null", plan.text(step.target));
+                    try testing.expectEqualStrings("/dev/null", plan.text(step.source));
+                    seen_bind = true;
+                }
+            },
+            .pivot_root => {
+                try testing.expectEqualStrings(".", plan.text(step.target));
+                try testing.expectEqualStrings(".", plan.text(step.source));
+            },
+            .link_dev => {
+                if (step.index == 4) {
+                    try testing.expectEqualStrings("/srv/alpine/dev/ptmx", plan.text(step.target));
+                    try testing.expectEqualStrings("pts/ptmx", plan.text(step.source));
+                }
+            },
+            else => {},
+        }
+    }
+    try testing.expect(seen_bind);
+}
+
+test "the exec image is a clean environment, and a bare program is looked up in PATH" {
+    // Goal: the command gets exactly PATH, HOME, HOSTNAME and TERM, and the candidates are the
+    // PATH directories in order for a bare name, or the one path for a name with a slash.
+    var plan: Plan = undefined;
+    var input = test_input(&.{ "ls", "-l" });
+    plan.build(&input);
+    try testing.expectEqualStrings("ls", std.mem.span(plan.argv[0].?));
+    try testing.expectEqualStrings("-l", std.mem.span(plan.argv[1].?));
+    try testing.expect(plan.argv[2] == null);
+    const path_variable = "PATH=" ++ constants.container_path;
+    try testing.expectEqualStrings(path_variable, std.mem.span(plan.envp[0].?));
+    try testing.expectEqualStrings("HOME=/root", std.mem.span(plan.envp[1].?));
+    try testing.expectEqualStrings("HOSTNAME=web-1", std.mem.span(plan.envp[2].?));
+    try testing.expectEqualStrings("TERM=xterm", std.mem.span(plan.envp[3].?));
+    try testing.expect(plan.envp[4] == null);
+    try testing.expectEqual(constants.container_path_dirs_count, plan.candidates_count);
+    try testing.expectEqualStrings("/usr/local/sbin/ls", plan.text(plan.candidates[0]));
+    try testing.expectEqualStrings("/bin/ls", plan.text(plan.candidates[5]));
+
+    input.term = null;
+    input.command = &.{"./tool"};
+    plan.build(&input);
+    try testing.expect(plan.envp[3] == null);
+    try testing.expectEqual(@as(u32, 1), plan.candidates_count);
+    try testing.expectEqualStrings("./tool", plan.text(plan.candidates[0]));
+}
+
+test "Spec.env adds variables after the defaults and replaces a default of the same name" {
+    // Goal: the caller's environment reaches the exec image, in order, and PATH can be replaced
+    // without a second PATH. Method: one added variable, then one that replaces TERM and PATH.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"ls"});
+    input.env = &.{.{ .key = "APP", .value = "a=b c" }};
+    plan.build(&input);
+    try testing.expectEqualStrings("TERM=xterm", std.mem.span(plan.envp[3].?));
+    try testing.expectEqualStrings("APP=a=b c", std.mem.span(plan.envp[4].?));
+    try testing.expect(plan.envp[5] == null);
+    input.env = &.{ .{ .key = "TERM", .value = "dumb" }, .{ .key = "PATH", .value = "/x" } };
+    plan.build(&input);
+    try testing.expectEqualStrings("HOME=/root", std.mem.span(plan.envp[0].?));
+    try testing.expectEqualStrings("HOSTNAME=web-1", std.mem.span(plan.envp[1].?));
+    try testing.expectEqualStrings("TERM=dumb", std.mem.span(plan.envp[2].?));
+    try testing.expectEqualStrings("PATH=/x", std.mem.span(plan.envp[3].?));
+    try testing.expect(plan.envp[4] == null);
+}
+
+test "the longest rootfs, name, command and ids still build a valid plan" {
+    // Goal: the bounds in constants.zig are enough for the worst case at once, and every path
+    // derived from the longest rootfs is a valid path.
+    const repeat = @import("../test_util.zig").repeat;
+    var plan: Plan = undefined;
+    const word = repeat('w', constants.command_word_bytes_max);
+    const words: [8][]const u8 = @splat(word);
+    const input: Input = .{
+        .rootfs = repeat('r', constants.rootfs_bytes_max),
+        .name = repeat('n', constants.container_name_bytes_max),
+        .command = &words,
+        .term = repeat('t', constants.term_bytes_max),
+        .uid = std.math.maxInt(u32) - 1,
+        .gid = std.math.maxInt(u32) - 1,
+        .mapping = .{ .full = .{
+            .newuidmap = "/usr/local/bin/newuidmap",
+            .newgidmap = "/usr/local/bin/newgidmap",
+            .uid_start = std.math.maxInt(u32) - constants.subid_range_min,
+            .gid_start = std.math.maxInt(u32) - constants.subid_range_min,
+        } },
+    };
+    plan.build(&input);
+    for (plan.steps[0..plan.count]) |step| {
+        try testing.expect(plan.text(step.target).len <= constants.path_bytes_max);
+        try testing.expect(plan.text(step.source).len <= constants.path_bytes_max);
+    }
+    try testing.expect(plan.paths_len <= constants.plan_paths_bytes_max);
+    try testing.expect(plan.strings_len <= constants.exec_strings_bytes_max);
+}
+
+test "describe names every step and adds the device or link" {
+    // Goal: no step lacks a phrase for its diagnostic, and the indexed ones say which device.
+    var plan: Plan = undefined;
+    const input = test_input(&.{"sh"});
+    plan.build(&input);
+    var buffer: [160]u8 = undefined;
+    for (plan.steps[0..plan.count]) |*step| {
+        const phrase = describe(step, &buffer);
+        try testing.expect(phrase.len > 10);
+        if (step.kind == .bind_device and step.index == 5) {
+            try testing.expectEqualStrings("bind-mounting /dev/tty", phrase);
+        }
+        if (step.kind == .link_dev and step.index == 1) {
+            try testing.expectEqualStrings("creating the link /dev/stdin", phrase);
+        }
+    }
+}
+
+test "a plan with a scope has the start_scope step before the go-ahead, with its names" {
+    // Goal: the scope's place in the plan: after the maps (single or helpers) and before
+    // release_child, so the child is in its cgroup before it may run anything; the unit and its
+    // description are made from the container's name; a plan without one is unchanged.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    input.scope = .{ .version = 255, .limits = .{ .pids = 64 } };
+    plan.build(&input);
+    try testing.expectEqual(steps_count_single + 2 + cgroup_view_steps_count, plan.count);
+    try testing.expectEqual(Kind.spawn_keeper, plan.steps[plan.first_child() - 3].kind);
+    try testing.expectEqual(Kind.start_scope, plan.steps[plan.first_child() - 2].kind);
+    try testing.expectEqual(Kind.release_child, plan.steps[plan.first_child() - 1].kind);
+    const step = plan.steps[plan.first_child() - 2];
+    try testing.expectEqualStrings("zbx-web-1.scope", plan.text(step.target));
+    try testing.expectEqualStrings("zbx: web-1", plan.text(step.source));
+    try testing.expectEqual(@as(u32, 255), plan.scope_version);
+    try testing.expectEqual(@as(?u32, 64), plan.scope_limits.pids);
+    var buffer: [160]u8 = undefined;
+    try testing.expectEqualStrings(
+        "starting the container's cgroup scope",
+        describe(&plan.steps[plan.first_child() - 2], &buffer),
+    );
+
+    input.mapping = .{ .full = test_helpers };
+    plan.build(&input);
+    try testing.expectEqual(steps_count_full + 2 + cgroup_view_steps_count, plan.count);
+    try testing.expectEqual(Kind.spawn_keeper, plan.steps[4].kind);
+    try testing.expectEqual(Kind.start_scope, plan.steps[5].kind);
+
+    input.scope = null;
+    plan.build(&input);
+    try testing.expectEqual(steps_count_full, plan.count);
+    try testing.expect(!plan.scoped);
+}
+
+const store_cache = "/home/alice/.local/share/zbx/store/cache/b3abc";
+const state_containers = "/home/alice/.local/state/zbx/containers/web-1";
+
+fn overlay_input(read_only: bool) Input {
+    var input = test_input(&.{"sh"});
+    input.rootfs = state_containers ++ "/merged";
+    input.read_only = read_only;
+    input.overlay = if (read_only) .{
+        .net = state_containers ++ "/net",
+        .lower = store_cache,
+        .upper = null,
+        .work = null,
+        .empty = state_containers ++ "/empty",
+    } else .{
+        .net = state_containers ++ "/net",
+        .lower = store_cache,
+        .upper = state_containers ++ "/upper",
+        .work = state_containers ++ "/work",
+        .empty = null,
+    };
+    return input;
+}
+
+test "a run of a tree mounts the overlay where a rootfs is bound, and has as many steps" {
+    // Goal: the overlay is a replacement, not an addition. Method: build with and without; the
+    // step count is the same, the bind is gone, the overlay's target is the merged directory
+    // and its data names the three layers.
+    var plain: Plan = undefined;
+    plain.build(&test_input(&.{"sh"}));
+    var plan: Plan = undefined;
+    plan.build(&overlay_input(false));
+    try testing.expectEqual(plain.count, plan.count);
+    var found: ?Step = null;
+    for (plan.steps[0..plan.count]) |step| {
+        try testing.expect(step.kind != .bind_rootfs);
+        if (step.kind == .mount_overlay) found = step;
+    }
+    const step = found.?;
+    try testing.expectEqualStrings(state_containers ++ "/merged", plan.text(step.target));
+    try testing.expectEqualStrings(
+        "userxattr,lowerdir=" ++ state_containers ++ "/net:" ++ store_cache ++
+            ",upperdir=" ++ state_containers ++ "/upper" ++
+            ",workdir=" ++ state_containers ++ "/work",
+        plan.text(step.source),
+    );
+    // Everything the container sets up is inside the merged directory.
+    try testing.expect(
+        std.mem.startsWith(
+            u8,
+            plan.text(plan.steps[plan.first_child() + 5].target),
+            state_containers,
+        ),
+    );
+}
+
+test "a lazy run mounts FUSE on the lower layer and serves it before the overlay is mounted" {
+    // Goal: S2 slice 4's order. Method: a lazy plan has `lazy_steps_count` steps more than the
+    // plain one; the child mounts FUSE on the lower layer and sends the descriptor before the
+    // overlay, and the parent serves it after the go-ahead and before it waits for the report.
+    var plain: Plan = undefined;
+    plain.build(&overlay_input(false));
+    var input = overlay_input(false);
+    input.lazy = true;
+    var plan: Plan = undefined;
+    plan.build(&input);
+    try testing.expect(plan.lazy and plan.has_channel());
+    try testing.expectEqual(plain.count + lazy_steps_count, plan.count);
+    var at: [4]?u32 = @splat(null);
+    const kinds = [_]Kind{ .mount_fuse, .send_fuse, .mount_overlay, .serve_fuse };
+    for (plan.steps[0..plan.count], 0..) |step, index| {
+        for (kinds, &at) |kind, *slot| {
+            if (step.kind == kind) slot.* = @intCast(index);
+        }
+    }
+    try testing.expect(at[0].? < at[1].? and at[1].? < at[2].?);
+    const mount = plan.steps[at[0].?];
+    try testing.expectEqualStrings(store_cache, plan.text(mount.target));
+    var release: ?u32 = null;
+    var report: ?u32 = null;
+    for (plan.steps[0..plan.count], 0..) |step, index| {
+        if (step.kind == .release_child) release = @intCast(index);
+        if (step.kind == .await_report) report = @intCast(index);
+    }
+    try testing.expect(release.? < at[3].? and at[3].? < report.?);
+    try testing.expectEqual(Side.parent, side_of(.serve_fuse));
+    try testing.expectEqual(Side.child, side_of(.mount_fuse));
+}
+
+test "a read-only run of a tree has no upper layer, and a second empty lower one" {
+    // Goal: `--read-only` with a digest is an overlay without an upper. Method: the data has
+    // two lower layers and neither upperdir nor workdir.
+    var plan: Plan = undefined;
+    plan.build(&overlay_input(true));
+    for (plan.steps[0..plan.count]) |step| {
+        if (step.kind != .mount_overlay) continue;
+        const data = plan.text(step.source);
+        try testing.expectEqualStrings(
+            "userxattr,lowerdir=" ++ state_containers ++ "/net:" ++ store_cache ++ ":" ++
+                state_containers ++ "/empty",
+            data,
+        );
+        try testing.expect(std.mem.indexOf(u8, data, "upperdir") == null);
+        try testing.expect(std.mem.indexOf(u8, data, "workdir") == null);
+    }
+}
+
+fn under_store(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "/zbx/store/") != null;
+}
+
+test "no step ever mounts a path of the store writable, or makes anything in it" {
+    // Goal: "running a container never writes into the shared store", at the plan. Method: for
+    // a writable and a read-only run of a tree, every step's target and source is checked: the
+    // store's path appears in exactly one place, the lowerdir of the overlay; nothing is bound,
+    // remounted, created or linked in it; and the upper and work layers are elsewhere.
+    for ([_]bool{ false, true }) |read_only| {
+        var plan: Plan = undefined;
+        plan.build(&overlay_input(read_only));
+        var mentions: u32 = 0;
+        for (plan.steps[0..plan.count]) |step| {
+            const target = plan.text(step.target);
+            const source = plan.text(step.source);
+            try testing.expect(!under_store(target)); // Nothing is made, bound or mounted there.
+            if (!under_store(source)) continue;
+            try testing.expectEqual(Kind.mount_overlay, step.kind);
+            mentions += 1;
+            // The store's path is the lower layer, and only that.
+            const lower = ":" ++ store_cache;
+            try testing.expect(std.mem.indexOf(u8, source, lower) != null);
+            if (std.mem.indexOf(u8, source, "upperdir=")) |at| {
+                try testing.expect(!under_store(source[at..]));
+            }
+            if (std.mem.indexOf(u8, source, "workdir=")) |at| {
+                try testing.expect(!under_store(source[at..]));
+            }
+        }
+        try testing.expectEqual(@as(u32, 1), mentions);
+    }
+}
+
+test "a path the kernel would split is not a layer" {
+    // Goal: the mount data is text split at commas and colons. Method: each separator.
+    try testing.expectEqual(@as(?u8, ','), spec.overlay_path_problem("/a,b"));
+    try testing.expectEqual(@as(?u8, ':'), spec.overlay_path_problem("/a:b"));
+    try testing.expectEqual(@as(?u8, '\\'), spec.overlay_path_problem("/a\\b"));
+    try testing.expectEqual(@as(?u8, null), spec.overlay_path_problem("/home/alice/.local/state"));
+}
+
+fn index_of(plan: *const Plan, kind: Kind) ?usize {
+    assert(plan.count <= constants.plan_steps_max);
+    assert(plan.count > 0);
+    for (plan.steps[0..plan.count], 0..) |step, index| {
+        if (step.kind == kind) return index;
+    }
+    return null;
+}
+
+test "/sys is bound read-only from the host in a plan that shares the host's network" {
+    // Goal: the M4 decision, kept for `--net host`. Method: the three steps are there, in order,
+    // with the host's /sys as the source and the rootfs's as the target, whether or not the
+    // rootfs is read-only.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    input.network = .host;
+    plan.build(&input);
+    const made = index_of(&plan, .make_sys_dir).?;
+    try testing.expectEqual(Kind.bind_sys, plan.steps[made + 1].kind);
+    try testing.expectEqual(Kind.remount_sys, plan.steps[made + 2].kind);
+    try testing.expectEqualStrings("/srv/alpine/sys", plan.text(plan.steps[made + 1].target));
+    try testing.expectEqualStrings("/sys", plan.text(plan.steps[made + 1].source));
+    try testing.expect(made + 2 < index_of(&plan, .pivot_root).?);
+    input.read_only = true;
+    plan.build(&input);
+    try testing.expect(index_of(&plan, .remount_sys).? < index_of(&plan, .remount_readonly).?);
+}
+
+test "a working directory adds one step and a user two, after the root is entered" {
+    // Goal: the image's config at run. Method: the steps exist only when asked for, the user
+    // comes after the capabilities and before no_new_privs, root alone adds nothing.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    plan.build(&input);
+    const plain = plan.count;
+    try testing.expect(index_of(&plan, .enter_workdir) == null);
+    try testing.expect(index_of(&plan, .set_user) == null);
+    input.workdir = "/srv/app";
+    input.user = .{ .uid = 0, .gid = 0 };
+    plan.build(&input);
+    try testing.expectEqual(plain + 1, plan.count);
+    try testing.expect(index_of(&plan, .set_user) == null);
+    try testing.expect(index_of(&plan, .enter_new_root).? < index_of(&plan, .enter_workdir).?);
+    try testing.expectEqualStrings(
+        "/srv/app",
+        plan.text(plan.steps[index_of(&plan, .enter_workdir).?].target),
+    );
+    input.user = .{ .uid = 33, .gid = 44 };
+    plan.build(&input);
+    // The user, and the death signal asked for again right after it.
+    try testing.expectEqual(plain + 3, plan.count);
+    try testing.expectEqual(@as(u32, 33), plan.user_uid);
+    try testing.expectEqual(@as(u32, 44), plan.user_gid);
+    try testing.expect(index_of(&plan, .clear_ambient).? < index_of(&plan, .set_user).?);
+    const rearm = index_of(&plan, .rearm_death_signal).?;
+    try testing.expectEqual(index_of(&plan, .set_user).? + 1, rearm);
+    try testing.expect(rearm < index_of(&plan, .set_no_new_privs).?);
+    plan.check();
+}
+
+test "an image's PATH decides where a bare command is looked for" {
+    // Goal: python:3.12-slim's PATH starts with /usr/local/bin and has seven directories.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"python"});
+    const path = "/opt/py/bin:/usr/local/bin:relative:/usr/bin::/bin";
+    const env = [_]spec.Label{.{ .key = "PATH", .value = path }};
+    input.env = &env;
+    plan.build(&input);
+    try testing.expectEqual(@as(u32, 4), plan.candidates_count);
+    try testing.expectEqualStrings("/opt/py/bin/python", plan.text(plan.candidates[0]));
+    try testing.expectEqualStrings("/bin/python", plan.text(plan.candidates[3]));
+    plan.check();
+}
+
+test "a container with a network of its own gets a sysfs of its own, and lo up first" {
+    // Goal: M5's /sys and loopback. Method: in the default plan the sysfs replaces the bind and
+    // the remount, `lo` comes up before the capabilities are restricted, and a plan that shares
+    // the host's network has neither and the same number of steps.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    plan.build(&input);
+    try testing.expect(plan.isolated());
+    const made = index_of(&plan, .make_sys_dir).?;
+    try testing.expectEqual(Kind.mount_sysfs, plan.steps[made + 1].kind);
+    try testing.expectEqualStrings("/srv/alpine/sys", plan.text(plan.steps[made + 1].target));
+    try testing.expect(index_of(&plan, .bind_sys) == null);
+    try testing.expect(index_of(&plan, .remount_sys) == null);
+    const loopback = index_of(&plan, .bring_up_loopback).?;
+    try testing.expect(loopback < index_of(&plan, .restrict_capabilities).?);
+    try testing.expect(!plan.steps[index_of(&plan, .bring_up_loopback).?].tolerant);
+    const isolated_count = plan.count;
+    input.network = .host;
+    plan.build(&input);
+    try testing.expect(!plan.isolated());
+    try testing.expect(index_of(&plan, .bring_up_loopback) == null);
+    try testing.expect(index_of(&plan, .mount_sysfs) == null);
+    try testing.expectEqual(isolated_count, plan.count);
+}
+
+test "a read-only plan binds the hostname read-only too, and has one step more (#117)" {
+    // Goal: `--read-only` covers /etc/hostname, as it does the other generated files; the rootfs
+    // remount is not recursive and does not reach the bind. Method: build a read-only and a
+    // writable plan of the same run; only the first remounts the hostname, and the count says so.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    plan.build(&input);
+    const writable_count = plan.count;
+    input.read_only = true;
+    plan.build(&input);
+    const hostname = @backingInt(netfiles.File.hostname);
+    var remounts: u32 = 0;
+    for (plan.steps[0..plan.count]) |step| {
+        if (step.kind == .remount_etc_file and step.index == hostname) remounts += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), remounts);
+    try testing.expectEqual(plan.steps_expected(), plan.count);
+    try testing.expect(plan.count > writable_count);
+}
+
+test "a given hosts file is bound itself, read-only, with no staged copy and no fallback (ZB-6)" {
+    // Goal: ZB-6's plan. Method: build with and without `hosts_file`; the given plan has two
+    // steps fewer (no stage, no unstage of the hosts), binds the host's path over the mount
+    // point and remounts it read-only, both non-tolerant and in no group, while the other two
+    // files keep their steps, and the step count is the one `steps_expected` says.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    input.network = .none;
+    plan.build(&input);
+    const generated = plan.count;
+    input.hosts_file = "/srv/mesh/hosts";
+    plan.build(&input);
+    try testing.expectEqual(generated - 2, plan.count);
+    try testing.expectEqual(plan.steps_expected(), plan.count);
+    const hosts: u8 = @backingInt(netfiles.File.hosts);
+    var binds: u32 = 0;
+    for (plan.steps[0..plan.count], 0..) |step, at| {
+        if (step.index != hosts or !is_etc(step.kind)) continue;
+        if (step.kind == .create_etc_file or step.kind == .make_etc_dir) continue;
+        try testing.expect(step.kind != .stage_etc_file and step.kind != .unstage_etc_file);
+        try testing.expect(!step.tolerant);
+        try testing.expectEqual(@as(u8, 0), group_of(&step));
+        if (step.kind != .bind_etc_file) continue;
+        binds += 1;
+        try testing.expectEqualStrings("/srv/mesh/hosts", plan.text(step.source));
+        try testing.expectEqualStrings("/srv/alpine/etc/hosts", plan.text(step.target));
+        try testing.expectEqual(Kind.remount_etc_file, plan.steps[at + 1].kind);
+    }
+    try testing.expectEqual(@as(u32, 1), binds);
+    var stages: u32 = 0;
+    for (plan.steps[0..plan.count]) |step| stages += @intFromBool(step.kind == .stage_etc_file);
+    try testing.expectEqual(@as(u32, 2), stages);
+}
+
+test "the generated /etc files are bound read-only over the image's, and the staged name goes" {
+    // Goal: M5's hosts and resolv.conf. Method: for each file the mount point, the stage, the
+    // bind, the read-only remount and the removal come in that order, the text is the file's,
+    // all are tolerant and in one group per file, and the bind comes after /dev is mounted and
+    // before the pivot.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    plan.build(&input);
+    var stages: u32 = 0;
+    for (plan.steps[0..plan.count], 0..) |step, at| {
+        if (step.kind != .stage_etc_file) continue;
+        stages += 1;
+        const name = etc_name(step.index);
+        try testing.expectEqual(Kind.bind_etc_file, plan.steps[at + 1].kind);
+        // The hostname is not remounted read-only: a program may write it (#113).
+        const writable = step.index == @backingInt(netfiles.File.hostname) and !plan.read_only;
+        const parts: usize = if (writable) 3 else 4;
+        if (!writable) try testing.expectEqual(Kind.remount_etc_file, plan.steps[at + 2].kind);
+        try testing.expectEqual(Kind.unstage_etc_file, plan.steps[at + parts - 1].kind);
+        for (plan.steps[at .. at + parts]) |part| {
+            try testing.expect(part.tolerant);
+            try testing.expectEqual(step.index + 1, group_of(&part));
+        }
+        const staged = plan.text(step.target);
+        try testing.expect(std.mem.startsWith(u8, staged, "/srv/alpine/dev/.zbx-"));
+        try testing.expectEqualStrings(staged, plan.text(plan.steps[at + 1].source));
+        const inside = plan.text(plan.steps[at + 1].target);
+        try testing.expect(std.mem.endsWith(u8, inside, name));
+        try testing.expect(std.mem.startsWith(u8, inside, "/srv/alpine/etc/"));
+        try testing.expect(at > index_of(&plan, .mount_dev).?);
+        try testing.expect(at < index_of(&plan, .pivot_root).?);
+    }
+    try testing.expectEqual(@as(u32, 3), stages);
+    // #113: /etc/hostname holds the container's name, as its sethostname does.
+    try testing.expectEqualStrings("web-1\n", plan.text(plan.etc_texts[2]));
+    const hosts_text = plan.text(plan.etc_texts[0]);
+    try testing.expect(std.mem.indexOf(u8, hosts_text, "127.0.0.1\tlocalhost web-1\n") != null);
+    try testing.expect(std.mem.indexOf(u8, plan.text(plan.etc_texts[1]), "nameserver") == null);
+    input.network = .host;
+    input.host_resolv = "nameserver 127.0.0.53\n";
+    plan.build(&input);
+    try testing.expectEqualStrings("nameserver 127.0.0.53\n", plan.text(plan.etc_texts[1]));
+}
+
+test "a tree's mount points are in the net layer, a directory's in the rootfs" {
+    // Goal: the image's tree and the upper layer (which a commit reads) are not written for the
+    // generated files. Method: the mount points of a tree are made below the net layer, before
+    // the overlay is mounted; those of a directory below the rootfs, after the bind.
+    var plan: Plan = undefined;
+    plan.build(&overlay_input(false));
+    const overlay_at = index_of(&plan, .mount_overlay).?;
+    var points: u32 = 0;
+    for (plan.steps[0..plan.count], 0..) |step, at| {
+        if (step.kind != .make_etc_dir and step.kind != .create_etc_file) continue;
+        points += 1;
+        try testing.expect(at < overlay_at);
+        const target = plan.text(step.target);
+        try testing.expect(std.mem.startsWith(u8, target, state_containers ++ "/net/etc"));
+    }
+    try testing.expectEqual(@as(u32, 4), points);
+    plan.build(&test_input(&.{"sh"}));
+    const bind_at = index_of(&plan, .bind_rootfs).?;
+    try testing.expectEqual(Kind.make_etc_dir, plan.steps[bind_at + 1].kind);
+    try testing.expectEqualStrings("/srv/alpine/etc", plan.text(plan.steps[bind_at + 1].target));
+}
+
+test "the knobs add a step per sysctl and per limit, after /proc and before the capabilities" {
+    // Goal: M2b's plan steps (brief items 1, 2 and 4). Method: a plan without knobs has none and
+    // mounts /dev/shm at the default size; one with two sysctls and two limits has four steps
+    // more, each in its place, and the size asked for.
+    var plan: Plan = undefined;
+    var input = test_input(&.{"sh"});
+    plan.build(&input);
+    const plain = plan.count;
+    try testing.expect(index_of(&plan, .write_sysctl) == null);
+    try testing.expect(index_of(&plan, .set_rlimit) == null);
+    const shm = plan.steps[index_of(&plan, .mount_shm).?];
+    try testing.expectEqualStrings("mode=1777,size=67108864", plan.text(shm.source));
+    const sysctls = [_]knobs.Sysctl{
+        .{ .key = "net.core.somaxconn", .value = "8192" },
+        .{ .key = "kernel.shmmax", .value = "68719476736" },
+    };
+    input.network = .none;
+    input.sysctls = &sysctls;
+    input.shm_bytes = 256 << 20;
+    input.rlimits.nofile = .{ .soft = 4096, .hard = 8192 };
+    input.rlimits.stack = .{ .soft = knobs.unlimited, .hard = knobs.unlimited };
+    plan.build(&input);
+    try testing.expectEqual(plain + 4, plan.count);
+    const first = index_of(&plan, .write_sysctl).?;
+    try testing.expect(index_of(&plan, .mount_proc).? < first);
+    try testing.expect(index_of(&plan, .enter_new_root).? < first);
+    try testing.expectEqualStrings(
+        "/proc/sys/net/core/somaxconn",
+        plan.text(plan.steps[first].target),
+    );
+    try testing.expectEqualStrings("8192", plan.text(plan.steps[first].source));
+    const second = plan.steps[first + 1];
+    try testing.expectEqualStrings("/proc/sys/kernel/shmmax", plan.text(second.target));
+    try testing.expectEqual(@as(u8, 1), plan.steps[first + 1].index);
+    // The limits follow, in the order of `knobs.Resource`, then the capabilities are dropped.
+    try testing.expectEqual(Kind.set_rlimit, plan.steps[first + 2].kind);
+    try testing.expectEqual(@backingInt(knobs.Resource.nofile), plan.steps[first + 2].index);
+    try testing.expectEqual(@backingInt(knobs.Resource.stack), plan.steps[first + 3].index);
+    try testing.expectEqual(Kind.restrict_capabilities, plan.steps[first + 4].kind);
+    for (plan.steps[first .. first + 4]) |step| try testing.expect(!step.tolerant);
+    const sized = plan.steps[index_of(&plan, .mount_shm).?];
+    try testing.expectEqualStrings("mode=1777,size=268435456", plan.text(sized.source));
+    plan.check();
+}

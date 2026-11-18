@@ -1,0 +1,1416 @@
+const std = @import("std");
+
+/// The release targets. Both are built statically (no libc is ever linked) and in ReleaseSafe so
+/// assertions stay on. See docs/STYLE.md.
+const release_targets = [_]std.Target.Query{
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+};
+
+const release_install_dirs = [_][]const u8{
+    "release/x86_64-linux",
+    "release/aarch64-linux",
+};
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // The version has one source of truth, build.zig.zon, handed to the code as an option.
+    const manifest = @import("build.zig.zon");
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", manifest.version);
+    // 0.5.2 and 0.5.3 ship lazy start (S2) dormant: `--lazy` is refused unless a build turns it on,
+    // which only demo-s2-lazy's zbx does (docs/decisions/2026-11-16-0.5.2-s2-dormant.md).
+    options.addOption(bool, "lazy_start", false);
+
+    // LLVM in every mode, not Zig's own x86_64 backend in Debug: that backend writes each
+    // `undefined` global into .data as 0xaa bytes, which made a Debug zbx 335 MB and a test
+    // binary 1.4 GB, filling the build cache a build at a time. LLVM leaves them in .bss.
+    // On a Mac the default install is the macOS zbx (a forwarder to a Linux VM; it links
+    // libSystem and Virtualization.framework). The Linux zbx, static and libc-free, is what
+    // `-Dtarget=<arch>-linux` and `release` build, and what the VM's initramfs carries.
+    const vm_module = add_vm_module(b);
+    const for_macos = target.result.os.tag == .macos;
+    if (for_macos) {
+        add_macos_install(b, options, target, optimize, vm_module);
+    } else {
+        const exe = b.addExecutable(.{
+            .name = "zbx",
+            .root_module = zbx_module(b, options, target, optimize, null),
+            .use_llvm = true,
+        });
+        b.installArtifact(exe);
+    }
+    add_library_module(b, options, target, optimize);
+    add_package_module(b, target, optimize);
+
+    add_test_step(b, options, target, optimize, vm_module);
+    add_tidy_step(b);
+    const fuzz = add_fuzz_step(b, options, target);
+    add_release_step(b, options);
+    const packages_help = "Package tree for packages-redate and release-assets";
+    const packages_dir = b.option([]const u8, "packages-dir", packages_help);
+    add_packages_steps(b, options, packages_dir);
+    add_release_assets_step(b, options, packages_dir);
+    add_demo_step(b, options, vm_module);
+    add_errors_site_steps(b);
+    add_trust_wasm_step(b);
+    add_dbus_live_step(b, options);
+    add_check_step(b, fuzz);
+    add_vm_kernel_steps(b);
+}
+
+/// The runtime as a module named `zigbox`, for Zigcube's agent to link: another build adds this
+/// package as a dependency and imports `zigbox` from it. Its root is in `src/` so that the files
+/// it imports (`constants.zig`, `host.zig`, ...) are inside the module's path.
+fn add_library_module(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    _ = b.addModule("zigbox", .{
+        .root_source_file = b.path("src/zigbox.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+}
+
+/// The package writer as a module named `zigbox_package`, for Zigcube's C3 to build its own
+/// packages: another build imports it from this package as it does `zigbox_vm`. It knows nothing
+/// about `zbx`, and its root is in `src/` so that `constants.zig` is inside its path.
+fn add_package_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    _ = b.addModule("zigbox_package", .{
+        .root_source_file = b.path("src/package.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+}
+
+/// `zig build packages` writes the apt and dnf trees of the `zigbox` packages under
+/// `zig-out/packages/`; `-Dsignatures=<dir>` adds the owner's signatures, `-Dtest-key` signs with
+/// the fixed test key (CI). `packages-check` places the same files, then checks every digest.
+/// It never runs `gpg`: it prints the commands (docs/releases/packaging.md).
+fn add_packages_steps(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    packages_dir: ?[]const u8,
+) void {
+    const signatures_help =
+        "Directory of the owner's signatures for `packages` (docs/releases/packaging.md)";
+    const signatures = b.option([]const u8, "signatures", signatures_help);
+    const test_key_help = "Sign the packages with the fixed test key";
+    const test_key = b.option(bool, "test-key", test_key_help) orelse false;
+    const signed_at = b.option([]const u8, "signed-at", signed_at_help);
+    const tool = package_tool(b);
+    const out = "zig-out/packages";
+    var steps: [2]*std.Build.Step.Run = undefined;
+    for (&steps, [_]bool{ false, true }) |*slot, checking| {
+        const run = b.addRunArtifact(tool);
+        run.setCwd(b.path("."));
+        run.addArgs(&.{ "--version", @import("build.zig.zon").version });
+        add_release_binaries(b, options, run);
+        run.addArg("--license");
+        run.addFileArg(b.path("LICENSE"));
+        run.addArgs(&.{ "--out", out });
+        if (signatures) |directory| run.addArgs(&.{ "--signatures", directory });
+        if (test_key) run.addArg("--test-key");
+        if (signed_at) |seconds| run.addArgs(&.{ "--signed-at", seconds });
+        if (checking) run.addArg("--check");
+        run.has_side_effects = true;
+        slot.* = run;
+    }
+    steps[1].step.dependOn(&steps[0].step);
+    const packages_help = "Write the apt and dnf trees of the zigbox packages";
+    b.step("packages", packages_help).dependOn(&steps[0].step);
+    const check_help = "Place the signatures, then check every file of the package trees";
+    b.step("packages-check", check_help).dependOn(&steps[1].step);
+    add_redate_step(b, tool, signed_at, packages_dir);
+}
+
+const signed_at_help =
+    "Unix seconds of the signing: the apt Release gets this Date and a Valid-Until 21 days later";
+
+/// `zig build packages-redate -Dsigned-at=N -Dpackages-dir=DIR` rewrites the `Date` and
+/// `Valid-Until` of DIR's apt `Release` and drops the signature files that no longer match it,
+/// without rebuilding any package (the weekly refresh signs the result again).
+fn add_redate_step(
+    b: *std.Build,
+    tool: *std.Build.Step.Compile,
+    signed_at: ?[]const u8,
+    directory: ?[]const u8,
+) void {
+    const redate_help = "Re-date an existing apt Release (-Dsigned-at, -Dpackages-dir)";
+    const step = b.step("packages-redate", redate_help);
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArg("--redate");
+    run.addArgs(&.{ "--out", directory orelse "zig-out/packages" });
+    run.addArgs(&.{ "--signed-at", signed_at orelse "0" });
+    run.has_side_effects = true;
+    if (signed_at == null) {
+        step.dependOn(&b.addFail("packages-redate needs -Dsigned-at=SECONDS").step);
+    }
+    step.dependOn(&run.step);
+}
+
+/// `zig build release-assets` writes the tarballs, the SBOM and `SHA256SUMS` under
+/// `zig-out/release-assets/`. With `-Dpackages-dir=DIR` (the signed tree of the release script)
+/// it adds the debs and rpms; `-Drepos-archive=FILE` adds the repository archive; without
+/// `-Dpackages-dir` the step needs `-Dno-packages` (docs/releases/packaging.md).
+fn add_release_assets_step(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    packages: ?[]const u8,
+) void {
+    const no_packages_help = "Write release assets without debs and rpms";
+    const no_packages = b.option(bool, "no-packages", no_packages_help) orelse false;
+    const archive_help = "zigbox-repos.tar.gz to add to the assets";
+    const archive = b.option([]const u8, "repos-archive", archive_help);
+    const epoch = b.option([]const u8, "source-date-epoch", "Timestamp of tar entries and SBOM");
+    const tool = b.addExecutable(.{
+        .name = "release_assets_main",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/release_assets_main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ "assets", "--version", @import("build.zig.zon").version });
+    add_release_binaries(b, options, run);
+    run.addArg("--license");
+    run.addFileArg(b.path("LICENSE"));
+    run.addArgs(&.{ "--license-id", license_id });
+    run.addArgs(&.{ "--zig-version", @import("builtin").zig_version_string });
+    run.addArgs(&.{ "--out", "zig-out/release-assets" });
+    if (epoch) |seconds| run.addArgs(&.{ "--source-date-epoch", seconds });
+    if (packages) |directory| run.addArgs(&.{ "--packages", directory });
+    if (no_packages) run.addArg("--no-packages");
+    if (archive) |file| run.addArgs(&.{ "--extra", file });
+    run.has_side_effects = true;
+    const help = "Write the release tarballs, the SBOM and SHA256SUMS (docs/releases/packaging.md)";
+    b.step("release-assets", help).dependOn(&run.step);
+    const sums_dir = b.option([]const u8, "assets-dir", "Directory of assets for release-sums");
+    const name_help = "File release-sums writes";
+    const sums_name = b.option([]const u8, "sums-name", name_help) orelse "SHA256SUMS";
+    const sums = b.addRunArtifact(tool);
+    sums.setCwd(b.path("."));
+    const directory = sums_dir orelse "zig-out/release-assets";
+    sums.addArgs(&.{ "sums", "--dir", directory, "--name", sums_name });
+    sums.has_side_effects = true;
+    const sums_help = "Write SHA256SUMS over a directory again (-Dassets-dir, -Dsums-name)";
+    b.step("release-sums", sums_help).dependOn(&sums.step);
+}
+
+const license_id = "MIT";
+
+fn package_tool(b: *std.Build) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "package_main",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/package_main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+}
+
+/// The packages of `demo-m8-packages`: the same writer as `zig build packages -Dtest-key`, into
+/// a directory of its own so the demo never reads a tree signed with anything else. The demo's
+/// run depends on the returned step and is handed the directory.
+const m8_packages_dir = ".zig-cache/m8-packages";
+
+fn add_m8_packages(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    demo: *std.Build.Step.Run,
+) void {
+    const run = b.addRunArtifact(package_tool(b));
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ "--version", @import("build.zig.zon").version });
+    add_release_binaries(b, options, run);
+    run.addArg("--license");
+    run.addFileArg(b.path("LICENSE"));
+    run.addArgs(&.{ "--out", m8_packages_dir, "--test-key" });
+    run.has_side_effects = true;
+    demo.step.dependOn(&run.step);
+    demo.addArgs(&.{ "--packages", m8_packages_dir });
+    demo.addArgs(&.{ "--version", @import("build.zig.zon").version });
+}
+
+/// The VM test harness as a module named `zigbox_vm`: boot an Ubuntu 24.04 guest under QEMU,
+/// provision it with cloud-init, run commands on its console, copy files in, tear it down. The
+/// demos below are built on it, and Zigcube's real-runtime smoke test imports it with
+/// `b.dependency("zigbox", .{}).module("zigbox_vm")` (docs/vm-module.md). Target and optimize
+/// mode come from the module that imports it.
+fn add_vm_module(b: *std.Build) *std.Build.Module {
+    return b.addModule("zigbox_vm", .{
+        .root_source_file = b.path(vm_module_root),
+        .link_libc = false,
+    });
+}
+
+const vm_module_root = "src/testing/vm/lib/zigbox_vm.zig";
+
+fn zbx_module(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = false,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+}
+
+/// Every test root. `zig build tidy` reads this list to find tests that no root reaches. On a Mac
+/// the roots that need a Linux kernel (the simulator and the Linux runtime, `linux_only`) are
+/// skipped by name and the macOS root runs; `-Dtarget=aarch64-linux` compiles the first kind
+/// without running it. On Linux, the macOS root is not built.
+const roots = [_][]const u8{
+    "src/testing/vm/lib/zigbox_vm.zig",
+    "src/testing/vm/main.zig",
+    "src/testing/vm/main_m1.zig",
+    "src/testing/vm/main_m2.zig",
+    "src/testing/vm/main_m3.zig",
+    "src/testing/vm/main_m4.zig",
+    "src/testing/vm/main_m5.zig",
+    "src/testing/vm/main_m6.zig",
+    "src/testing/vm/main_m6b.zig",
+    "src/testing/vm/main_m6d.zig",
+    "src/testing/vm/main_m7.zig",
+    "src/testing/vm/main_m8.zig",
+    "src/testing/vm/main_m8b.zig",
+    "src/testing/vm/main_m9.zig",
+    "src/testing/vm/main_m10.zig",
+    "src/testing/vm/main_s2_lazy.zig",
+    "src/testing/vm/main_s2_probe.zig",
+    "src/testing/vm/main_m2b_probe.zig",
+    "src/testing/vm/main_m2b.zig",
+    "src/testing/vm/main_c4.zig",
+    "src/testing/vm/main_z7.zig",
+    "src/testing/vm/main_m8_packages.zig",
+    "src/testing/vm/main_top20.zig",
+    "src/main.zig",
+    "src/zigbox.zig",
+    "src/package.zig",
+    "src/package_main.zig",
+    "src/release_assets_main.zig",
+    "src/tidy.zig",
+    "src/fuzz.zig",
+    "src/size_check.zig",
+    "src/errors_site.zig",
+    "src/vm_image/kernel_fetch.zig",
+    "src/mac_release.zig",
+    "src/testing/mac_demo.zig",
+    "src/vm_image_make.zig",
+    "src/vm_image/kernel_build.zig",
+    "src/macos_main.zig",
+};
+
+const linux_only = [_][]const u8{
+    "src/testing/vm/lib/zigbox_vm.zig",
+    "src/testing/vm/main.zig",
+    "src/testing/vm/main_m1.zig",
+    "src/testing/vm/main_m2.zig",
+    "src/testing/vm/main_m3.zig",
+    "src/testing/vm/main_m4.zig",
+    "src/testing/vm/main_m5.zig",
+    "src/testing/vm/main_m6.zig",
+    "src/testing/vm/main_m6b.zig",
+    "src/testing/vm/main_m6d.zig",
+    "src/testing/vm/main_m7.zig",
+    "src/testing/vm/main_m8.zig",
+    "src/testing/vm/main_m8b.zig",
+    "src/testing/vm/main_m9.zig",
+    "src/testing/vm/main_m10.zig",
+    "src/testing/vm/main_s2_lazy.zig",
+    "src/testing/vm/main_s2_probe.zig",
+    "src/testing/vm/main_m2b_probe.zig",
+    "src/testing/vm/main_m2b.zig",
+    "src/testing/vm/main_c4.zig",
+    "src/testing/vm/main_z7.zig",
+    "src/testing/vm/main_m8_packages.zig",
+    "src/testing/vm/main_top20.zig",
+    "src/main.zig",
+    "src/zigbox.zig",
+    "src/package.zig",
+    "src/package_main.zig",
+    "src/release_assets_main.zig",
+    "src/fuzz.zig",
+};
+
+const macos_root = "src/macos_main.zig";
+const mac_demo_root = "src/testing/mac_demo.zig";
+const kernel_build_root = "src/vm_image/kernel_build.zig";
+
+fn is_listed(list: []const []const u8, name: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, name)) return true;
+    }
+    return false;
+}
+
+fn add_test_step(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vm_module: *std.Build.Module,
+) void {
+    const test_step = b.step("test", "Run unit, snapshot and simulation tests");
+    const for_macos = target.result.os.tag == .macos;
+    const runs_here = target.result.os.tag == b.graph.host.result.os.tag;
+    for (roots) |root| {
+        if (for_macos and is_listed(&linux_only, root)) continue; // Skipped on a Mac, by name.
+        if (!for_macos and std.mem.eql(u8, root, macos_root)) continue;
+        const module = b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = target,
+            .optimize = optimize,
+            // macOS needs libSystem; the Linux roots never link a libc.
+            .link_libc = if (for_macos) null else false,
+            // The tests' static workspaces together pass 2 GiB (M9 grew the build file), which the
+            // small code model cannot address on x86-64; the release binary stays small.
+            .code_model = if (target.result.cpu.arch == .x86_64) .medium else .default,
+            .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+        });
+        // Only the top-20 harness reads it; the policy is a data file, so an import costs nothing.
+        module.addAnonymousImport("seccomp_policy", .{
+            .root_source_file = b.path("src/runtime/policy/seccomp.zon"),
+        });
+        add_m9_cases(b, module);
+        add_m6d_goldens(b, module);
+        if (std.mem.eql(u8, root, macos_root)) link_macos(module, add_vm_image(b, options));
+        // The demos are built on the VM module; the module's own root needs no import of itself.
+        const needs_vm = std.mem.startsWith(u8, root, "src/testing/vm/main") or
+            std.mem.eql(u8, root, mac_demo_root);
+        if (needs_vm) {
+            module.addImport("zigbox_vm", vm_module);
+        }
+        if (std.mem.eql(u8, root, kernel_build_root)) {
+            module.addImport("build_options", kernel_pin_options(b).createModule());
+        }
+        // LLVM, as for zbx above: Zig's own backend fills `undefined` globals with 0xaa in the
+        // binary, so a test could pass on that fill (gc_tests did) where a release would not.
+        const unit_tests = b.addTest(.{ .root_module = module, .use_llvm = true });
+        if (runs_here) {
+            test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+        } else {
+            test_step.dependOn(&unit_tests.step); // Compiled, not run: another OS than this host.
+        }
+    }
+}
+
+/// The kernel pin (`vm/kernel/pin.zon`) as build options, for the kernel build program.
+fn kernel_pin_options(b: *std.Build) *std.Build.Step.Options {
+    const pinned = @import("vm/kernel/pin.zon");
+    const options = b.addOptions();
+    options.addOption([]const u8, "url", pinned.url);
+    options.addOption([]const u8, "tarball_sha256", pinned.tarball_sha256);
+    options.addOption([]const u8, "image_sha256", pinned.image_sha256);
+    options.addOption([]const u8, "release_url", pinned.release_url);
+    options.addOption([]const u8, "toolchain", pinned.toolchain);
+    return options;
+}
+
+fn add_tidy_step(b: *std.Build) void {
+    // Tidy is a host tool: always built for the machine running the build.
+    const tidy = b.addExecutable(.{
+        .name = "tidy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tidy.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tidy);
+    run.setCwd(b.path("."));
+    // Formatting is checked alongside the mechanical rules: both must pass before review.
+    // The golden import is the bytes `zbx import` writes, which put a one-element tuple in
+    // spaces where `zig fmt` would not (`.{ "go.mod" }`): a golden is not reformatted.
+    const format = b.addFmt(.{
+        .paths = &.{ b.path("src"), b.path("build.zig") },
+        .exclude_paths = &.{b.path("src/testing/vm/m9_expected.build.zon")},
+        .check = true,
+    });
+    const step = b.step("tidy", "Check formatting, line and function length, banned patterns");
+    step.dependOn(&format.step);
+    step.dependOn(&run.step);
+}
+
+fn add_fuzz_step(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+) *std.Build.Step.Compile {
+    // Fuzzers keep assertions on regardless of the user's optimize flag: they exist to trip them.
+    const fuzz = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+            .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+        }),
+    });
+    const run = b.addRunArtifact(fuzz);
+    run.addPassthruArgs();
+    const description = "Run one seeded fuzzer: zig build fuzz -- <fuzzer> [seed] [iterations]";
+    const step = b.step("fuzz", description);
+    step.dependOn(&run.step);
+    add_fuzz_macos_step(b, options);
+    return fuzz;
+}
+
+/// `zig build fuzz-macos`: the fuzzers compiled for a Mac, analysed only (nothing requests the
+/// binary, so no code is generated and no SDK is needed). The macOS job builds them natively, and
+/// they reach `cli.run`, so a Linux-only path that is not cut at comptime fails there and nowhere
+/// else (S2 slice 4's FUSE server did). This catches it on Linux in seconds; `check` runs it.
+fn add_fuzz_macos_step(b: *std.Build, options: *std.Build.Step.Options) void {
+    const fuzz = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }),
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+            .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+        }),
+    });
+    const step = b.step("fuzz-macos", "Compile the fuzzers for aarch64-macos, without a binary");
+    step.dependOn(&fuzz.step);
+}
+
+/// The spec's release criterion: a static binary under 4 MiB (2 MiB until M4's TLS client and
+/// decoders; live doc rev 54).
+const release_size_limit_bytes = 4 * 1024 * 1024;
+
+fn add_release_step(b: *std.Build, options: *std.Build.Step.Options) void {
+    const description = "Cross-compile static ReleaseSafe binaries, stripped, under 4 MiB";
+    const step = b.step("release", description);
+    // Release binaries are stripped by default so that they meet the size limit; ReleaseSafe
+    // stays, so assertions still fire, only without symbolised stack traces. -Dstrip=false builds
+    // the debug-info variant (about 3.7 MB) for diagnosing a crash, and skips the size gate.
+    const strip_help = "Strip debug info from release binaries (default true)";
+    const strip = b.option(bool, "strip", strip_help) orelse true;
+
+    const checker = b.addExecutable(.{
+        .name = "size_check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/size_check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const check = b.addRunArtifact(checker);
+    check.addArg(b.fmt("{d}", .{release_size_limit_bytes}));
+
+    for (release_targets, release_install_dirs) |query, install_dir| {
+        const exe = b.addExecutable(.{
+            .name = "zbx",
+            .root_module = zbx_module(b, options, b.resolveTargetQuery(query), .ReleaseSafe, strip),
+        });
+        const install = b.addInstallArtifact(exe, .{
+            .dest_dir = .{ .override = .{ .custom = install_dir } },
+        });
+        step.dependOn(&install.step);
+        check.addFileArg(exe.getEmittedBin());
+        // The binary that can run here is run once. A release binary has its own startup (no
+        // libc: `std.os.linux.tls`), and a thread-local variable once made it panic before
+        // `main`, which no test binary showed.
+        // Only a Linux host can run it; on a Mac the binaries are built and measured, not run.
+        const host = b.graph.host.result;
+        if (query.cpu_arch == host.cpu.arch and host.os.tag == .linux) {
+            const smoke = b.addRunArtifact(exe);
+            smoke.addArg("--version");
+            step.dependOn(&smoke.step);
+        }
+    }
+    if (strip) step.dependOn(&check.step);
+}
+
+/// The milestone demos: the step, the harness's root file and the help line.
+const demos = [_]struct { step: []const u8, root: []const u8, help: []const u8 }{
+    .{
+        .step = "demo-m0",
+        .root = "src/testing/vm/main.zig",
+        .help = "Run the M0 demo in a real Ubuntu 24.04 VM (see docs/demos/m0.md)",
+    },
+    .{
+        .step = "demo-m1",
+        .root = "src/testing/vm/main_m1.zig",
+        .help = "Run the M1 demo: zbx run in an Alpine rootfs, in the VM (docs/demos/m1.md)",
+    },
+    .{
+        .step = "demo-m2",
+        .root = "src/testing/vm/main_m2.zig",
+        .help = "Run the M2 demo: limits, hardening, lifecycle, in the VM (docs/demos/m2.md)",
+    },
+    .{
+        .step = "demo-m2b",
+        .root = "src/testing/vm/main_m2b.zig",
+        .help = "Run the M2b demo: --ulimit, --shm-size, --sysctl, --require-host, cgroup, NUMA",
+    },
+    .{
+        .step = "demo-m3",
+        .root = "src/testing/vm/main_m3.zig",
+        .help = "Run the M3 demo, as far as it is built: the store and running by digest",
+    },
+    .{
+        .step = "demo-m4",
+        .root = "src/testing/vm/main_m4.zig",
+        .help = "Run the M4 demo, as far as it is built: pull, the lock, run by name",
+    },
+    .{
+        .step = "demo-m5",
+        .root = "src/testing/vm/main_m5.zig",
+        .help = "Run the M5 demo, as far as it is built: the upgrade test against M4",
+    },
+    .{
+        .step = "demo-m6",
+        .root = "src/testing/vm/main_m6.zig",
+        .help = "Run the M6 demo, as far as it is built: the five steps, upgrade from M5",
+    },
+    .{
+        .step = "demo-m6b",
+        .root = "src/testing/vm/main_m6b.zig",
+        .help = "Run the M6b demo: the dev loop (mount, exec, logs), upgrade from M6",
+    },
+    .{
+        .step = "demo-m6d",
+        .root = "src/testing/vm/main_m6d.zig",
+        .help = "Run the M6d demo: Artifact Registry and gcr.io pulls through GitHub's WIF",
+    },
+    .{
+        .step = "demo-m7",
+        .root = "src/testing/vm/main_m7.zig",
+        .help = "Run the M7 demo: zbx build, the six steps, two VMs, upgrade from 0.2.0",
+    },
+    .{
+        .step = "demo-m8",
+        .root = "src/testing/vm/main_m8.zig",
+        .help = "Run the M8 export check: one tree exported as two users, byte-identical",
+    },
+    .{
+        .step = "demo-m8b",
+        .root = "src/testing/vm/main_m8b.zig",
+        .help = "Run the M8b demo: --listen hands a loopback listener from the container out",
+    },
+    .{
+        .step = "demo-m9",
+        .root = "src/testing/vm/main_m9.zig",
+        .help = "Run the M9 demo: zbx import of a Dockerfile, build, the fixtures, two VMs",
+    },
+    .{
+        .step = "demo-m10",
+        .root = "src/testing/vm/main_m10.zig",
+        .help = "Run the M10 demo: --device and --gpu with a fake vendor, doctor, refusals",
+    },
+    .{
+        .step = "demo-s2-lazy",
+        .root = "src/testing/vm/main_s2_lazy.zig",
+        .help = "Run the S2 slice 4 check: zbx run --lazy serves an image from the store",
+    },
+    .{
+        .step = "demo-s2-probe",
+        .root = "src/testing/vm/main_s2_probe.zig",
+        .help = "Run the S2 probe: a no-libc FUSE server under a userxattr overlay, as a user",
+    },
+    .{
+        .step = "demo-m2b-probe",
+        .root = "src/testing/vm/main_m2b_probe.zig",
+        .help = "Run the M2b probe: NUMA calls, sysctl namespaces, runtimes under a scope",
+    },
+    .{
+        .step = "demo-c4",
+        .root = "src/testing/vm/main_c4.zig",
+        .help = "Run the C4 demo: container_socket, exec's network, an adopted socket (0.5.2)",
+    },
+    .{
+        .step = "demo-z7",
+        .root = "src/testing/vm/main_z7.zig",
+        .help = "Run the Z7 check: a host port forwarded into the guest (docs/vm-module.md)",
+    },
+    .{
+        .step = "demo-m8-packages",
+        .root = "src/testing/vm/main_m8_packages.zig",
+        .help = "Install the test-key packages on Ubuntu, Debian, Fedora and Rocky (M8 slice 7)",
+    },
+    .{
+        .step = "top20",
+        .root = "src/testing/vm/main_top20.zig",
+        .help = "Pull and run the top 20 Docker Hub images in the VM (docs/demos/m4.md)",
+    },
+};
+
+/// `zig build demo-m0` and `demo-m1`: the milestone demos in a real Ubuntu VM. They use the
+/// stripped ReleaseSafe binaries, the ones that ship. -Daccel=kvm|tcg|auto chooses the accelerator:
+/// auto means KVM and fails with a one-line message if /dev/kvm is unusable; tcg (software
+/// emulation, much slower) must be asked for explicitly.
+fn add_demo_step(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    vm_module: *std.Build.Module,
+) void {
+    const Accel = enum { auto, kvm, tcg };
+    const accel_help = "VM accelerator for the demos: auto (default), kvm, tcg";
+    const accel = b.option(Accel, "accel", accel_help) orelse .auto;
+    const dropin_help = "demo-m0 only: provision a Delegate= drop-in for user managers";
+    const dropin = b.option(bool, "delegate-dropin", dropin_help) orelse false;
+    const keep_help = "demos: keep the VM disk overlay (development)";
+    const keep = b.option(bool, "keep-overlay", keep_help) orelse false;
+    const reuse_help = "demos: boot the kept, provisioned overlay (development)";
+    const reuse = b.option(bool, "reuse-overlay", reuse_help) orelse false;
+
+    const mirror_help = "top20: a docker.io mirror for the guest (the weekly run uses none)";
+    const mirror = b.option([]const u8, "mirror", mirror_help);
+    const only_help = "top20: run only these images, e.g. redis,nginx (development)";
+    const only = b.option([]const u8, "only", only_help);
+    const ca_help = "demos: a CA bundle the guest trusts, for a host that inspects TLS";
+    const ca_file = b.option(std.Build.LazyPath, "ca-file", ca_help);
+    // `zig build test` only compiles what a test reaches, and a demo's steps are reached through
+    // its `parts` list, not a test: compiling every harness is a gate of its own (`check`).
+    const harness = b.step("harness", "Compile every VM demo harness, without running it");
+
+    const harness_target = harness_target_of(b);
+    for (demos) |demo| {
+        const is_top20 = std.mem.eql(u8, demo.step, "top20");
+        const is_packages = std.mem.eql(u8, demo.step, "demo-m8-packages");
+        const vm = b.addExecutable(.{
+            .name = "vm",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(demo.root),
+                .target = harness_target,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "zigbox_vm", .module = vm_module }},
+            }),
+        });
+        harness.dependOn(&vm.step);
+        add_harness_imports(b, options, demo.step, vm.root_module);
+        const run = b.addRunArtifact(vm);
+        run.setCwd(b.path("."));
+        run.addArgs(&.{ "--accel", @tagName(accel) });
+        if (dropin and std.mem.eql(u8, demo.step, "demo-m0")) run.addArg("--delegate-dropin");
+        if (old_commit_of(demo.step)) |commit| add_old_binary(b, run, commit);
+        if (std.mem.eql(u8, demo.step, "demo-m4")) {
+            run.addArgs(&.{ "--blob-cache", ".zig-cache/zbx-vm/m4-blobs.img" });
+        }
+        if (is_top20 and mirror != null) run.addArgs(&.{ "--mirror", mirror.? });
+        if (is_top20 and only != null) run.addArgs(&.{ "--only", only.? });
+        if (ca_file) |path| {
+            run.addArg("--ca-file");
+            run.addFileArg(path);
+        }
+        if (keep) run.addArg("--keep-overlay");
+        if (reuse) run.addArg("--reuse-overlay");
+        if (is_packages) {
+            add_m8_packages(b, options, run);
+        } else if (std.mem.eql(u8, demo.step, "demo-s2-lazy")) {
+            add_release_binaries(b, lazy_start_options(b), run);
+        } else {
+            add_release_binaries(b, options, run);
+        }
+        const step = b.step(demo.step, demo.help);
+        step.dependOn(&run.step);
+    }
+}
+
+/// What one demo's harness embeds beyond the VM module.
+fn add_harness_imports(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    step: []const u8,
+    module: *std.Build.Module,
+) void {
+    // The top-20 run tells a seccomp refusal from another EPERM by the allowlist itself.
+    if (std.mem.eql(u8, step, "top20")) {
+        module.addAnonymousImport("seccomp_policy", .{
+            .root_source_file = b.path("src/runtime/policy/seccomp.zon"),
+        });
+    }
+    if (std.mem.eql(u8, step, "demo-m10")) add_gpu_fixtures(b, module);
+    if (std.mem.eql(u8, step, "demo-m9")) add_m9_cases(b, module);
+    if (std.mem.eql(u8, step, "demo-s2-probe")) add_s2_probe_fixture(b, module);
+    if (std.mem.eql(u8, step, "demo-m2b")) add_numa_probe(b, module);
+    if (std.mem.eql(u8, step, "demo-c4")) add_c4_supervisor(b, module);
+    if (std.mem.eql(u8, step, "demo-m6d")) add_m6d_helper(b, module);
+    if (std.mem.eql(u8, step, "demo-s2-lazy")) add_fuse_kernel_test(b, options, module);
+}
+
+/// demo-s2-lazy's FUSE kernel test (`src/fuse/kernel_tests.zig`) as a test binary for the guest
+/// (x86_64, static, no libc, ReleaseSafe), embedded in the harness, which serves it: the guest
+/// runs it as `demo` against its own kernel, where it must pass, not skip.
+fn add_fuse_kernel_test(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    harness_module: *std.Build.Module,
+) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/fuse_kernel_test_root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = false,
+        // Stripped, to fit the harness's 8 MiB body (`http_body_bytes_max`); asserts stay on.
+        .strip = true,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+    // The test's imports bring their own files' tests along; the guest runs this one alone.
+    const binary = b.addTest(.{
+        .root_module = module,
+        .use_llvm = true,
+        .filters = &.{"a real kernel mount serves a tree"},
+    });
+    harness_module.addAnonymousImport("fuse_kernel_test", .{
+        .root_source_file = binary.getEmittedBin(),
+    });
+}
+
+/// demo-s2-probe's throwaway FUSE server (S2 slice 1), static x86_64 with no libc, embedded in
+/// the harness, which serves it to the guest. It is x86_64 because the test VM's guest is; if an
+/// arm64 guest is added, this target must follow the guest's architecture.
+fn add_s2_probe_fixture(b: *std.Build, harness_module: *std.Build.Module) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const probe = b.addExecutable(.{
+        .name = "fuse_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/s2_probe/fuse_probe.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+            .link_libc = false,
+        }),
+    });
+    harness_module.addAnonymousImport("fuse_probe", .{
+        .root_source_file = probe.getEmittedBin(),
+    });
+}
+
+/// demo-m2b's `numa-probe` (step 6), static x86_64 with no libc like the guest, embedded in the
+/// harness, which serves it; the guest copies it into the Alpine rootfs.
+fn add_numa_probe(b: *std.Build, harness_module: *std.Build.Module) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const probe = b.addExecutable(.{
+        .name = "numa-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/numa_probe/numa_probe.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+            .link_libc = false,
+        }),
+    });
+    harness_module.addAnonymousImport("numa_probe", .{
+        .root_source_file = probe.getEmittedBin(),
+    });
+}
+
+/// demo-c4's stand-in for Zigcube's per-replica supervisor: a multi-threaded program that links
+/// the `zigbox` module, built for the guest (x86_64, static, no libc) and served to it.
+fn add_c4_supervisor(b: *std.Build, harness_module: *std.Build.Module) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "0.0.0-demo");
+    const library = b.createModule(.{
+        .root_source_file = b.path("src/zigbox.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = false,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+    const supervisor = b.addExecutable(.{
+        .name = "c4-supervisor",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/c4_fixture/supervisor.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+            // Stripped: unstripped it is over the harness's 8 MiB body limit for a served file.
+            .strip = true,
+            .imports = &.{.{ .name = "zigbox", .module = library }},
+        }),
+    });
+    harness_module.addAnonymousImport("c4_supervisor", .{
+        .root_source_file = supervisor.getEmittedBin(),
+    });
+}
+
+/// demo-m6d's guest helper (the library path, the masking and the secret scan): a program that
+/// links the `zigbox` module, built for the guest (x86_64, static, no libc) and served to it.
+fn add_m6d_helper(b: *std.Build, harness_module: *std.Build.Module) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "0.0.0-demo");
+    const library = b.createModule(.{
+        .root_source_file = b.path("src/zigbox.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = false,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+    const helper = b.addExecutable(.{
+        .name = "m6d-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/m6d_fixture/helper.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+            // Stripped, to fit the harness's 8 MiB body (`http_body_bytes_max`).
+            .strip = true,
+            .imports = &.{.{ .name = "zigbox", .module = library }},
+        }),
+    });
+    harness_module.addAnonymousImport("m6d_helper", .{
+        .root_source_file = helper.getEmittedBin(),
+    });
+}
+
+/// demo-m6d's refusals as zbx prints them (the diagnostic goldens), for the harness's unit tests
+/// of steps 1 and 4: a harness can embed only files under `src/testing/vm/`. Data, like
+/// `add_m9_cases`: the test roots that do not read them pay nothing.
+fn add_m6d_goldens(b: *std.Build, module: *std.Build.Module) void {
+    module.addAnonymousImport("m6d_e0560", .{
+        .root_source_file = b.path("src/testdata/diag/E0560.txt"),
+    });
+    module.addAnonymousImport("m6d_e0568", .{
+        .root_source_file = b.path("src/testdata/diag/E0568.txt"),
+    });
+}
+
+/// demo-m9's fixtures (the Dockerfiles and their goldens): a harness can embed only files under
+/// `src/testing/vm/`, so the fixtures' own index is handed to it as an import. Data, like the
+/// seccomp policy: the test roots get it too, at no cost to those that do not read it.
+fn add_m9_cases(b: *std.Build, module: *std.Build.Module) void {
+    module.addAnonymousImport("m9_vm_cases", .{
+        .root_source_file = b.path("src/build/dockerfile_fixtures/vm_cases.zig"),
+    });
+    // Steps 7 and 8's file server, built for the guest (x86_64, static, no libc).
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .none });
+    const server = b.addExecutable(.{
+        .name = "fixture-http",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/fixture_http.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+        }),
+    });
+    module.addAnonymousImport("fixture_http", .{ .root_source_file = server.getEmittedBin() });
+}
+
+/// demo-m10's fake driver library (soname `libzbxgpu.so.1`) and the program that needs it, built
+/// for the guest (x86_64, glibc's loader as the interpreter, no libc linked) and embedded in the
+/// harness, which serves them to the guest. The harness serves the x86_64 `zbx` too.
+fn add_gpu_fixtures(b: *std.Build, harness_module: *std.Build.Module) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const library = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "zbxgpu",
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/m10_fixture/library.zig"),
+            .target = target,
+            .optimize = .ReleaseSmall,
+            .link_libc = false,
+        }),
+    });
+    const probe = b.addExecutable(.{
+        .name = "zbxgpu-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/m10_fixture/probe.zig"),
+            .target = target,
+            .optimize = .ReleaseSmall,
+            .link_libc = false,
+        }),
+    });
+    probe.root_module.linkLibrary(library);
+    harness_module.addAnonymousImport("zbxgpu_library", .{
+        .root_source_file = library.getEmittedBin(),
+    });
+    harness_module.addAnonymousImport("zbxgpu_probe", .{
+        .root_source_file = probe.getEmittedBin(),
+    });
+}
+
+/// The commit whose zbx a demo's upgrade test starts from (`old_release.zon`), if it has one.
+fn old_commit_of(step: []const u8) ?[]const u8 {
+    const releases = @import("src/testing/vm/old_release.zon");
+    if (std.mem.eql(u8, step, "demo-m3")) return releases.commit;
+    if (std.mem.eql(u8, step, "demo-m4")) return releases.m4_commit;
+    if (std.mem.eql(u8, step, "demo-m5")) return releases.m5_commit;
+    if (std.mem.eql(u8, step, "demo-m6")) return releases.m6_commit;
+    if (std.mem.eql(u8, step, "demo-m6b")) return releases.m6b_commit;
+    if (std.mem.eql(u8, step, "demo-m7")) return releases.m7_commit;
+    if (std.mem.eql(u8, step, "demo-m8")) return releases.m8_tag;
+    if (std.mem.eql(u8, step, "demo-m2b")) return releases.m2b_tag;
+    return null;
+}
+
+/// The harness drives QEMU on a Linux host. On a Mac it is compiled for Linux (so a change to
+/// it cannot break unseen) and never run: the demos are CI's job.
+fn harness_target_of(b: *std.Build) std.Build.ResolvedTarget {
+    const host = b.graph.host.result;
+    if (host.os.tag == .linux) return b.graph.host;
+    return b.resolveTargetQuery(.{ .cpu_arch = host.cpu.arch, .os_tag = .linux, .abi = .musl });
+}
+
+/// The shipped zbx for each release target, handed to a demo as `--zbx-<arch>`.
+fn add_release_binaries(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    run: *std.Build.Step.Run,
+) void {
+    const flags = [_][]const u8{ "--zbx-x86_64", "--zbx-aarch64" };
+    for (release_targets, flags) |query, flag| {
+        const exe = b.addExecutable(.{
+            .name = "zbx",
+            .root_module = zbx_module(b, options, b.resolveTargetQuery(query), .ReleaseSafe, true),
+        });
+        run.addArg(flag);
+        run.addFileArg(exe.getEmittedBin());
+    }
+}
+
+/// The options of demo-s2-lazy's zbx: a release's, with lazy start turned on. 0.5.2 ships it
+/// dormant (docs/decisions/2026-11-16-0.5.2-s2-dormant.md); 0.6.0 drops the option.
+fn lazy_start_options(b: *std.Build) *std.Build.Step.Options {
+    const manifest = @import("build.zig.zon");
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", manifest.version);
+    options.addOption(bool, "lazy_start", true);
+    return options;
+}
+
+/// The upgrade test of demo-m3 to demo-m6b: the older zbx, built from a worktree of the
+/// pinned commit by `src/testing/vm/build_old.zig`, handed to the harness as `--old-zbx`.
+fn add_old_binary(b: *std.Build, run: *std.Build.Step.Run, commit: []const u8) void {
+    const builder = b.addExecutable(.{
+        .name = "build_old",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/build_old.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const old = b.addRunArtifact(builder);
+    old.setCwd(b.path("."));
+    old.addArg(b.graph.zig_exe);
+    old.addArg(commit);
+    run.addArg("--old-zbx");
+    run.addFileArg(old.addOutputFileArg("zbx-old"));
+}
+
+/// `zig build dbus-live`: the D-Bus client against a real bus (see src/dbus_live.zig). It is not
+/// a test: it needs a bus, so run it as `dbus-run-session -- zig build dbus-live`.
+fn add_dbus_live_step(b: *std.Build, options: *std.Build.Step.Options) void {
+    const live = b.addExecutable(.{
+        .name = "dbus_live",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dbus_live.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+            .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+        }),
+    });
+    const run = b.addRunArtifact(live);
+    const step = b.step("dbus-live", "Run the D-Bus client against a real bus (dbus-run-session)");
+    step.dependOn(&run.step);
+}
+
+/// `zig build errors-site` writes site/errors/<code>.html from the diagnostic registry;
+/// `zig build errors-site-check` (run by CI) fails if a checked-in page is missing or stale.
+fn add_errors_site_steps(b: *std.Build) void {
+    const generator = b.addExecutable(.{
+        .name = "errors_site",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/errors_site.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const write = b.addRunArtifact(generator);
+    write.setCwd(b.path("."));
+    write.addArg("site/errors");
+    const write_step = b.step("errors-site", "Write site/errors/<code>.html from the registry");
+    write_step.dependOn(&write.step);
+
+    const check = b.addRunArtifact(generator);
+    check.setCwd(b.path("."));
+    check.addArgs(&.{ "site/errors", "--check" });
+    const check_step = b.step("errors-site-check", "Fail if site/errors is stale");
+    check_step.dependOn(&check.step);
+}
+
+/// `zig build trust-wasm`: compiles the pure trust surface (`zigbox.trust`) for
+/// `wasm32-freestanding`, so Zigcube's core can link it. A host or store import in it fails here.
+fn add_trust_wasm_step(b: *std.Build) void {
+    const object = b.addObject(.{
+        .name = "trust_wasm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/trust_wasm_check.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSafe,
+            .link_libc = false,
+        }),
+    });
+    const step = b.step("trust-wasm", "Compile the pure trust surface for wasm32-freestanding");
+    step.dependOn(&object.step);
+}
+
+/// `zig build check`: every gate a slice must pass, in one command, ending in the one line a
+/// report quotes (`check: PASS <commit>`). Build, test, tidy, release and the error pages run
+/// first, as dependencies; then, as root, `zig build test` again as -Dcheck-user (default tester)
+/// in a scratch worktree, because CI runs as an ordinary user. -Dcheck-user=- skips that.
+/// `fuzz` is the fuzzers' binary: `check` runs every one of them with a fresh seed.
+fn add_check_step(b: *std.Build, fuzz: *std.Build.Step.Compile) void {
+    const user = b.option([]const u8, "check-user", "User for the non-root test run, or -") orelse
+        "tester";
+    const tool = b.addExecutable(.{
+        .name = "check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ b.graph.zig_exe, user });
+    run.addArtifactArg(fuzz);
+    run.has_side_effects = true;
+    const gates = [_][]const u8{
+        "install",    "test",       "tidy", "release", "errors-site-check", "harness",
+        "trust-wasm", "fuzz-macos",
+    };
+    for (gates) |name| {
+        const gate = b.top_level_steps.get(name) orelse @panic(name);
+        run.step.dependOn(&gate.step);
+    }
+    const step = b.step("check", "Every gate, then the test suite as a non-root user; one line");
+    step.dependOn(&run.step);
+}
+
+/// Where the VM's kernel `Image` lives between builds: large, so under the cache, and found by
+/// the macOS build from here unless `-Dvm-kernel` names another.
+const vm_kernel_default = ".zig-cache/zbx-vm/kernel/Image";
+
+/// `zig build vm-kernel-fetch` downloads the pinned Image from the repository's release and
+/// checks it against the pin; see src/vm_image/kernel_fetch.zig.
+fn add_vm_kernel_fetch(b: *std.Build, pin: *std.Build.Module) void {
+    const tool = b.addExecutable(.{
+        .name = "kernel_fetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vm_image/kernel_fetch.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "build_options", .module = pin }},
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.addArgs(&.{ "--out", vm_kernel_default });
+    run.setCwd(b.path("."));
+    const description = "Download the pinned VM kernel Image (no toolchain, no Docker)";
+    b.step("vm-kernel-fetch", description).dependOn(&run.step);
+}
+
+/// `zig build vm-kernel` builds the VM's kernel on an arm64 Ubuntu host; `vm-kernel-docker` does
+/// the same inside an `ubuntu:24.04` arm64 container, as a developer convenience on a Mac (the
+/// product never uses Docker). The program is `src/vm_image/kernel_build.zig`.
+fn add_vm_kernel_steps(b: *std.Build) void {
+    const pin = kernel_pin_options(b).createModule();
+    const jobs = b.fmt("{d}", .{std.Thread.getCpuCount() catch 4});
+    const native = b.addExecutable(.{
+        .name = "kernel_build",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vm_image/kernel_build.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "build_options", .module = pin }},
+        }),
+    });
+    const run = b.addRunArtifact(native);
+    run.addArgs(&.{ "--config", "vm/kernel/config-arm64", "--cache", ".zig-cache/zbx-vm/kernel" });
+    run.addArgs(&.{ "--work", ".zig-cache/zbx-vm/kernel-build", "--out", vm_kernel_default });
+    run.addArgs(&.{ "--jobs", jobs });
+    run.setCwd(b.path("."));
+    add_vm_kernel_fetch(b, pin);
+    const description = "Build the VM kernel Image (needs an arm64 Ubuntu 24.04 host)";
+    b.step("vm-kernel", description).dependOn(&run.step);
+
+    const linux_arm: std.Target.Query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl };
+    const inside = b.addExecutable(.{
+        .name = "kernel_build",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vm_image/kernel_build.zig"),
+            .target = b.resolveTargetQuery(linux_arm),
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "build_options", .module = pin }},
+        }),
+    });
+    const install = b.addInstallArtifact(inside, .{
+        .dest_dir = .{ .override = .{ .custom = "vm-tools" } },
+    });
+    const docker = b.addSystemCommand(&.{ "docker", "run", "--rm", "--platform", "linux/arm64" });
+    docker.setCwd(b.path("."));
+    docker.addArgs(&.{
+        "-v", "./zig-out/vm-tools:/tools:ro",
+        "-v", "./vm/kernel:/kernel:ro",
+        "-v", "./.zig-cache/zbx-vm/kernel:/cache",
+    });
+    docker.addArgs(&.{ "ubuntu:24.04", "/tools/kernel_build", "--config", "/kernel/config-arm64" });
+    docker.addArgs(&.{ "--cache", "/cache", "--work", "/build", "--out", "/cache/Image" });
+    docker.addArgs(&.{ "--install-deps", "--jobs", jobs });
+    docker.step.dependOn(&install.step);
+    const docker_text = "Build the VM kernel in an ubuntu:24.04 arm64 container (developer aid)";
+    b.step("vm-kernel-docker", docker_text).dependOn(&docker.step);
+}
+
+// ---- The macOS zbx and the VM image it carries -----------------------------------------------
+
+const VmImage = struct {
+    kernel: std.Build.LazyPath,
+    initramfs: std.Build.LazyPath,
+    version: std.Build.LazyPath,
+};
+
+/// The VM's initramfs and its version, made from the pinned kernel, the guest's init and the
+/// Linux zbx (aarch64, the same ReleaseSafe build as `release`). `-Dvm-kernel` names the kernel
+/// Image (default: where `zig build vm-kernel` leaves it); its digest must be the pin's.
+fn add_vm_image(b: *std.Build, options: *std.Build.Step.Options) VmImage {
+    if (vm_image_made) |made| return made; // One set of options and steps per build.
+    const kernel_help = "VM kernel Image (default: " ++ vm_kernel_default ++ ")";
+    const kernel = b.option(std.Build.LazyPath, "vm-kernel", kernel_help) orelse
+        b.path(vm_kernel_default);
+    const label_help = "development: text mixed into the VM image's version, to tell builds apart";
+    const label = b.option([]const u8, "vm-label", label_help) orelse "";
+    const guest: std.Target.Query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl };
+    const init_exe = b.addExecutable(.{
+        .name = "init",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vm_guest_init.zig"),
+            .target = b.resolveTargetQuery(guest),
+            .optimize = .ReleaseSafe,
+            .strip = true,
+            .link_libc = false,
+        }),
+    });
+    const linux_zbx = b.addExecutable(.{
+        .name = "zbx",
+        .root_module = zbx_module(b, options, b.resolveTargetQuery(guest), .ReleaseSafe, true),
+    });
+    const tool = b.addExecutable(.{
+        .name = "make_image",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vm_image_make.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const pinned = @import("vm/kernel/pin.zon");
+    const run = b.addRunArtifact(tool);
+    // A fresh checkout has no kernel yet. Say so in one line, only to the steps that need it.
+    if (kernel_missing(b, kernel)) {
+        const missing = b.addFail("the VM kernel is missing: run `zig build vm-kernel-fetch` " ++
+            "(downloads it) or `zig build vm-kernel-docker` (builds it), or pass " ++
+            "-Dvm-kernel=<path to the pinned Image>");
+        run.step.dependOn(&missing.step);
+    }
+    run.addArg("--kernel");
+    run.addFileArg(kernel);
+    run.addArgs(&.{ "--kernel-sha256", pinned.image_sha256, "--init" });
+    run.addFileArg(init_exe.getEmittedBin());
+    run.addArg("--zbx");
+    run.addFileArg(linux_zbx.getEmittedBin());
+    if (label.len > 0) run.addArgs(&.{ "--label", label });
+    run.addArgs(&.{ "--apk-cache", ".zig-cache/zbx-vm/apk" });
+    run.addArgs(&.{ "--apk-mirror", @import("vm/alpine.zon").mirror });
+    inline for (@import("vm/alpine.zon").packages) |package| {
+        run.addArgs(&.{ "--apk", package.name, package.url, package.sha256 });
+    }
+    run.addArg("--out-initramfs");
+    const initramfs = run.addOutputFileArg("initramfs.cpio");
+    run.addArg("--out-version");
+    const version = run.addOutputFileArg("image-version");
+    vm_image_made = .{ .kernel = kernel, .initramfs = initramfs, .version = version };
+    return vm_image_made.?;
+}
+
+var vm_image_made: ?VmImage = null;
+
+/// True if the kernel Image is not a file this build can read. Checked when the build is
+/// configured, relative to the directory `zig build` runs in (the repository's root).
+fn kernel_missing(b: *std.Build, kernel: std.Build.LazyPath) bool {
+    const path = switch (kernel) {
+        .src_path => |source| source.sub_path,
+        else => return false,
+    };
+    std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch {
+        // The answer is "missing" now and may change without build.zig changing, so a cached
+        // configuration must not be reused.
+        b.graph.poisonCache();
+        return true;
+    };
+    b.dependOnFileMetadata(kernel); // Replaced or rebuilt: configure again.
+    return false;
+}
+
+/// The VM image as the three files the macOS zbx embeds, and the frameworks it needs.
+fn link_macos(module: *std.Build.Module, image: VmImage) void {
+    module.addAnonymousImport("vm_kernel", .{ .root_source_file = image.kernel });
+    module.addAnonymousImport("vm_initramfs", .{ .root_source_file = image.initramfs });
+    module.addAnonymousImport("vm_image_version", .{ .root_source_file = image.version });
+    module.linkSystemLibrary("objc", .{});
+    module.linkFramework("Foundation", .{});
+    module.linkFramework("Virtualization", .{});
+    module.linkFramework("SystemConfiguration", .{});
+}
+
+/// Builds the macOS zbx, signs it ad hoc with the virtualization entitlement (good for this Mac;
+/// a Developer ID signature and notarization are the release's job) and installs it.
+/// `zig build demo-mac`: the M1 to M4, M4b, M6b and M9 demo steps, driven from this Mac through
+/// the macOS `zbx` it installs (src/testing/mac_demo.zig). Only where the build runs on macOS.
+fn add_demo_mac(b: *std.Build, vm_module: *std.Build.Module) void {
+    const exe = b.addExecutable(.{
+        .name = "demo_mac",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(mac_demo_root),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            // It boots the image through the harness's `vm/image.zig`, built on the VM module.
+            .imports = &.{.{ .name = "zigbox_vm", .module = vm_module }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ "--zbx", "zig-out/bin/zbx" });
+    run.step.dependOn(b.getInstallStep());
+    const step = b.step("demo-mac", "Run the M1 to M4, M4b, M6b and M9 demo steps from macOS");
+    step.dependOn(&run.step);
+}
+
+/// The ReleaseSafe macOS `zbx` for one architecture (`aarch64` or `x86_64`).
+fn mac_release_binary(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    image: VmImage,
+    architecture: []const u8,
+    sdk: bool,
+) *std.Build.Step.Compile {
+    const query = b.fmt("{s}-macos", .{architecture});
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/macos_main.zig"),
+        .target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = query }) catch
+            @panic("mac-release: the target query is a constant and parses")),
+        .optimize = .ReleaseSafe,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+    link_macos(module, image);
+    if (sdk) {
+        // A cross-built target gets no automatic SDK, so the frameworks and libobjc are not found
+        // without these. The compiler puts `--sysroot` in front of both paths.
+        module.addFrameworkPath(.{ .cwd_relative = "/System/Library/Frameworks" });
+        module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    }
+    return b.addExecutable(.{ .name = "zbx", .root_module = module, .use_llvm = true });
+}
+
+/// `zig build mac-release`: the universal ReleaseSafe macOS `zbx`, signed with the hardened runtime
+/// and the virtualization entitlement, zipped, and (with `-Dnotarize`)
+/// notarized; see src/mac_release.zig.
+/// `-Dsign-identity=-` signs ad hoc, for trying it; the defaults are the owner's.
+fn add_mac_release(b: *std.Build, options: *std.Build.Step.Options) void {
+    const release = @import("src/mac_release.zig");
+    const identity_help = "mac-release: the codesign identity (- is ad hoc); default " ++
+        release.default_identity;
+    const identity = b.option([]const u8, "sign-identity", identity_help) orelse
+        release.default_identity;
+    const profile_help = "mac-release: the notarytool keychain profile; default " ++
+        release.default_profile;
+    const profile = b.option([]const u8, "notary-profile", profile_help) orelse
+        release.default_profile;
+    const keychain_help = "mac-release: the keychain file codesign and notarytool use; " ++
+        "default the login keychain";
+    const keychain = b.option([]const u8, "keychain", keychain_help) orelse "";
+    const notarize_help = "mac-release: submit the archive to Apple's notary service";
+    const notarize = b.option(bool, "notarize", notarize_help) orelse false;
+    const sdk_help = "mac-release: search the SDK given as --sysroot for the frameworks and " ++
+        "libobjc; needed because a cross-built target finds none by itself";
+    const sdk = b.option(bool, "sdk", sdk_help) orelse false;
+    const image = add_vm_image(b, options);
+    // One binary per architecture, each cross-built whatever the host is, then combined by
+    // `lipo` in the tool: the release is universal. The VM image inside is the same for both.
+    const arm64 = mac_release_binary(b, options, image, "aarch64", sdk);
+    const x86_64 = mac_release_binary(b, options, image, "x86_64", sdk);
+    const tool = b.addExecutable(.{
+        .name = "mac_release",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mac_release.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArg("--binary-arm64");
+    run.addArtifactArg(arm64);
+    run.addArg("--binary-x86_64");
+    run.addArtifactArg(x86_64);
+    run.addArgs(&.{ "--entitlements", "vm/zbx.entitlements" });
+    run.addArgs(&.{ "--formula", "packaging/homebrew/zigbox.rb" });
+    run.addArgs(&.{ "--out", "zig-out/mac-release" });
+    run.addArgs(&.{ "--version", @import("build.zig.zon").version });
+    run.addArgs(&.{ "--identity", identity, "--profile", profile });
+    if (keychain.len > 0) run.addArgs(&.{ "--keychain", keychain });
+    if (notarize) run.addArg("--notarize");
+    const step = b.step("mac-release", "Sign, zip and optionally notarize the macOS zbx");
+    step.dependOn(&run.step);
+}
+
+fn add_macos_install(
+    b: *std.Build,
+    options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vm_module: *std.Build.Module,
+) void {
+    const image = add_vm_image(b, options);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/macos_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+    });
+    link_macos(module, image);
+    const exe = b.addExecutable(.{ .name = "zbx", .root_module = module, .use_llvm = true });
+    add_mac_release(b, options);
+    add_demo_mac(b, vm_module);
+    const copy = b.addSystemCommand(&.{"cp"});
+    copy.addArtifactArg(exe);
+    const signed = copy.addOutputFileArg("zbx");
+    const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-", "--entitlements" });
+    sign.addFileArg(b.path("vm/zbx.entitlements"));
+    sign.addFileArg(signed);
+    sign.step.dependOn(&copy.step);
+    const install = b.addInstallBinFile(signed, "zbx");
+    install.step.dependOn(&sign.step);
+    b.getInstallStep().dependOn(&install.step);
+}

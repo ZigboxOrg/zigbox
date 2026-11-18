@@ -1,0 +1,1199 @@
+//! The JSON schemas of the commands' output (`zbx schema <command>`), versioned: the number in
+//! each `$id` and `version` is the schema's, and a change that could break a reader makes a new
+//! one. They describe what `--output json` writes: the result on stdout for the commands that
+//! have one (`ps`, `stop`, `run -d`, `bundle`), and the lines on stderr: a diagnostic per
+//! failure or warning, and for a foreground `run` that started, a last `container_exit` line.
+//!
+//! Every one is one JSON object. The tests check that each is valid JSON and that the output of
+//! the commands they describe has the keys they require.
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+/// The members of the diagnostic object, as `zbx explain`, the renderer and DIAGNOSTICS.md
+/// describe it. Inline text (no `$ref`), shared by every schema that holds a diagnostic.
+const diagnostic_properties =
+    \\"code":{"type":"string","pattern":"^ZBX-[EWB][0-9]{4}$"},
+    \\"severity":{"enum":["error","warning","bug"]},"blame":{"enum":["user","environment",
+    \\"external","internal","bug"]},
+    \\"summary":{"type":"string"},"causes":{"type":"array","items":{"type":"string"}},
+    \\"while":{"type":"array","items":{"type":"string"}},"context":{"type":"object"},
+    \\"fixes":{"type":"array","items":{"type":"object","properties":{
+    \\"sentence":{"type":"string"},"command":{"type":["string","null"]},
+    \\"needs_root":{"type":"boolean","description":"M6: only when true; the command needs root"},
+    \\"template":{"type":"boolean",
+    \\"description":"M6: only when true; an example to adapt, not to run as written"}}}},
+    \\"docs":{"type":"string"},"saved":{"type":"string"},"omitted":{"type":"object"}
+;
+
+const diagnostic_required =
+    \\"required":["code","severity","blame","summary","causes","docs"]
+;
+
+/// The diagnostic as one object schema, for a member that holds one (a doctor check's).
+const diagnostic_object =
+    \\{"type":"object",
+++ diagnostic_required ++
+    \\,"properties":{
+++ diagnostic_properties ++ "}}";
+
+/// The old `$defs` entry, kept so that a reader of the path `$defs.diagnostic` still finds it.
+const diagnostic_definition = "\"diagnostic\":" ++ diagnostic_object;
+
+/// The members M2b added to a container: `ulimits` and `sysctls`, each absent when not set.
+const knobs_properties =
+    \\"ulimits":{"type":"object","description":"M2b: each --ulimit; absent when none",
+    \\"additionalProperties":{"type":"object","required":["soft","hard"],
+    \\"properties":{"soft":{"type":["integer","string"],"description":"or \"unlimited\""},
+    \\"hard":{"type":["integer","string"],"description":"or \"unlimited\""}}}},
+    \\"sysctls":{"type":"array","description":"M2b: each --sysctl, in order; absent when none",
+    \\"items":{"type":"object","required":["key","value"],
+    \\"properties":{"key":{"type":"string"},"value":{"type":"string"}}}}
+;
+
+/// `shm_bytes`, M2b's `--shm-size`: absent when not set.
+const shm_property =
+    \\"shm_bytes":{"type":"integer","description":"M2b: --shm-size; absent when not set"}
+;
+
+/// What `container_exit` holds (the value of the member of that name).
+const container_exit_object =
+    \\{"type":"object","required":["reason","code"],
+    \\"properties":{"reason":{"enum":["exited","signal","oom","pid_limit"]},
+    \\"code":{"type":"integer","minimum":0,"maximum":255},"signal":{"type":"integer"},
+    \\"limit_bytes":{"type":["integer","null"]},"limit":{"type":["integer","null"]},
+    \\"network":{"enum":["none","host","user"]},
+    \\"hint":{"enum":["network_none"],
+    \\"description":"M6: the failure may be the network: default network, no --net, exit != 0"},
+    \\"published":{"type":"array","description":"--publish: TCP host ports forwarded (M5)",
+    \\"items":{"type":"object","required":["host","container"],
+    \\"properties":{"host":{"type":"integer","minimum":1,"maximum":65535},
+    \\"container":{"type":"integer","minimum":1,"maximum":65535}}}},
+    \\"timed_out":{"type":"boolean"},
+    \\"writable_mounts":{"type":"array",
+    \\"description":"M6b: each --mount, by its resolved host path",
+    \\"items":{"type":"object","required":["host","target"],
+    \\"properties":{"host":{"type":"string"},"target":{"type":"string"}}}},
+    \\"user":{"type":["object","null"],"description":"M6b: the user the command ran as",
+    \\"properties":{"uid":{"type":"integer"},"gid":{"type":"integer"}}},
+++ shm_property ++ "," ++ knobs_properties ++
+    \\}}
+;
+
+const ran_object =
+    \\{"type":"object","description":"what the run ran","required":["kind"],
+    \\"properties":{"kind":{"enum":["image","tree","rootfs"]},
+    \\"reference":{"type":"string","description":"image: the name as typed"},
+    \\"manifest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$","description":"image"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$","description":"image and tree"},
+    \\"path":{"type":"string","description":"rootfs: the directory as typed"}}}
+;
+
+/// The `container` of a detached run's document. `network`, `published` and `env` are M6's.
+const detached_container_object =
+    \\{"type":"object","required":["name","pid","detached"],
+    \\"properties":{"name":{"type":"string"},
+    \\"pid":{"type":"integer"},"scope":{"type":["string","null"]},"detached":{"const":true},
+    \\"network":{"enum":["none","host","user"],"description":"M6: what the container can reach"},
+    \\"published":{"type":"array","description":"M6: --publish, as in container_exit",
+    \\"items":{"type":"object","required":["host","container"],
+    \\"properties":{"host":{"type":"integer","minimum":1,"maximum":65535},
+    \\"container":{"type":"integer","minimum":1,"maximum":65535}}}},
+    \\"env":{"type":"array","items":{"type":"string"},
+    \\"description":"M6: names of the variables set with -e; a value is never shown"},
+    \\"writable_mounts":{"type":"array",
+    \\"description":"M6b: each --mount, by its resolved host path",
+    \\"items":{"type":"object","required":["host","target"],
+    \\"properties":{"host":{"type":"string"},"target":{"type":"string"}}}},
+    \\"user":{"type":["object","null"],"description":"M6b: the user the command ran as",
+    \\"properties":{"uid":{"type":"integer"},"gid":{"type":"integer"}}},
+++ shm_property ++ "," ++ knobs_properties ++
+    \\}}
+;
+
+/// `zbx schema run`: ONE object schema with no `$ref`, which an agent can follow without a
+/// resolver. The members of the three documents a run can print (a diagnostic, the
+/// `container_exit` line, the detached document) are all listed under `properties`, and `oneOf`
+/// says which members tell the kinds apart. `$defs` is the older form of the same text, kept
+/// so that no reader of it breaks. Nothing in this text refers to anything else.
+const run_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/run/1","version":1,
+    \\"title":"zbx run --output json",
+    \\"description":"stderr: diagnostics, then container_exit. With -d, stdout: detached.",
+    \\"$comment":"One object schema, no $ref: oneOf names the members that tell them apart.",
+    \\"type":"object",
+    \\"properties":{
+++ diagnostic_properties ++
+    \\,"container_exit":
+++ container_exit_object ++
+    \\,"schema":{"const":"zbx.run/1"},"container":
+++ detached_container_object ++
+    \\,"ran":
+++ ran_object ++
+    \\},
+    \\"oneOf":[{
+++ diagnostic_required ++
+    \\},{"required":["container_exit"]},{"required":["schema","container"]}],
+    \\"$defs":{
+++ diagnostic_definition ++
+    \\,"container_exit":{"type":"object","required":["container_exit"],
+    \\"properties":{"container_exit":
+++ container_exit_object ++
+    \\,"ran":
+++ ran_object ++
+    \\}},
+    \\"ran":
+++ ran_object ++
+    \\,"detached":{"type":"object","required":["schema","container"],
+    \\"properties":{"schema":{"const":"zbx.run/1"},"container":
+++ detached_container_object ++
+    \\,"ran":
+++ ran_object ++
+    \\}}}}
+;
+
+const ps_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/ps/1","version":1,
+    \\"title":"zbx ps --output json",
+    \\"description":"stdout: containers, newest first; without --all only running and lost.",
+    \\"type":"object","required":["schema","containers"],
+    \\"properties":{"schema":{"const":"zbx.ps/1"},
+    \\"containers":{"type":"array","items":{"type":"object",
+    \\"required":["name","state","pid","started","timed_out","command","labels","limits"],
+    \\"properties":{
+    \\"name":{"type":"string"},"state":{"enum":["running","stopped","lost"]},
+    \\"pid":{"type":"integer"},
+    \\"supervisor":{"type":"integer"},"scope":{"type":["string","null"]},
+    \\"detached":{"type":"boolean"},
+    \\"timed_out":{"type":"boolean","description":"stopped because --timeout was up"},
+    \\"started":{"type":"integer",
+    \\"description":"seconds since the epoch; 0 for a scope without a record"},
+    \\"ended":{"type":["integer","null"]},
+    \\"reason":{"enum":["exited","signal","oom","pid_limit","none"]},
+    \\"exit_code":{"type":["integer","null"]},
+    \\"command":{"type":"array","items":{"type":"string"}},
+    \\"labels":{"type":"array","items":{"type":"object","required":["key","value"],
+    \\"properties":{"key":{"type":"string"},"value":{"type":"string"}}}},
+    \\"limits":{"type":"object","properties":{"memory_bytes":{"type":["integer","null"]},
+    \\"pids":{"type":["integer","null"]},"cpu_millis":{"type":["integer","null"]},
+++ shm_property ++
+    \\}},
+    \\"network":{"enum":["none","host","user",null],
+    \\"description":"M6: what the container can reach; null for a record of an older zbx"},
+    \\"published":{"type":"array","description":"M6: --publish, as in zbx run",
+    \\"items":{"type":"object","required":["host","container"],
+    \\"properties":{"host":{"type":"integer","minimum":1,"maximum":65535},
+    \\"container":{"type":"integer","minimum":1,"maximum":65535}}}},
+    \\"env":{"type":"array","items":{"type":"string"},
+    \\"description":"M6: names of the variables set with -e; a value is never kept"},
+    \\"writable_mounts":{"type":"array",
+    \\"description":"M6b: each --mount, by its resolved host path",
+    \\"items":{"type":"object","required":["host","target"],
+    \\"properties":{"host":{"type":"string"},"target":{"type":"string"}}}},
+    \\"listen":{"type":"string","description":"M8b: --listen (127.0.0.1:PORT)"},
+    \\"lazy":{"type":"object","description":"S2: a lazy run's fetching; absent for any other",
+    \\"required":["local_percent","fetched_bytes","errors"],
+    \\"properties":{"local_percent":{"type":"integer","description":"of the image's bytes"},
+    \\"fetched_bytes":{"type":"integer","description":"on first read and in the background"},
+    \\"errors":{"type":"integer","description":"reads that failed (EIO)"}}},
+    \\"devices":{"type":"array","description":"M10: each --device; absent for a run with none",
+    \\"items":{"type":"object","required":["asked"],
+    \\"properties":{"asked":{"type":"string","description":"as given"},
+    \\"path":{"type":"string",
+    \\"description":"in the container; only for a host path (a CDI name resolves at start)"}}}},
+++ knobs_properties ++ "," ++
+    \\"user":{"type":["object","null"],"description":"M6b: the user the command ran as",
+    \\"properties":{"uid":{"type":"integer"},"gid":{"type":"integer"}}}}}}}}
+;
+
+const stop_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/stop/1","version":1,
+    \\"title":"zbx stop --output json",
+    \\"description":"stdout: how the container stopped. A failure is a diagnostic on stderr.",
+    \\"type":"object","required":["schema","name","result"],
+    \\"properties":{"schema":{"const":"zbx.stop/1"},
+    \\"name":{"type":"string"},"result":{"enum":["graceful","killed","already_stopped"]},
+    \\"reason":{"enum":["exited","signal","oom","pid_limit","none"]},
+    \\"exit_code":{"type":["integer","null"]}}}
+;
+
+/// `zbx logs --output json`: on stdout one object per line, one per record the container's log
+/// holds; on stderr a diagnostic for each refusal or warning. One object schema, no `$ref`,
+/// like `exec`'s: the record's members stay as they were (M6b slice 2), and `oneOf` names the
+/// members that tell the record from the diagnostic. Only the diagnostic's members were added.
+const logs_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/logs/1","version":1,
+    \\"title":"zbx logs --output json",
+    \\"description":"stdout: a line per record (a write of up to 4096 bytes). stderr: diagnostics.",
+    \\"$comment":"One object schema, no $ref: oneOf names the members that tell them apart.",
+    \\"type":"object",
+    \\"properties":{"schema":{"const":"zbx.logs/1"},
+    \\"stream":{"enum":["stdout","stderr"]},
+    \\"time":{"type":"integer","description":"seconds since the epoch when zbx read the write"},
+    \\"text":{"type":"string","description":"the bytes; not UTF-8 becomes U+FFFD and lossy"},
+    \\"lossy":{"const":true,"description":"only when text had bytes that are not UTF-8"},
+    \\"dropped_bytes":{"type":"integer","minimum":1,
+    \\"description":"first record only: bytes of older output the 5 MiB cap dropped"},
+++ diagnostic_properties ++
+    \\},
+    \\"oneOf":[{"required":["schema","stream","time","text"]},{
+++ diagnostic_required ++
+    \\}]}
+;
+
+/// `zbx exec --output json`: one object per line on stderr, a diagnostic for each failure or
+/// warning, and when the command ran, a last `exec_exit` line. One object schema, no `$ref`.
+const exec_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/exec/1","version":1,
+    \\"title":"zbx exec --output json",
+    \\"description":"stderr: diagnostics, then exec_exit. The command's own output is its own.",
+    \\"type":"object",
+    \\"properties":{
+++ diagnostic_properties ++
+    \\,"exec_exit":{"type":"object","required":["container","reason","code","container_ended"],
+    \\"properties":{"container":{"type":"string"},"reason":{"enum":["exited","signal"]},
+    \\"code":{"type":"integer","minimum":0,"maximum":255,
+    \\"description":"the command's exit code, or 128 plus its signal; zbx exits with it"},
+    \\"signal":{"type":"integer","description":"only for reason signal"},
+    \\"container_ended":{"type":"boolean",
+    \\"description":"the command was killed because its container ended"}}}},
+    \\"oneOf":[{
+++ diagnostic_required ++
+    \\},{"required":["exec_exit"]}]}
+;
+
+const bundle_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/bundle/1","version":1,
+    \\"title":"zbx bundle --output json",
+    \\"description":"stdout: the path of the bundle written. A failure is a diagnostic on stderr.",
+    \\"type":"object","required":["bundle"],"properties":{"bundle":{"type":"string"}}}
+;
+
+/// `zbx schema doctor`: stdout is the `zbx.doctor/1` report; stderr carries the diagnostic of
+/// each failing check, as before (M6 added the report; the diagnostics did not change). One
+/// object schema without `$ref`, like `run`'s.
+const doctor_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/doctor/1","version":1,
+    \\"title":"zbx doctor --output json",
+    \\"description":"stdout: the report. stderr: a diagnostic per failing check. Exit 0, or 2.",
+    \\"$comment":"One object schema, no $ref: oneOf names the members that tell them apart.",
+    \\"type":"object",
+    \\"properties":{
+++ diagnostic_properties ++
+    \\,"schema":{"const":"zbx.doctor/1"},"ok":{"type":"boolean",
+    \\"description":"no check failed; a warning does not change it"},
+    \\"gpu":{"type":"array",
+    \\"description":"only when there is a CDI spec, NVIDIA driver, render node or /dev/kfd",
+    \\"items":{"type":"object","required":["kind","ok","subject","detail"],
+    \\"properties":{"kind":{"enum":["spec","device","driver","node","fix"]},
+    \\"ok":{"type":"boolean"},"subject":{"type":"string"},"detail":{"type":"string"}}}},
+    \\"host_settings":{"type":"object",
+    \\"description":"Linux: the settings --require-host checks; null: absent or unreadable",
+    \\"properties":{"vm.max_map_count":{"type":["integer","null"]},
+    \\"fs.aio-max-nr":{"type":["integer","null"]},
+    \\"vm.overcommit_memory":{"enum":[0,1,2,null]},
+    \\"transparent_hugepage":{"enum":["always","madvise","never",null]}}},
+    \\"checks":{"type":"array","description":"every check, in the order of the text report",
+    \\"items":{"type":"object","required":["id","status","detail"],
+    \\"properties":{"id":{"enum":["kernel","userns","cgroup","overlay","subid","seccomp",
+    \\"host-settings","fuse","net"]},
+    \\"status":{"enum":["ok","warn","fail"]},"detail":{"type":"string",
+    \\"description":"the line of the text report"},
+    \\"code":{"type":"string","pattern":"^ZBX-[EW][0-9]{4}$",
+    \\"description":"only for warn and fail: the code of the diagnostic"},
+    \\"diagnostic":
+++ diagnostic_object ++
+    \\}}}},
+    \\"oneOf":[{"required":["schema","ok","checks"]},{
+++ diagnostic_required ++
+    \\}],
+    \\"$defs":{
+++ diagnostic_definition ++ "}}";
+
+const store_import_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-import/1","version":1,
+    \\"title":"zbx store import --output json",
+    \\"description":"stdout: what was imported. Warnings and failures are diagnostics on stderr.",
+    \\"type":"object","required":["schema","digest","source","files","directories","symlinks",
+    \\"skipped","unmapped_owners","unmapped_groups","bytes","new_objects","reused_objects",
+    \\"new_bytes","new_trees","reused_trees",
+    \\"ids"],
+    \\"properties":{"schema":{"const":"zbx.store.import/1"},
+    \\"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},"source":{"type":"string"},
+    \\"files":{"type":"integer"},"directories":{"type":"integer"},"symlinks":{"type":"integer"},
+    \\"skipped":{"type":"integer","description":"devices, FIFOs and sockets left out"},
+    \\"xattrs_skipped":{"type":"integer"},
+    \\"unmapped_owners":{"type":"integer","description":"entries with an unmappable owner"},
+    \\"unmapped_groups":{"type":"integer","description":"the same for groups"},
+    \\"bytes":{"type":"integer",
+    \\"description":"the sum of the lengths of the files"},
+    \\"new_objects":{"type":"integer"},"reused_objects":{"type":"integer"},
+    \\"new_bytes":{"type":"integer","description":"bytes of the objects that were new"},
+    \\"new_trees":{"type":"integer"},"reused_trees":{"type":"integer"},
+    \\"ids":{"enum":["full","single"],"description":"how ids were mapped while importing"}}}
+;
+
+const store_ls_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-ls/1","version":1,
+    \\"title":"zbx store ls --output json",
+    \\"description":"stdout: the roots, newest first, and the pulled images.",
+    \\"type":"object","required":["schema","roots","images"],
+    \\"properties":{"schema":{"const":"zbx.store.ls/1"},
+    \\"roots":{"type":"array","items":{"type":"object",
+    \\"required":["digest","kind","time","files","bytes","size_unique","source","parent"],
+    \\"properties":{"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"kind":{"enum":["import","commit","container"]},
+    \\"time":{"type":"integer","description":"seconds since the epoch"},
+    \\"files":{"type":"integer"},
+    \\"bytes":{"type":"integer","description":"the files' lengths, each counted once per name"},
+    \\"size_unique":{"type":["integer","null"],
+    \\"description":"bytes of the distinct files, each once however many names; null if unread"},
+    \\"source":{"type":"string"},"parent":{"type":["string","null"]}}}},
+    \\"images":{"type":"array","description":"pulled images, with every tag they were pulled as",
+    \\"items":{"type":"object","required":["reference","tags","manifest","platform","tree","time"],
+    \\"properties":{"reference":{"type":["string","null"],
+    \\"description":"the newest of tags; null if there are none"},
+    \\"tags":{"type":"array","items":{"type":"string"},
+    \\"description":"every reference it was pulled as, oldest first; none if only by digest"},
+    \\"manifest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"platform":{"type":"string"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"time":{"type":"integer"},
+    \\"partial":{"const":true,"description":"S2: started lazily, not every file local"},
+    \\"local_percent":{"type":"integer",
+    \\"description":"S2: of a partial image's bytes; absent when its tree cannot be read"}}}}}}
+;
+
+const store_du_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-du/1","version":1,
+    \\"title":"zbx store du --output json",
+    \\"description":"stdout: the store's totals, or with a digest one tree's sizes.",
+    \\"type":"object","required":["schema"],
+    \\"properties":{"schema":{"const":"zbx.store.du/1"},
+    \\"store":{"type":"object","required":["bytes","objects","trees"],
+    \\"properties":{"bytes":{"type":"integer"},"objects":{"type":"integer"},
+    \\"trees":{"type":"integer"}}},
+    \\"tree":{"type":"object","required":["digest","files","logical_bytes","objects",
+    \\"stored_bytes","shared_bytes"],
+    \\"properties":{"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"files":{"type":"integer"},"logical_bytes":{"type":"integer"},
+    \\"objects":{"type":"integer","description":"distinct objects"},
+    \\"stored_bytes":{"type":"integer","description":"bytes of the distinct objects"},
+    \\"shared_bytes":{"type":"integer","description":"of those, bytes other roots also use"}}},
+    \\"images":{"type":"array","description":"du --by-image: one entry for each pulled image",
+    \\"items":{"type":"object","required":["reference","tags","manifest","platform","tree",
+    \\"files","logical_bytes","compressed_bytes","stored_bytes","shared_bytes"],
+    \\"properties":{"reference":{"type":["string","null"],
+    \\"description":"the newest of tags; null if there are none"},
+    \\"tags":{"type":"array","items":{"type":"string"},
+    \\"description":"the references the image was pulled as, oldest first"},
+    \\"manifest":{"type":"string"},
+    \\"platform":{"type":"string"},"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"files":{"type":"integer"},"logical_bytes":{"type":"integer"},
+    \\"compressed_bytes":{"type":"integer","description":"the layers as downloaded"},
+    \\"stored_bytes":{"type":"integer","description":"bytes of the distinct objects"},
+    \\"shared_bytes":{"type":"integer","description":"of those, bytes other roots also use"}}}}},
+    \\"oneOf":[{"required":["store"]},{"required":["tree"]},{"required":["images"]}]}
+;
+
+const store_rm_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-rm/1","version":1,
+    \\"title":"zbx store rm --output json",
+    \\"description":"stdout: the root that was dropped. A failure is a diagnostic on stderr.",
+    \\"type":"object","required":["schema","digest","removed"],
+    \\"properties":{"schema":{"const":"zbx.store.rm/1"},
+    \\"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},"removed":{"const":true},
+    \\"images":{"type":"integer","description":"image records of the tree that went with it"}}}
+;
+
+const commit_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/commit/1","version":1,
+    \\"title":"zbx commit --output json",
+    \\"description":"stdout: the tree a container's changes made. A failure is a diagnostic",
+    \\"type":"object","required":["schema","digest","parent","container","unchanged","files",
+    \\"bytes","new_objects","new_bytes","new_trees","deleted"],
+    \\"properties":{"schema":{"const":"zbx.commit/1"},
+    \\"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"parent":{"type":"string","pattern":"^b3:[0-9a-f]{64}$",
+    \\"description":"the tree the container started from"},
+    \\"container":{"type":"string"},
+    \\"unchanged":{"type":"boolean",
+    \\"description":"true if digest equals parent: nothing changed, no root written"},
+    \\"files":{"type":"integer","description":"files in the whole new tree"},
+    \\"bytes":{"type":"integer","description":"their total length"},
+    \\"new_objects":{"type":"integer"},"new_bytes":{"type":"integer"},
+    \\"new_trees":{"type":"integer"},
+    \\"deleted":{"type":"integer","description":"names the container deleted from the parent"}}}
+;
+
+const store_diff_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-diff/1","version":1,
+    \\"title":"zbx store diff --output json",
+    \\"description":"stdout: the paths that differ, in path order, a directory first",
+    \\"type":"object","required":["schema","from","to","changes","summary"],
+    \\"properties":{"schema":{"const":"zbx.store.diff/1"},
+    \\"from":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"to":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"changes":{"type":"array","items":{"type":"object","required":["change","kind","path"],
+    \\"properties":{"change":{"enum":["added","removed","changed"]},
+    \\"kind":{"enum":["file","dir","symlink"],
+    \\"description":"in the second tree, or the first for a removed path"},
+    \\"path":{"type":"string",
+    \\"description":"from the root, with a leading slash; / is the root directory itself"},
+    \\"attributes":{"type":"array","description":"only for changed: what differs",
+    \\"items":{"enum":["content","mode","owner","xattrs","target","type"]}}}}},
+    \\"summary":{"type":"object","required":["added","removed","changed"],
+    \\"properties":{"added":{"type":"integer"},"removed":{"type":"integer"},
+    \\"changed":{"type":"integer"}}}}}
+;
+
+const store_verify_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-verify/1","version":1,
+    \\"title":"zbx store verify --output json",
+    \\"description":"stdout: what was checked and what is damaged (exit 2 if anything is)",
+    \\"type":"object","required":["schema","ok","objects","object_bytes","chunk_lists",
+    \\"orphan_lists","trees","roots","damaged","paths_truncated","things"],
+    \\"properties":{"schema":{"const":"zbx.store.verify/1"},"ok":{"type":"boolean"},
+    \\"objects":{"type":"integer"},"object_bytes":{"type":"integer"},
+    \\"chunk_lists":{"type":"integer"},
+    \\"orphan_lists":{"type":"integer","description":"chunk lists with no object: not damage"},
+    \\"trees":{"type":"integer"},"roots":{"type":"integer"},
+    \\"damaged":{"type":"integer","description":"all damaged things, listed or not"},
+    \\"paths_truncated":{"type":"boolean","description":"the walk for paths ran out of room"},
+    \\"partial_images":{"type":"integer",
+    \\"description":"S2: images started with --lazy, not every file fetched: not damage"},
+    \\"things":{"type":"array","items":{"type":"object",
+    \\"required":["id","class","kind","reason","errno","reached","paths"],
+    \\"properties":{"id":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"class":{"enum":["object","tree","root"]},
+    \\"kind":{"enum":["content","chunk_list","unreadable","not_a_file","tree_damaged",
+    \\"tree_missing","object_missing","root_unusable"]},
+    \\"reason":{"type":"string"},"errno":{"type":"integer"},
+    \\"reached":{"type":"integer","description":"paths in root trees that reach it"},
+    \\"paths":{"type":"array","description":"up to 16 of them, sorted",
+    \\"items":{"type":"object","required":["root","path"],
+    \\"properties":{"root":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"path":{"type":"string","description":"from the root, with a leading slash"}}}}}}}}}
+;
+
+const store_gc_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-gc/1","version":1,
+    \\"title":"zbx store gc --output json",
+    \\"description":"stdout: the plan (applied false), or what a confirmed plan moved (true)",
+    \\"type":"object","required":["schema","applied","plan","objects","lists","trees","farms",
+    \\"tmp","bytes"],
+    \\"properties":{"schema":{"const":"zbx.store.gc/1"},"applied":{"type":"boolean"},
+    \\"plan":{"type":"string","pattern":"^b3:[0-9a-f]{64}$",
+    \\"description":"the hash to confirm with"},
+    \\"generation":{"type":"integer","description":"plans only: the store's generation counter"},
+    \\"gc":{"type":"string","description":"applied only: the id of the trash"},
+    \\"expires":{"type":"integer","description":"applied only: when the trash is emptied"},
+    \\"expired":{"type":"integer","description":"applied only: old trash emptied now"},
+    \\"trust_orphans":{"type":"integer","description":"trust records whose tree is gone"},
+    \\"objects":{"type":"integer"},"lists":{"type":"integer","description":"chunk lists"},
+    \\"trees":{"type":"integer"},"farms":{"type":"integer","description":"materialized dirs"},
+    \\"blobs":{"type":"integer","description":"downloaded blobs no image names"},
+    \\"partials":{"type":"integer","description":"cut downloads untouched for 24 hours"},
+    \\"tmp":{"type":"integer","description":"leftovers of dead processes in tmp/"},
+    \\"bytes":{"type":"integer"}}}
+;
+
+const store_trash_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-trash/1","version":1,
+    \\"title":"zbx store gc --trash --output json",
+    \\"description":"stdout: the trash that is left, oldest first",
+    \\"type":"object","required":["schema","trash"],
+    \\"properties":{"schema":{"const":"zbx.store.trash/1"},
+    \\"trash":{"type":"array","items":{"type":"object","required":["gc","readable"],
+    \\"properties":{"gc":{"type":"string"},"readable":{"type":"boolean"},
+    \\"time":{"type":"integer"},"expires":{"type":"integer"},
+    \\"objects":{"type":"integer"},"lists":{"type":"integer"},"trees":{"type":"integer"},
+    \\"farms":{"type":"integer"},"blobs":{"type":"integer"},"partials":{"type":"integer"},
+    \\"bytes":{"type":"integer"},
+    \\"complete":{"type":"boolean","description":"false if a gc or restore was interrupted"}}}}}}
+;
+
+const store_restore_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-restore/1","version":1,
+    \\"title":"zbx store restore --output json",
+    \\"description":"stdout: what was moved back from the trash",
+    \\"type":"object","required":["schema","gc","objects","lists","trees","farms"],
+    \\"properties":{"schema":{"const":"zbx.store.restore/1"},"gc":{"type":"string"},
+    \\"objects":{"type":"integer"},"lists":{"type":"integer"},"trees":{"type":"integer"},
+    \\"farms":{"type":"integer"},"blobs":{"type":"integer"},"partials":{"type":"integer"}}}
+;
+
+const store_export_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/store-export/1","version":1,
+    \\"title":"zbx store export --oci --output json",
+    \\"description":"stdout: the OCI layout written and the digests of its blobs",
+    \\"type":"object","required":["schema","dir","manifest","config","layer","size"],
+    \\"properties":{"schema":{"const":"zbx.export/1"},"dir":{"type":"string"},
+    \\"manifest":{"type":"string","description":"sha256 digest of the image manifest"},
+    \\"config":{"type":"string","description":"sha256 digest of the image config"},
+    \\"layer":{"type":"string","description":"sha256 digest of the compressed layer"},
+    \\"size":{"type":"integer","description":"bytes of the manifest, config and layer"}}}
+;
+
+const state_ls_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/state-ls/1","version":1,
+    \\"title":"zbx state ls --output json",
+    \\"description":"stdout: the state volumes by name, and the trash of zbx state rm",
+    \\"type":"object","required":["schema","directory","volumes","trash","truncated"],
+    \\"properties":{"schema":{"const":"zbx.state.ls/1"},"directory":{"type":"string"},
+    \\"volumes":{"type":"array","items":{"type":"object","required":["name","bytes",
+    \\"disk_bytes","files","record","created","last_used","last_container","last_path",
+    \\"last_read_only","in_use","used_by"],
+    \\"properties":{"name":{"type":"string","pattern":"^[a-z0-9][a-z0-9._-]{0,62}$"},
+    \\"bytes":{"type":["integer","null"],"description":"files and symlinks, hard links once"},
+    \\"disk_bytes":{"type":["integer","null"],"description":"space on the disk; null: not counted"},
+    \\"files":{"type":["integer","null"]},
+    \\"record":{"enum":["ok","missing","unreadable"],"description":"state.zon"},
+    \\"created":{"type":["integer","null"]},"last_used":{"type":["integer","null"]},
+    \\"last_container":{"type":["string","null"]},"last_path":{"type":["string","null"]},
+    \\"last_read_only":{"type":["boolean","null"]},
+    \\"in_use":{"type":"boolean","description":"a running container mounts it"},
+    \\"used_by":{"type":"array","items":{"type":"object","required":["container","read_only"],
+    \\"properties":{"container":{"type":"string"},"read_only":{"type":"boolean"}}}}}}},
+    \\"trash":{"type":"array","items":{"type":"object","required":["name","entry","removed",
+    \\"expires","expired"],"properties":{"name":{"type":"string"},"entry":{"type":"string"},
+    \\"removed":{"type":"integer"},"expires":{"type":"integer"},"expired":{"type":"boolean"}}}},
+    \\"truncated":{"type":"boolean","description":"more volumes or trash than are listed"}}}
+;
+
+const state_rm_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/state-rm/1","version":1,
+    \\"title":"zbx state rm --output json",
+    \\"description":"stdout: the volume moved to the trash",
+    \\"type":"object","required":["schema","name","entry","removed","expires","emptied"],
+    \\"properties":{"schema":{"const":"zbx.state.rm/1"},"name":{"type":"string"},
+    \\"entry":{"type":"string","description":"its name in the trash: <name>@<removed>"},
+    \\"removed":{"type":"integer"},"expires":{"type":"integer"},
+    \\"emptied":{"type":"integer","description":"expired trash emptied now"}}}
+;
+
+const state_restore_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/state-restore/1","version":1,
+    \\"title":"zbx state restore --output json",
+    \\"description":"stdout: the volume brought back from the trash",
+    \\"type":"object","required":["schema","name","entry","removed"],
+    \\"properties":{"schema":{"const":"zbx.state.restore/1"},"name":{"type":"string"},
+    \\"entry":{"type":"string"},"removed":{"type":"integer"}}}
+;
+
+const state_export_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/state-export/1","version":1,
+    \\"title":"zbx state export -o FILE --output json",
+    \\"description":"stdout, only when -o names a file (else the archive is stdout)",
+    \\"type":"object","required":["schema","name","file","directories","files","symlinks",
+    \\"hard_links","skipped","bytes","archive_bytes"],
+    \\"properties":{"schema":{"const":"zbx.state.export/1"},"name":{"type":"string"},
+    \\"file":{"type":"string"},"directories":{"type":"integer"},"files":{"type":"integer"},
+    \\"symlinks":{"type":"integer"},"hard_links":{"type":"integer"},
+    \\"skipped":{"type":"integer","description":"devices, sockets and fifos left out"},
+    \\"bytes":{"type":"integer","description":"the files' bytes before compression"},
+    \\"archive_bytes":{"type":"integer"}}}
+;
+
+const pull_resolve_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/pull-resolve/1","version":1,
+    \\"title":"zbx pull --resolve-only --output json",
+    \\"description":"stdout: what a reference names for this platform. A failure is on stderr.",
+    \\"type":"object","required":["schema","reference","registry","repository","index_digest",
+    \\"manifest_digest","manifest_size","platform","config_digest","config_size","layers"],
+    \\"properties":{"schema":{"const":"zbx.pull.resolve/1"},
+    \\"reference":{"type":"string","description":"the canonical form of the reference"},
+    \\"registry":{"type":"string"},"repository":{"type":"string"},
+    \\"index_digest":{"type":["string","null"],"pattern":"^sha256:[0-9a-f]{64}$",
+    \\"description":"the index or manifest list the reference named; null for a single manifest"},
+    \\"manifest_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$",
+    \\"description":"the manifest of this platform: what zbx.lock records"},
+    \\"manifest_size":{"type":"integer"},
+    \\"platform":{"enum":["linux/amd64","linux/arm64"]},
+    \\"config_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"config_size":{"type":"integer"},
+    \\"layers":{"type":"array","items":{"type":"object","required":["digest","size","kind"],
+    \\"properties":{"digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"size":{"type":"integer"},"kind":{"enum":["tar","tar_gzip","tar_zstd"]}}}}}}
+;
+
+const pull_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/pull/1","version":1,
+    \\"title":"zbx pull --output json",
+    \\"description":"stdout: the image pulled and the tree it became. A failure is on stderr.",
+    \\"type":"object","required":["schema","reference","registry","repository","manifest_digest",
+    \\"platform","tree","config","layers","files","directories","symlinks","bytes",
+    \\"special_skipped","xattrs_skipped","image","lock"],
+    \\"properties":{"schema":{"const":"zbx.pull/1"},
+    \\"reference":{"type":"string","description":"as the user wrote it"},
+    \\"registry":{"type":"string"},"repository":{"type":"string"},
+    \\"manifest_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"platform":{"enum":["linux/amd64","linux/arm64"]},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$",
+    \\"description":"the store's identity of the image: the digest of its flattened tree"},
+    \\"config":{"type":"object","required":["digest","cache"],
+    \\"properties":{"digest":{"type":"string"},"cache":{"enum":["cached","downloaded","resumed"]}}},
+    \\"layers":{"type":"array","items":{"type":"object","required":["digest","size","cache"],
+    \\"properties":{"digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"size":{"type":"integer"},"cache":{"enum":["cached","downloaded","resumed"]}}}},
+    \\"files":{"type":"integer"},"directories":{"type":"integer"},"symlinks":{"type":"integer"},
+    \\"bytes":{"type":"integer"},"special_skipped":{"type":"integer"},
+    \\"xattrs_skipped":{"type":"integer"},
+    \\"image":{"type":"object","description":"what the image runs by default",
+    \\"required":["entrypoint","cmd","env","workdir","user"],
+    \\"properties":{"entrypoint":{"type":"array","items":{"type":"string"}},
+    \\"cmd":{"type":"array","items":{"type":"string"}},
+    \\"env":{"type":"array","items":{"type":"string"}},
+    \\"workdir":{"type":"string"},"user":{"type":"string"}}},
+    \\"lock":{"type":["object","null"],
+    \\"description":"zbx.lock after the pull; null for a digest reference, which needs none",
+    \\"required":["path","created"],
+    \\"properties":{"path":{"type":"string"},
+    \\"created":{"type":"boolean","description":"this pull made the file"}}}}}
+;
+
+const import_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/import/1","version":1,
+    \\"title":"zbx import --output json",
+    \\"description":"stdout: what the import made of a Dockerfile; a refusal is on stderr.",
+    \\"type":"object","required":["schema","dockerfile","output","target","stages","steps",
+    \\"dropped","flagged"],
+    \\"properties":{"schema":{"const":"zbx.import/1"},
+    \\"dockerfile":{"type":"string"},
+    \\"output":{"type":"string","description":"the build file written"},
+    \\"target":{"type":"string"},"stages":{"type":"integer"},
+    \\"steps":{"type":"array","items":{"type":"object",
+    \\"required":["name","line","kind","network","matched","cache","bind"],
+    \\"properties":{"name":{"type":"string"},"line":{"type":"integer"},
+    \\"kind":{"type":"string"},
+    \\"network":{"type":["string","null"],"description":"the word that looked like network use"},
+    \\"matched":{"type":"boolean"},"cache":{"type":"boolean"},"bind":{"type":"boolean"}}}},
+    \\"dropped":{"type":"array","items":{"type":"object","required":["line","what","became"],
+    \\"properties":{"line":{"type":"integer"},"what":{"type":"string"},
+    \\"became":{"type":"string"}}}},
+    \\"flagged":{"type":"integer","description":"steps not hermetic (network or cache)"}}}
+;
+
+const push_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/push/1","version":1,
+    \\"title":"zbx push <source> <destination> --output json",
+    \\"description":"stdout: what each blob needed and the manifest put under the tag.",
+    \\"type":"object","required":["blobs","destination","manifest","schema"],
+    \\"properties":{"schema":{"const":"zbx.push/1"},
+    \\"destination":{"type":"string","description":"registry/repository:tag, as pushed"},
+    \\"manifest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"blobs":{"type":"array","items":{"type":"object","required":["digest","outcome","size"],
+    \\"properties":{"digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"outcome":{"enum":["exists","mounted","uploaded"]},
+    \\"size":{"type":"integer"}}}}}}
+;
+
+const explain_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/explain/1","version":1,
+    \\"title":"zbx explain <code> --output json",
+    \\"description":"stdout: one registered code. An unknown code is a diagnostic on stderr.",
+    \\"type":"object","required":["schema","code","severity","blame","summary","explanation",
+    \\"docs"],
+    \\"properties":{"schema":{"const":"zbx.explain/1"},
+    \\"code":{"type":"string","pattern":"^ZBX-[EWB][0-9]{4}$"},
+    \\"severity":{"enum":["error","warning","note","bug"]},
+    \\"blame":{"enum":["user","environment","external","internal"]},
+    \\"summary":{"type":"string"},
+    \\"explanation":{"type":"string","description":"the long text, hard-wrapped, with newlines"},
+    \\"docs":{"type":"string","description":"the page of the code on the project site"}}}
+;
+
+const lock_show_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/lock-show/1","version":1,
+    \\"title":"zbx lock show --output json",
+    \\"description":"stdout: the project's zbx.lock. A failure is a diagnostic on stderr.",
+    \\"type":"object","required":["schema","path","images"],
+    \\"properties":{"schema":{"const":"zbx.lock/1"},
+    \\"path":{"type":"string","description":"the lock file, found as run finds it"},
+    \\"images":{"type":"array","description":"the entries, sorted by reference",
+    \\"items":{"type":"object","required":["reference","manifest","platform","tree"],
+    \\"properties":{"reference":{"type":"string","description":"as it was written"},
+    \\"manifest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"platform":{"enum":["linux/amd64","linux/arm64"]},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}}}}}
+;
+
+const build_graph_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/build-graph/1","version":1,
+    \\"title":"zbx build --graph --output json",
+    \\"description":"stdout: the checked build file as a graph. A refusal is on stderr.",
+    \\"type":"object","required":["schema","path","nodes","edges"],
+    \\"properties":{"schema":{"const":"zbx.build_graph/1"},
+    \\"path":{"type":"string","description":"the build file, resolved"},
+    \\"nodes":{"type":"array",
+    \\"description":"the steps in the order a build starts them (ties by name), then the image",
+    \\"items":{"type":"object","required":["name","kind","base"],
+    \\"properties":{"name":{"type":"string","description":"the step's; the image's is image"},
+    \\"kind":{"enum":["step","image"]},
+    \\"base":{"type":["string","null"],
+    \\"description":"an image reference, or step:<name>; null: an empty base"},
+    \\"inputs":{"type":"array","items":{"type":"string"},
+    \\"description":"a step's: project-relative paths, as written"},
+    \\"needs":{"type":"array","items":{"type":"string"},"description":"a step's, as written"},
+    \\"network":{"type":"boolean","description":"a step's"},
+    \\"output":{"const":"root","description":"a step's, only when its output is its root"},
+    \\"copies":{"type":"integer","description":"a step's copy entries, only when it has some"},
+    \\"adds":{"type":"array","description":"the image's, in order",
+    \\"items":{"type":"object","required":["from","to"],
+    \\"properties":{"from":{"type":"string"},"to":{"type":"string"}}}}}}},
+    \\"edges":{"type":"array","description":"from a step to a node that needs it or adds it",
+    \\"items":{"type":"object","required":["from","to"],
+    \\"properties":{"from":{"type":"string"},"to":{"type":"string"}}}}}}
+;
+
+const sign_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/sign/1","version":1,
+    \\"title":"zbx sign --output json",
+    \\"description":"stdout: the signature just added to a tree's record, or found there.",
+    \\"type":"object",
+    \\"required":["schema","tree","binding","subject","key","id","added","signatures"],
+    \\"properties":{"schema":{"const":"zbx.sign/1"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$","description":"the tree signed"},
+    \\"binding":{"enum":["none","result","manifest"],
+    \\"description":"none: the tree alone; result: and one build result; manifest: and a manifest"},
+    \\"subject":{"type":"string","description":"the operand, as given"},
+    \\"key":{"type":"string","pattern":"^[a-z0-9-]{1,32}$"},
+    \\"id":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"the signing key's id"},
+    \\"added":{"type":"boolean","description":"false: this key had signed the same subjects"},
+    \\"signatures":{"type":"integer","minimum":1,"description":"lines in the tree's record now"}}}
+;
+
+const policy_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/policy/1","version":1,
+    \\"title":"zbx policy check --output json",
+    \\"description":"stdout: each policy file read and, given an operand, what it says of a run.",
+    \\"type":"object","required":["schema","subject","files","allowed"],
+    \\"properties":{"schema":{"const":"zbx.policy/1"},
+    \\"subject":{"description":"null when no operand was given",
+    \\"oneOf":[{"type":"null"},{"type":"object","required":["operand","tree","binding"],
+    \\"properties":{"operand":{"type":"string"},
+    \\"tree":{"type":["string","null"],"pattern":"^b3:[0-9a-f]{64}$"},
+    \\"binding":{"enum":["none","result","manifest"]}}}]},
+    \\"files":{"type":"array","description":"each policy file that exists, system file first",
+    \\"items":{"type":"object",
+    \\"required":["path","require_signature","require_provenance","verify","keys","met",
+    \\"code","refusal","signatures"],
+    \\"properties":{"path":{"type":"string"},
+    \\"require_signature":{"type":"boolean"},"require_provenance":{"type":"boolean"},
+    \\"verify":{"enum":["cached","always"]},
+    \\"keys":{"type":"array","items":{"type":"object","required":["name","public"],
+    \\"properties":{"name":{"type":"string"},
+    \\"public":{"type":"string","pattern":"^zbx-ed25519:[0-9a-f]{64}$"}}}},
+    \\"met":{"type":["boolean","null"],
+    \\"description":"null: no operand, or the file asks nothing of a run"},
+    \\"code":{"enum":["ZBX-E0905","ZBX-E0906",null],
+    \\"description":"the code `run` would refuse with; null when met or nothing is asked"},
+    \\"refusal":{"enum":["unsigned","other_binding","provenance",null],
+    \\"description":"why not: unsigned, signed for another result, or no provenance"},
+    \\"signatures":{"type":"array","description":"the tree's record, judged against this file",
+    \\"items":{"type":"object","required":["public","key","reason"],
+    \\"properties":{"public":{"type":"string"},
+    \\"key":{"type":["string","null"],"description":"the policy's name for the key, if listed"},
+    \\"reason":{"enum":["counts","malformed","bad_signature","untrusted_key","other_tree",
+    \\"other_predicate","other_binding","not_derived"]}}}}}}},
+    \\"allowed":{"type":"boolean","description":"every file is met; the run would start"}}}
+;
+
+const key_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/key/1","version":1,
+    \\"title":"zbx key new|list|show --output json",
+    \\"description":"stdout: the keys made or described. Never a secret or a passphrase.",
+    \\"type":"object","required":["schema","action","keys","truncated"],
+    \\"properties":{"schema":{"const":"zbx.key/1"},
+    \\"action":{"enum":["new","list","show"]},
+    \\"keys":{"type":"array","description":"by name; new and show have exactly one",
+    \\"items":{"type":"object","required":["name","id","public","encryption"],
+    \\"properties":{"name":{"type":"string","pattern":"^[a-z0-9-]{1,32}$"},
+    \\"id":{"type":"string","pattern":"^[0-9a-f]{64}$",
+    \\"description":"BLAKE3 of the public key under the zbx-key domain; always whole"},
+    \\"public":{"type":"string","pattern":"^zbx-ed25519:[0-9a-f]{64}$"},
+    \\"encryption":{"enum":["passphrase","none"]}}}},
+    \\"truncated":{"type":"boolean","description":"list: more keys than are shown"}}}
+;
+
+const vm_status_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/vm-status/1","version":1,
+    \\"title":"zbx vm status --output json (the macOS zbx)",
+    \\"description":"stdout: whether the virtual machine runs, its image and its size",
+    \\"type":"object","required":["schema","state","image_version","configured",
+    \\"idle_timeout_ms"],
+    \\"properties":{"schema":{"const":"zbx.vm.status/1"},
+    \\"state":{"enum":["stopped","starting","running","stopping"]},
+    \\"image_version":{"type":"string","pattern":"^[0-9a-f]{16}$",
+    \\"description":"the image this zbx carries"},
+    \\"vm_image_version":{"type":["string","null"],"pattern":"^[0-9a-f]{16}$",
+    \\"description":"the image the running machine booted from; null when it is stopped"},
+    \\"image_match":{"type":["boolean","null"],
+    \\"description":"false: zbx will replace the machine; null when it is stopped"},
+    \\"pid":{"type":["integer","null"],"description":"the process that owns the machine"},
+    \\"cpus":{"type":["integer","null"],"description":"of the running machine"},
+    \\"memory_bytes":{"type":["integer","null"],"description":"of the running machine"},
+    \\"uptime_ms":{"type":["integer","null"],"description":"since the guest answered"},
+    \\"network":{"enum":["up","down",null],
+    \\"description":"M4b slice 2: whether the guest got an address by DHCP; null when stopped"},
+    \\"configured":{"type":"object","required":["cpus","memory_bytes"],
+    \\"description":"what the next boot uses (zbx vm config)",
+    \\"properties":{"cpus":{"type":"integer"},"memory_bytes":{"type":"integer"},
+    \\"disk_bytes":{"type":"integer","description":"M4b slice 3: the store disk's size"}}},
+    \\"idle_timeout_ms":{"type":"integer","description":"idle time after which it stops"}}}
+;
+
+const vm_config_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/vm-config/1","version":1,
+    \\"title":"zbx vm config --output json (the macOS zbx)",
+    \\"description":"stdout: the virtual machine's size, as set or as defaulted",
+    \\"type":"object","required":["schema","cpus","memory_bytes","source","bounds",
+    \\"applies"],
+    \\"properties":{"schema":{"const":"zbx.vm.config/1"},
+    \\"cpus":{"type":"integer"},"memory_bytes":{"type":"integer"},
+    \\"disk_bytes":{"type":"integer","description":"M4b slice 3: the store disk; it only grows"},
+    \\"source":{"enum":["default","settings"],
+    \\"description":"settings: written by zbx vm config"},
+    \\"bounds":{"type":"object","required":["cpus_min","cpus_max","memory_bytes_min",
+    \\"memory_bytes_max"],"description":"what this Mac allows",
+    \\"properties":{"cpus_min":{"type":"integer"},"cpus_max":{"type":"integer"},
+    \\"memory_bytes_min":{"type":"integer"},"memory_bytes_max":{"type":"integer"},
+    \\"disk_bytes_min":{"type":"integer"},"disk_bytes_max":{"type":"integer"}}},
+    \\"applies":{"enum":["next_boot","running_machine"],
+    \\"description":"running_machine: the machine runs with these values already"},
+    \\"running":{"type":["object","null"],"description":"a running machine with other values",
+    \\"properties":{"cpus":{"type":"integer"},"memory_bytes":{"type":"integer"}}}}}
+;
+
+const build_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/build/1","version":1,
+    \\"title":"zbx build --output json",
+    \\"description":"stdout: a line per ended step and for the image, then the result digest.",
+    \\"$comment":"No $ref; oneOf tells the lines apart. A failed build: a diagnostic on stderr.",
+    \\"type":"object",
+    \\"properties":{"schema":{"const":"zbx.build/1"},
+    \\"step":{"type":"string","description":"a step's name; the image's is image"},
+    \\"cache":{"enum":["hit","miss"]},
+    \\"key":{"type":"string","pattern":"^b3:[0-9a-f]{64}$","description":"the cache key"},
+    \\"output":{"type":"string","pattern":"^b3:[0-9a-f]{64}$","description":"the output tree"},
+    \\"start_ms":{"type":"integer","description":"milliseconds since the build began"},
+    \\"end_ms":{"type":"integer","description":"a hit starts and ends when it is found"},
+    \\"network":{"type":"boolean","description":"the step was given the network"},
+    \\"caches":{"const":true,"description":"M9: present only on a step with cache mounts"},
+    \\"build_result":{"type":"object","required":["digest","hits","misses","elapsed_ms"],
+    \\"properties":{"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$",
+    \\"description":"the result digest: zbx run and zbx inspect take it"},
+    \\"hits":{"type":"integer"},"misses":{"type":"integer"},"elapsed_ms":{"type":"integer"}}},
+    \\
+++ diagnostic_properties ++
+    \\},
+    \\"oneOf":[{"required":["schema","step","cache","key","output","start_ms","end_ms","network"]},
+    \\{"required":["schema","build_result"]},{
+++ diagnostic_required ++
+    \\}]}
+;
+
+const inspect_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/inspect/1","version":1,
+    \\"title":"zbx inspect --output json",
+    \\"description":"stdout: a build result, one line. A refusal is on stderr.",
+    \\"type":"object","required":["schema","digest","tree","config"],
+    \\"properties":{"schema":{"const":"zbx.build_result/1"},
+    \\"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$","description":"the result digest"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$","description":"the image tree"},
+    \\"config":{"type":"object",
+    \\"required":["entrypoint","cmd","env","workdir","user","labels"],
+    \\"properties":{"entrypoint":{"type":"array","items":{"type":"string"}},
+    \\"cmd":{"type":"array","items":{"type":"string"}},
+    \\"env":{"type":"array","items":{"type":"string"},"description":"NAME=value"},
+    \\"workdir":{"type":"string"},"user":{"type":"string"},
+    \\"labels":{"type":"object","additionalProperties":{"type":"string"}}}}}}
+;
+
+const inspect_provenance_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/inspect-provenance/1","version":1,
+    \\"title":"zbx inspect --provenance --output json",
+    \\"description":"stdout: a build result's provenance record, one line. A refusal is on stderr.",
+    \\"type":"object",
+    \\"required":["schema","result","tree","record","build_file","lock","builder",
+    \\"started","finished","bases","steps","image","signatures"],
+    \\"properties":{"schema":{"const":"zbx.provenance/1"},
+    \\"result":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"record":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"build_file":{"type":"object","required":["name","digest"],
+    \\"properties":{"name":{"type":"string"},
+    \\"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}},
+    \\"lock":{"anyOf":[{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},{"type":"null"}]},
+    \\"builder":{"type":"object","required":["version","platform","zbx"],
+    \\"properties":{"version":{"type":"string"},"platform":{"type":"string"},
+    \\"zbx":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}},
+    \\"started":{"type":"integer"},"finished":{"type":"integer"},
+    \\"bases":{"type":"array","items":{"type":"object",
+    \\"required":["reference","manifest","tree"],
+    \\"properties":{"reference":{"type":"string"},
+    \\"manifest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}}},
+    \\"steps":{"type":"array","items":{"type":"object",
+    \\"required":["name","key","base","input","needs","output","network"],
+    \\"properties":{"name":{"type":"string"},"key":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"base":{"type":"integer"},"input":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"needs":{"type":"object",
+    \\"additionalProperties":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}},
+    \\"output":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},"network":{"type":"boolean"}}}},
+    \\"image":{"type":"object","required":["key","base"],
+    \\"properties":{"key":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"base":{"anyOf":[{"type":"integer"},{"type":"null"}]}}},
+    \\"signatures":{"type":"array","items":{"type":"object",
+    \\"required":["key","id","signed"],
+    \\"properties":{"key":{"type":"string"},"id":{"type":"string"},
+    \\"signed":{"enum":["this record","an earlier build"]}}}}}}
+;
+
+const verify_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/verify/1","version":1,
+    \\"title":"zbx verify --output json",
+    \\"description":"stdout: the six links of a tree's chain; a broken one also raises ZBX-E0908.",
+    \\"type":"object",
+    \\"required":["schema","subject","tree","ok","links","signers","provenance_record","inputs",
+    \\"build_file","lock"],
+    \\"properties":{"schema":{"const":"zbx.verify/1"},
+    \\"subject":{"type":"string","description":"the operand, as given"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$",
+    \\"description":"the tree the operand names"},
+    \\"ok":{"type":"boolean","description":"no link failed and every one was reached"},
+    \\"links":{"type":"array","minItems":6,"maxItems":6,
+    \\"description":"signatures, signer, tree, provenance, inputs, build_file, in that order",
+    \\"items":{"type":"object","required":["n","name","status"],
+    \\"properties":{"n":{"type":"integer","minimum":1,"maximum":6},
+    \\"name":{"enum":["signatures","signer","tree","provenance","inputs","build_file"]},
+    \\"status":{"enum":["ok","skipped","partial","failed","not_reached"],
+    \\"description":"partial: some input trees are not in the store (ZBX-W0903)"}}}},
+    \\"signers":{"type":"array","items":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+    \\"description":"the key ids that signed the tree"},
+    \\"provenance_record":{"enum":["none","same","differs","absent"],
+    \\"description":"whether the stored provenance record is the signed bytes; none: not asked"},
+    \\"inputs":{"type":"object","required":["checked","not_in_store"],
+    \\"properties":{"checked":{"type":"integer","minimum":0},
+    \\"not_in_store":{"type":"integer","minimum":0}}},
+    \\"build_file":{"enum":["ok","skipped","partial","failed","not_reached"]},
+    \\"lock":{"enum":["ok","skipped","partial","failed","not_reached"]}}}
+;
+
+const trust_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/trust/1","version":1,
+    \\"title":"zbx trust import --output json",
+    \\"description":"stdout: what importing a bundle added to a tree's record.",
+    \\"type":"object",
+    \\"required":["schema","action","tree","added","present","total"],
+    \\"properties":{"schema":{"const":"zbx.trust/1"},
+    \\"action":{"const":"import"},
+    \\"tree":{"type":"string","pattern":"^b3:[0-9a-f]{64}$",
+    \\"description":"the tree the bundle is about"},
+    \\"added":{"type":"integer","minimum":0,"description":"lines the store did not have"},
+    \\"present":{"type":"integer","minimum":0,"description":"lines it had already"},
+    \\"total":{"type":"integer","minimum":1,"description":"lines in the tree's record now"}}}
+;
+
+const trust_prune_schema =
+    \\{"$schema":"https://json-schema.org/draft/2020-12/schema",
+    \\"$id":"https://zigbox.github.io/zigbox/schema/trust-prune/1","version":1,
+    \\"title":"zbx trust prune --output json",
+    \\"description":"stdout: records whose trees are gone; with --apply, how many were removed.",
+    \\"type":"object",
+    \\"required":["schema","dry_run","orphans","damaged","removed","truncated","entries"],
+    \\"properties":{"schema":{"const":"zbx.trust-prune/1"},
+    \\"dry_run":{"type":"boolean","description":"true: nothing was removed"},
+    \\"orphans":{"type":"integer","minimum":0},
+    \\"damaged":{"type":"integer","minimum":0},
+    \\"removed":{"type":"integer","minimum":0},
+    \\"truncated":{"type":"boolean","description":"more records than the list holds; run it again"},
+    \\"entries":{"type":"array","items":{"type":"object",
+    \\"required":["kind","fate","digest","lines","bytes"],
+    \\"properties":{"kind":{"enum":["signature","provenance"]},
+    \\"fate":{"enum":["orphan","damaged"]},
+    \\"digest":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"},
+    \\"lines":{"type":"integer","minimum":0},
+    \\"bytes":{"type":"integer","minimum":0}}}}}}
+;
+
+const Entry = struct { command: []const u8, text: []const u8 };
+
+const table = [_]Entry{
+    .{ .command = "run", .text = run_schema },
+    .{ .command = "bundle", .text = bundle_schema },
+    .{ .command = "ps", .text = ps_schema },
+    .{ .command = "stop", .text = stop_schema },
+    .{ .command = "logs", .text = logs_schema },
+    .{ .command = "exec", .text = exec_schema },
+    .{ .command = "doctor", .text = doctor_schema },
+    .{ .command = "store-import", .text = store_import_schema },
+    .{ .command = "store-ls", .text = store_ls_schema },
+    .{ .command = "store-du", .text = store_du_schema },
+    .{ .command = "store-rm", .text = store_rm_schema },
+    .{ .command = "commit", .text = commit_schema },
+    .{ .command = "store-diff", .text = store_diff_schema },
+    .{ .command = "store-verify", .text = store_verify_schema },
+    .{ .command = "store-gc", .text = store_gc_schema },
+    .{ .command = "store-trash", .text = store_trash_schema },
+    .{ .command = "store-restore", .text = store_restore_schema },
+    .{ .command = "pull-resolve", .text = pull_resolve_schema },
+    .{ .command = "pull", .text = pull_schema },
+    .{ .command = "import", .text = import_schema },
+    .{ .command = "push", .text = push_schema },
+    .{ .command = "explain", .text = explain_schema },
+    .{ .command = "lock-show", .text = lock_show_schema },
+    .{ .command = "build-graph", .text = build_graph_schema },
+    .{ .command = "key", .text = key_schema },
+    .{ .command = "sign", .text = sign_schema },
+    .{ .command = "policy", .text = policy_schema },
+    .{ .command = "verify", .text = verify_schema },
+    .{ .command = "trust", .text = trust_schema },
+    .{ .command = "trust-prune", .text = trust_prune_schema },
+    .{ .command = "build", .text = build_schema },
+    .{ .command = "inspect", .text = inspect_schema },
+    .{ .command = "inspect-provenance", .text = inspect_provenance_schema },
+    .{ .command = "store-export", .text = store_export_schema },
+    .{ .command = "state-ls", .text = state_ls_schema },
+    .{ .command = "state-rm", .text = state_rm_schema },
+    .{ .command = "state-restore", .text = state_restore_schema },
+    .{ .command = "state-export", .text = state_export_schema },
+    .{ .command = "vm-status", .text = vm_status_schema },
+    .{ .command = "vm-config", .text = vm_config_schema },
+};
+
+/// The schema of a command's output, or null if it has none.
+pub fn of(command: []const u8) ?[]const u8 {
+    assert(command.len <= 4096);
+    assert(table.len == 40);
+    for (table) |entry| {
+        if (std.mem.eql(u8, entry.command, command)) return entry.text;
+    }
+    return null;
+}
+
+/// The longest schema, for the buffer that prints it.
+pub const bytes_max: usize = blk: {
+    var longest: usize = 0;
+    for (table) |entry| longest = @max(longest, entry.text.len + 1);
+    break :blk longest;
+};
+
+const testing = std.testing;
+const test_util = @import("test_util.zig");
+
+test "every schema is valid JSON, names its command and its version" {
+    // Goal: the registry is complete and each document parses. Method: the five commands of M2
+    // and the four store commands; an unknown command has none.
+    for (table) |entry| {
+        try testing.expect(try test_util.json_is_valid(entry.text));
+        var id: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&id, "/schema/{s}/1\"", .{entry.command});
+        try testing.expect(std.mem.indexOf(u8, entry.text, want) != null);
+        try testing.expect(std.mem.indexOf(u8, entry.text, "\"version\":1") != null);
+    }
+    try testing.expect(of("lock") == null);
+    try testing.expect(of("") == null);
+    try testing.expectEqual(@as(usize, 40), table.len);
+}
+
+test "run and doctor are one object schema without a $ref, as an agent can follow it" {
+    // Goal: M5's agent test, finding 6. Method: the text has no `$ref`; the top level is an
+    // object schema whose `oneOf` alternatives are lists of required members (the form the
+    // agent's checker follows); every member they require is listed under `properties`; and the
+    // members M6 added to the documents are there, with the flags of a fix.
+    for ([_][]const u8{ "run", "doctor", "exec", "logs" }) |command| {
+        const text = of(command).?;
+        try testing.expect(std.mem.indexOf(u8, text, "\"$ref\"") == null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try testing.expectEqualStrings("object", root.get("type").?.string);
+        const properties = root.get("properties").?.object;
+        for (root.get("oneOf").?.array.items) |alternative| {
+            try testing.expectEqual(@as(u32, 1), alternative.object.count());
+            for (alternative.object.get("required").?.array.items) |name| {
+                try testing.expect(properties.get(name.string) != null);
+            }
+        }
+        const fixes = properties.get("fixes").?.object.get("items").?.object;
+        const flags = fixes.get("properties").?.object;
+        try testing.expect(flags.get("needs_root") != null);
+        try testing.expect(flags.get("template") != null);
+    }
+    // A schema only grows: the records of `logs` still require what they always did.
+    const logs_text = of("logs").?;
+    const record = "{\"required\":[\"schema\",\"stream\",\"time\",\"text\"]}";
+    try testing.expect(std.mem.indexOf(u8, logs_text, record) != null);
+    try testing.expect(std.mem.indexOf(u8, logs_text, "\"dropped_bytes\"") != null);
+    const run_text = of("run").?;
+    for ([_][]const u8{ "\"hint\"", "network_none", "\"env\"", "\"detached\"" }) |part| {
+        try testing.expect(std.mem.indexOf(u8, run_text, part) != null);
+    }
+    const doctor_text = of("doctor").?;
+    for ([_][]const u8{ "zbx.doctor/1", "\"checks\"", "\"diagnostic\"", "ZBX-[EW]" }) |part| {
+        try testing.expect(std.mem.indexOf(u8, doctor_text, part) != null);
+    }
+    const ps_text = of("ps").?;
+    for ([_][]const u8{ "\"network\"", "\"published\"", "\"env\"" }) |part| {
+        try testing.expect(std.mem.indexOf(u8, ps_text, part) != null);
+    }
+}
+
+test "the doctor schema's id enum is every check the doctor runs, in its order" {
+    // Goal: a new doctor check cannot ship with a schema that refuses its id (S2's fuse check
+    // did, and the M5 agent demo caught it in the VM). Method: the enum read from the parsed
+    // schema against `doctor.CheckId`, member by member. Linux only: importing `doctor.zig` pulls
+    // its tests, which reach Linux-only code, into the macOS test root; the Linux roots cover it.
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const doctor = @import("doctor.zig");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, doctor_schema, .{});
+    defer parsed.deinit();
+    const checks = parsed.value.object.get("properties").?.object.get("checks").?.object;
+    const item = checks.get("items").?.object.get("properties").?.object;
+    const ids = item.get("id").?.object.get("enum").?.array.items;
+    const checks_in_order = std.enums.values(doctor.CheckId);
+    try testing.expectEqual(checks_in_order.len, ids.len);
+    for (checks_in_order, 0..) |id, index| {
+        try testing.expectEqualStrings(id.name(), ids[index].string);
+    }
+}

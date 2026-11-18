@@ -1,0 +1,70 @@
+# Zigbox style and testing
+
+Zigbox adopts [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md), TigerBeetle's coding style, and TigerBeetle's testing approach: deterministic, seeded simulation with fault injection. Read TigerStyle in full once. This file says how it applies here and where Zigbox departs from it, with the reason each time.
+
+Design goals, in order: **safety, performance, developer experience.**
+
+## Rules (enforced by review; mechanical ones also by `zig build tidy`)
+
+### Control flow and limits
+
+- Simple, explicit control flow. **No recursion.** Tree walks (store import, verify, gc) use an explicit stack with a fixed maximum depth.
+- **Put a limit on everything.** Every loop, queue, buffer, path, file read and directory walk has a named upper bound in `src/constants.zig`. Exceeding a bound is an operating error with a one-line message, never undefined behaviour.
+- A loop that cannot terminate by design (signal-forwarding wait loop) asserts that fact.
+- Explicitly sized integer types (`u32`, `u64`). `usize` only where the language demands it (slice indexing, lengths), converted at the boundary with a checked cast.
+
+### Assertions
+
+- Assertions catch programmer errors; operating errors (missing file, `EPERM`, a bad image) are handled and reported. A failed assertion crashes. That is the correct response to corrupt code.
+- **At least two assertions per function on average**: arguments, return values, pre- and postconditions, invariants.
+- **Pair assertions**: check each important property on two paths, for example a tree digest when writing to the store and again when reading it back.
+- Assert the **positive space and the negative space**: what must hold and what must not.
+- Split compound assertions: `assert(a); assert(b);`, not `assert(a and b)`. Use `if (a) assert(b);` for implications.
+- **`comptime` assert the relationships between constants** in `constants.zig`.
+- Assertions stay on in release builds. Zigbox ships `ReleaseSafe`, not `ReleaseSmall`. The release size limit (under 4 MB since M4; 2 MB before) is checked against the `ReleaseSafe` binary. If it cannot be met, report that to the owner; do not switch build modes quietly.
+
+### Memory
+
+- **No allocation after startup.** Each command computes its memory need from `constants.zig`, allocates once (or uses fixed arrays), and never frees and reallocates.
+- Departure from TigerStyle: where an input has no natural bound (an image's file count, a registry blob's size), stream it through fixed buffers, and bound what must be held in memory at once (for example, entries per directory). If a design seems to need unbounded memory, stop and write it up for review.
+
+### Functions and names
+
+- **At most 70 lines per function, 100 columns per line**, 4-space indentation, `zig fmt`.
+- Push `if`s up and `for`s down. A parent function keeps the control flow and the state; leaf functions are pure and compute what should change.
+- Smallest possible scope; no variable before it is needed. Do not copy or alias state.
+- `snake_case` for files, functions and variables. No abbreviations (`source`/`target`, not `src`/`dst`). Put units and qualifiers last: `size_bytes_max`, `timeout_ms`.
+- Use an options struct when two arguments could be swapped. Pass library options explicitly at the call site rather than relying on defaults.
+- Pass arguments over 16 bytes as `*const`. Initialise large structs in place through an out pointer.
+- Split compound conditions into nested `if`/`else`. State invariants positively (`if (index < count)`). Exception: test code, reference oracles in fuzzers, and build-host tooling (`tidy`, `size_check`) may use compound conditions in branches, because an oracle that mirrors the production code's structure stops being independent. Compound *assertions* are banned everywhere.
+- Make the rounding intent of every division explicit (`@divExact`, `@divFloor`, `std.math.divCeil`).
+- Handle every error. `catch unreachable` is allowed only with an assertion-grade comment explaining why the error cannot occur. `zig build tidy` requires that comment on the same line or the line directly above, and rejects `and`/`or` inside `assert(...)`.
+- Comments say **why** and are full sentences. Each test opens with a comment giving its goal and method.
+- Commit messages explain why. A PR description is not a commit message.
+
+### Dependencies and tooling
+
+- **No dependencies** beyond the Zig toolchain. External programs are allowed only where the spec names them as part of the system: `newuidmap`/`newgidmap`, `pasta`, and QEMU for the test VM. On macOS, the system programs `/usr/bin/codesign` (the macOS `zbx doctor` reads the binary's own entitlements with it, and the release script signs and verifies with it), `/usr/bin/ditto` (the release archive), `/usr/bin/lipo` (joins the arm64 and x86_64 builds into the universal binary and checks which architectures it holds), `/usr/bin/xcrun` for `notarytool` and `stapler`, and `/usr/sbin/spctl`; nothing else, and none of them at run time except `codesign` in `zbx doctor`. The macOS `zbx` links libSystem and the system frameworks (Foundation, Virtualization), which macOS requires; that is not a dependency, and the Linux binaries still link no libc.
+- **The macOS release process** (milestone M4b) also uses Apple's `codesign` (signing the macOS `zbx` with the virtualization entitlement, ad hoc for a local build and with the Developer ID for a release), `notarytool` (notarization), `stapler` (attaching the ticket), `xcrun` (finding those tools), and `brew` (the formula and its tap). They run at build and release time only. The macOS `zbx` never runs any of them.
+- **The Linux package release** (M8) runs `gpg` and `rpm` in the release workflow (`.github/workflows/release.yml`, glue in `.github/release-sign.sh`) to sign the apt and dnf repositories and the rpm headers with a signing subkey, and to verify every signature (owner, 2026-11-11, superseding 2026-11-04). The primary key stays offline. It runs at release time only; `zbx` and `zig build packages` never run it, and the workflow's test job runs it with a throwaway key.
+- **The VM kernel build** (`zig build vm-kernel`, on arm64 Ubuntu 24.04) runs the kernel's own tool chain (`make`, `gcc`, `tar`, `apt-get` to install them). `zig build vm-kernel-docker` runs the same program inside an `ubuntu:24.04` container with `docker`, as a developer convenience on a Mac; no product code uses Docker.
+- **The VM image tool** downloads the pinned Alpine packages (`vm/alpine.zon`) with `std.http`, checks each against its SHA-256, and reads the `.apk` files itself (gzip and tar from `std`); it runs no external program.
+- Build, tidy, fuzz and VM tooling are written in Zig, not shell. A `.sh` file needs a written reason (`.github/release-sign.sh`: the program that signs is `gpg`; `.github/release-prepare-check.sh`: the program that checks its signature is `gpg`).
+
+## Testing
+
+A fuzzer or simulator proves only that bugs are present, never that they are absent. So: build a precise mental model of the code first, encode it as assertions, explain it in comments for the reviewer, and then let seeded tests try to break it.
+
+### Layers
+
+1. **Unit tests**: next to the code (`test` blocks), covering valid inputs, invalid inputs, and the boundary where valid becomes invalid.
+2. **Snapshot tests**: user-visible output (the `doctor` report, error lines) is compared against checked-in expected text. Error messages are part of the product.
+3. **Seeded fuzzers**: `zig build fuzz -- <fuzzer> [seed]`. Every failure prints its seed and reproduces exactly from it. Without a seed, a fuzzer picks one and prints it first. CI runs every fuzzer for a fixed number of iterations on a random seed and prints the seed.
+4. **Deterministic simulation**: all kernel interaction goes through one narrow interface (`src/host.zig`) with two implementations: `host_real.zig` (syscalls) and `host_sim.zig` (an in-memory model driven by a seeded PRNG). The simulator injects faults: `EINTR`, `EAGAIN`, `ENOMEM`, `EPERM`, `ENOSPC`, short reads and writes, missing files, malformed `/proc` contents, and process crashes at any step. Logic above `host.zig` must not know which implementation it is using. From M3 on, the store's simulator crashes at every write point and then asserts that the store is either unchanged or validly updated. This is Zigbox's equivalent of TigerBeetle's VOPR.
+5. **VM demo tests**: `zig build demo-mN` in a real QEMU guest. Only these show that the milestone works. Layers 1–4 never stand in for them.
+
+### Rules
+
+- Test the negative space as hard as the positive: every failure path in a demo script has a test, and every operating error has a test that triggers it.
+- No test depends on wall-clock time, host state or test order. Randomness comes only from a seed.
+- A bug found by any layer first gets a regression test, normally a fixed seed or a fixture, and only then a fix.

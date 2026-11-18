@@ -1,0 +1,1790 @@
+//! The runtime library: run a container in the foreground, or under a caller that supervises it.
+//! Its shape follows the `Runtime` contract of Zigcube's HANDOFF.md, so the two map one to one
+//! when Zigcube's agent links this module (`zigbox`): `start`, `wait`, `signal`, `inspect`, a
+//! `Spec`, a `Handle`, a `Status` and an `ExitReason`. Nothing here prints. A refusal is a coded
+//! `Diag`; a warning is handed to the caller's `Warn` as it happens, before the container's
+//! command can write a byte, so a terminal user sees it first.
+//!
+//! Process model (docs/briefs/M1-shell.md): the caller's process stays in the host PID namespace
+//! as the parent. `clone3` creates a child in new user, mount, PID, UTS, IPC and (unless the
+//! host's network is shared, `--net host`) network namespaces. The
+//! child is PID 1 of its namespace, sets the container up and runs the command; there is no init
+//! shim. Two pipes carry the synchronisation: the parent tells the child when the id maps are
+//! written (`ready`), and the child tells the parent about a failed or skipped step (`report`).
+//!
+//! Storage belongs to the caller. A `Handle` holds the plan, the doctor's `Facts` and the run's
+//! state, under 768 KiB (`constants.handle_bytes_max`); the caller passes it by pointer to `start`
+//! and may not move it until `wait` returns. The library has no module-level state but the real
+//! host's per-thread errno and the panic handler's settings (`diag/panic.zig`, which only the `zbx`
+//! program sets), so two callers on two threads each use their own (tested). The stack stays small:
+//! the plan is built in place in the handle, and what a start or a wait puts on the stack is a few
+//! buffers of at most `record_bytes_max` (32 KiB) and `output_bytes_max` (16 KiB). A thread that
+//! starts and waits for a container needs about 128 KiB of stack beyond the handle in a debug build
+//! (96 KiB was not enough in the test; the test uses 256 KiB), less in a release build.
+//!
+//! The rest of the contract is in `lifecycle.zig` (list, adopt by name, stop with a grace
+//! period, a poll for changes) and in `StartOptions`: `detached` (the record says a supervisor
+//! outlives the caller; the process split itself is the caller's, `cli.zig`'s `run -d`),
+//! `timeout_ms`/`grace_ms` (a run that lasts too long is sent SIGTERM and then SIGKILL).
+//! `oom` and `pid_limit` are in `ExitReason`: `wait` reads the scope's `memory.events` and
+//! `pids.events` as soon as PID 1 is reaped. The manager removes a transient scope the moment
+//! it is empty, so a container whose PID 1 exits right after the OOM killer ran would take its
+//! counters with it; a scope therefore has a second process, the keeper (`Host.start_keeper`),
+//! forked before the scope is requested, put in `PIDs` beside the container's, and released by
+//! `wait` after the counters are read. The keeper takes one pid of the scope's `TasksMax`, which
+//! is `--pids` plus one, so the container has exactly the pids it asked for. The thread that
+//! calls `start` must be the one that calls `wait`: the kernel ends the keeper when that thread
+//! ends.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const assert = std.debug.assert;
+const constants = @import("../constants.zig");
+const host_mod = @import("../host.zig");
+const text_util = @import("../text.zig");
+const Diag = @import("../diag/diag.zig").Diag;
+const codes = @import("../diag/codes.zig");
+const render = @import("../diag/render.zig");
+const diagnose = @import("diagnose.zig");
+const knobs_check = @import("knobs_check.zig");
+const host_settings_check = @import("host_settings_check.zig");
+const doctor = @import("../doctor.zig");
+const ids = @import("ids.zig");
+const logfile = @import("logfile.zig");
+const exec_history = @import("exec_history.zig");
+const image_diagnose = @import("../image_diagnose.zig");
+const image_mod = @import("image.zig");
+const netfiles = @import("netfiles.zig");
+const pasta_mod = @import("pasta.zig");
+const plan_mod = @import("plan.zig");
+const records = @import("records.zig");
+const lazy_mod = @import("../lazy/lazy.zig");
+const lazy_diagnose = @import("../fuse/diagnose.zig");
+const scope_mod = @import("scope.zig");
+const scope_text = @import("scope_text.zig");
+const session_mod = @import("session.zig");
+const spec_mod = @import("spec.zig");
+const volumes_mod = @import("volumes.zig");
+const mounts_mod = @import("mounts.zig");
+const cdi_diagnose = @import("cdi_diagnose.zig");
+const cdi_discover = @import("cdi_discover.zig");
+const cdi_mod = @import("cdi.zig");
+const devices_mod = @import("devices.zig");
+const gpu_mod = @import("gpu.zig");
+const devices_diagnose = @import("devices_diagnose.zig");
+
+const Host = host_mod.Host;
+const Digest = @import("../store/digest.zig").Digest;
+const Plan = plan_mod.Plan;
+const Session = session_mod.Session;
+
+pub const Spec = spec_mod.Spec;
+/// The memory a run of a tree from the store prepares it in (`StartOptions.image_workspace`).
+pub const ImageWorkspace = image_mod.Workspace;
+pub const Label = spec_mod.Label;
+pub const Limits = spec_mod.Limits;
+
+/// The run did not start the command; the reason is in the `Diag`.
+pub const Error = session_mod.Error;
+
+/// Where a run is. `starting` is only seen from inside `start`.
+/// Where a handle's run is. The union is the contract's `Status`; the plain phase is what the
+/// handle keeps in its own field.
+pub const Phase = enum { starting, running, stopped };
+
+pub const Status = union(enum) {
+    starting,
+    running,
+    /// How it ended; known once `wait` has returned (or the start failed).
+    stopped: ExitReason,
+};
+
+/// How the container's PID 1 ended, before the cgroup's counters are looked at.
+pub const Ended = union(enum) {
+    exited: u8,
+    signaled: u8,
+
+    pub fn code(ended: Ended) u8 {
+        assert(@backingInt(ended) <= 1);
+        switch (ended) {
+            .exited => |value| return value,
+            .signaled => |number| {
+                assert(number > 0);
+                assert(number < constants.signal_number_max);
+                return constants.exit_signal_offset + number;
+            },
+        }
+    }
+};
+
+/// The kernel's OOM killer killed something in the container's cgroup. The exit code is 137
+/// whatever PID 1 did, so a script can tell; `ended` keeps what PID 1 did, for `--verbose`.
+pub const Oom = struct {
+    /// The `--memory` limit; null if there was none (an ancestor's limit, or the machine's).
+    limit_bytes: ?u64,
+    ended: Ended,
+};
+
+/// The container hit its process limit (a fork was refused). The exit code is PID 1's own.
+pub const PidLimit = struct {
+    limit: ?u32,
+    ended: Ended,
+};
+
+/// Why a run ended.
+pub const ExitReason = union(enum) {
+    oom: Oom,
+    pid_limit: PidLimit,
+    exited: u8,
+    /// Killed by this signal. A container that died of the SIGKILL zbx sent in place of a signal
+    /// PID 1 had no handler for is reported with that signal.
+    signaled: u8,
+    /// The command never started; the diagnostic says why.
+    start_failed: Diag,
+    /// zbx could not wait for the container to the end (`Handle.lost_diag` says why).
+    lost,
+
+    /// The process exit code that stands for this: the command's own, or 128 plus its signal.
+    /// Null if the command did not run to an end.
+    pub fn code(reason: *const ExitReason) ?u8 {
+        switch (reason.*) {
+            .exited => |value| return value,
+            .signaled => |number| {
+                assert(number > 0);
+                assert(number < constants.signal_number_max);
+                return constants.exit_signal_offset + number;
+            },
+            .oom => return constants.exit_signal_offset + constants.signal_kill,
+            .pid_limit => |hit| return hit.ended.code(),
+            .start_failed, .lost => return null,
+        }
+    }
+
+    /// The word the JSON `container_exit.reason` and the run record use.
+    pub fn word(reason: *const ExitReason) []const u8 {
+        assert(@intFromPtr(reason) != 0);
+        return switch (reason.*) {
+            .oom => "oom",
+            .pid_limit => "pid_limit",
+            .exited => "exited",
+            .signaled => "signal",
+            .start_failed => "start_failed",
+            .lost => "lost",
+        };
+    }
+};
+
+/// A warning, handed over as it happens. The diagnostic is only valid during the call.
+pub const Warn = struct {
+    context: *anyopaque,
+    call: *const fn (context: *anyopaque, diag: *const Diag) void,
+};
+
+pub const StartOptions = struct {
+    warn: ?Warn = null,
+    /// Total wall time for the run in milliseconds, then SIGTERM; zero is no limit.
+    timeout_ms: u32 = 0,
+    /// The run is a detached one: the record says so (`zbx run -d` supervises it).
+    detached: bool = false,
+    /// After SIGTERM, how long before SIGKILL (for the timeout and for `stop`'s default).
+    grace_ms: u32 = constants.stop_grace_ms_default,
+    /// The memory a run of a tree from the store (`Spec.image`) prepares it in, about 17 MiB:
+    /// the caller's, in static or heap storage. Required exactly when `image` is set.
+    image_workspace: ?*image_mod.Workspace = null,
+    /// A check of the tree's files in the store's child before it is materialized
+    /// (`image.Check`); a refusal ends the start with its diagnostic.
+    tree_check: ?image_mod.Check = null,
+    /// Keep what the container writes to its standard output and error in its log
+    /// (`logfile.zig`). The container's streams are then pipes this library reads until the
+    /// container ends. A log that cannot be written is a warning, and the run goes on.
+    keep_log: bool = true,
+    /// Also copy that output to this process's standard output and error as it comes (the
+    /// foreground `zbx run`). Without a log there is nothing to copy: the container writes to
+    /// the terminal itself, as before logs existed.
+    mirror: bool = false,
+    /// The container's standard input is /dev/null (a build step), not this process's.
+    stdin_null: bool = false,
+    /// The run is a build step, which has fixed limits and no limit flags (it words E0307).
+    build_step: bool = false,
+    /// Also write that output, line by line with this prefix on each line, to this process's
+    /// standard error as it comes (`zbx build --verbose`, the prefix `<step> | `). Unlike
+    /// `mirror`, the container's streams are always pipes, even when they would be a
+    /// terminal; empty is off. At most `stream_prefix_bytes_max`.
+    stream_prefix: []const u8 = "",
+    /// Serve the tree lazily (`Lazy`); only a run of a tree from the store (`Spec.image`).
+    lazy: ?Lazy = null,
+    /// A lazy run's peer sources (Zigcube's swarm fetch, `zigbox.lazy.Source`), asked for a
+    /// chunk after the local store and before the registry, in this order. Only with `lazy`; at
+    /// most `lazy_sources_max - 1`, leaving room for the registry. `zbx` passes none.
+    lazy_sources: []const lazy_mod.Source = &.{},
+};
+
+/// A run whose tree is served lazily (`zbx run --lazy`, S2): the caller's FUSE server. The tree
+/// is not materialized; the setup child mounts FUSE on the overlay's lower layer and hands the
+/// descriptor to this process, which `serve` takes (`Session.Fuse`). The caller joins its
+/// serving threads once the run has ended, started or not.
+pub const Lazy = struct {
+    context: *anyopaque,
+    /// Builds the server's view of the tree in this process, before the container's child is
+    /// spawned. A refusal says why in `diag` and ends the start.
+    prepare: *const fn (context: *anyopaque, tree: Digest, diag: *Diag) bool,
+    serve: *const fn (context: *anyopaque, device: host_mod.Handle) host_mod.Error!void,
+    /// What the run has fetched so far, for its record (`.lazy`, version 11): asked each time
+    /// the record is written. Null, or a null answer (the server never started), writes a lazy
+    /// run's record with zero counts.
+    record: ?*const fn (context: *anyopaque) ?records.Lazy = null,
+    /// Given `StartOptions.lazy_sources` before `prepare`, when there are any.
+    peers: ?*const fn (context: *anyopaque, sources: []const lazy_mod.Source) void = null,
+
+    fn record_now(lazy: *const Lazy) records.Lazy {
+        const none: records.Lazy = .{
+            .sources = 0,
+            .demand_bytes = 0,
+            .fill_bytes = 0,
+            .errors = 0,
+            .local_percent = 0,
+        };
+        const ask = lazy.record orelse return none;
+        return ask(lazy.context) orelse none;
+    }
+};
+
+/// The longest `StartOptions.stream_prefix`: a build step's name and ` | `.
+pub const stream_prefix_bytes_max = constants.stream_prefix_bytes_max;
+
+pub const Note = text_util.Bounded(160);
+
+/// A running (or finished) container. It holds pointers into itself and into the `Spec`'s
+/// strings (the command and labels, for the record written at the end): neither may move or be
+/// freed until `wait` has returned.
+pub const Handle = struct {
+    host: Host,
+    status: Phase,
+    /// How the run ended; set when `status` becomes `.stopped`.
+    ended: ExitReason,
+    plan: Plan,
+    session: Session,
+    name: [constants.container_name_bytes_max]u8,
+    name_len: u8,
+    rootfs: [constants.rootfs_bytes_max]u8,
+    rootfs_len: u16,
+    /// A run of a tree from the store: the tree, the layers and whether it is read-only.
+    has_image: bool,
+    image: image_mod.Prepared,
+    /// Where a pruned run's layers are removed from; null if the caller gave none.
+    image_workspace: ?*image_mod.Workspace,
+    command: []const []const u8,
+    labels: []const Label,
+    /// The names (never the values) of the `-e` variables, for the record.
+    env_names: []const []const u8,
+    started: u64,
+    mapping: records.IdsMode,
+    /// Where the record goes; null if there is nowhere (a warning said so).
+    record_dir: ?records.Dir,
+    warn: ?Warn,
+    wait_options: Session.WaitOptions,
+    detached: bool,
+    /// The container's PID 1 as the host sees it, once it is running; zero before.
+    pid: u32,
+    record_warned: bool,
+    /// Steps that were allowed to fail and did (the devpts mount), as sentences.
+    notes: [constants.sync_records_max + 2]Note,
+    notes_count: u32,
+    /// The limits the run was started with, for the exit report and the record.
+    limits: spec_mod.Limits,
+    /// The workload knobs (`--ulimit`, `--sysctl`; they point into the `Spec`), for the exit
+    /// report and the record. `--shm-size` is `limits.shm_bytes`.
+    rlimits: spec_mod.Rlimits,
+    sysctls: []const spec_mod.Sysctl,
+    /// What the container could reach, for the exit report.
+    network: spec_mod.Network,
+    /// The host's ports forwarded to the container's (`--publish`), for the exit report.
+    publish: [constants.publish_count_max]spec_mod.Publish,
+    publish_count: u32,
+    /// The listener `--listen` asked for, for the record and `zbx ps`; never a descriptor.
+    listen: ?spec_mod.Listen,
+    /// A lazy run's server, asked for the record's `.lazy`; null for any other run.
+    lazy: ?Lazy,
+    /// For `--net user`: where pasta is, and the file its output goes to (empty: none).
+    pasta_path: text_util.Bounded(constants.pasta_path_bytes_max),
+    pasta_log: text_util.Bounded(constants.state_path_bytes_max + 80),
+    /// Why the run ended, as the record says it; `none` until it has.
+    end_reason: records.EndReason,
+    /// Why `wait` returned `.lost`.
+    lost_diag: Diag,
+    /// The state volumes, held from before the container is created until it has ended.
+    volumes: volumes_mod.Held,
+    /// The other mounts (they point into the `Spec`, like the command) and what the host showed
+    /// of each.
+    mounts: []const mounts_mod.Mount,
+    resolution: mounts_mod.Resolution,
+    /// The `--device`s (they point into the `Spec`), once the host has shown each.
+    devices: []const devices_mod.Device,
+    /// What `devices` come to once `--gpu` is expanded (they point into `gpu_expanded`, or into
+    /// the `Spec` when nothing was expanded): what the plan binds. `devices` is what was asked.
+    effective: []const devices_mod.Device,
+    gpu_expanded: gpu_mod.Expanded,
+    /// What resolving CDI specs needs while it runs (far too big for a stack): the probe of
+    /// `--gpu all` and the resolving of the CDI names use it one after the other.
+    cdi_scratch: cdi_discover.Scratch,
+    /// The devices' paths as the plan takes them.
+    device_paths: [constants.run_devices_max][]const u8,
+    /// What the CDI devices among `devices` resolved to, null: none was asked. Only while
+    /// `start` runs: a run that resolved them itself keeps them on `start`'s stack, which the
+    /// forked child has a copy of (a handle is also a static in tests, and the bound on static
+    /// data is close).
+    cdi: ?*const cdi_mod.Resolved,
+    /// The user the command runs as; null is root. Kept for the record and the exit report.
+    user: ?spec_mod.User,
+    /// What the tree is bound to, for the record.
+    binding: spec_mod.Binding,
+    /// The log of the container's output: open from before the container exists until it has
+    /// ended, when `log_active`. `mirror` copies the output to the terminal too.
+    log: logfile.Writer,
+    log_active: bool,
+    log_warned: bool,
+    mirror: bool,
+    /// The prefix of streamed lines (`StartOptions.stream_prefix`); the line each of the two
+    /// streams (stdout, stderr) is in the middle of (prefix included, `stream_line_len` bytes,
+    /// none when no line is open); and whether streaming has stopped for good because standard
+    /// error cannot be written to.
+    stream_prefix: [stream_prefix_bytes_max]u8,
+    stream_prefix_len: u8,
+    stream_line: [2][constants.stream_write_bytes_max]u8,
+    stream_line_len: [2]u32,
+    stream_stopped: bool,
+    /// This run's own room for the doctor's facts (200 KiB), so that runs on two threads share
+    /// nothing. It is why a `Handle` is large: keep it off the stack.
+    facts: doctor.Facts,
+
+    pub fn name_slice(handle: *const Handle) []const u8 {
+        assert(handle.name_len > 0);
+        assert(handle.name_len <= constants.container_name_bytes_max);
+        return handle.name[0..handle.name_len];
+    }
+
+    pub fn rootfs_slice(handle: *const Handle) []const u8 {
+        assert(handle.rootfs_len > 0);
+        return handle.rootfs[0..handle.rootfs_len];
+    }
+
+    pub fn publish_slice(handle: *const Handle) []const spec_mod.Publish {
+        assert(handle.publish_count <= constants.publish_count_max);
+        if (handle.publish_count > 0) assert(handle.network == .user);
+        return handle.publish[0..handle.publish_count];
+    }
+
+    pub fn note_slice(handle: *const Handle) []const Note {
+        assert(handle.notes_count <= handle.notes.len);
+        if (handle.notes_count > 0) assert(handle.notes[0].len > 0);
+        return handle.notes[0..handle.notes_count];
+    }
+
+    fn report(handle: *const Handle, diag: *const Diag) void {
+        assert(diag.code != null);
+        if (handle.warn) |warn| warn.call(warn.context, diag);
+    }
+};
+
+/// Whether `wait` had to stop the container because its time (`StartOptions.timeout_ms`) was up.
+pub fn timed_out(handle: *const Handle) bool {
+    assert(handle.status != .starting);
+    assert(handle.name_len > 0);
+    return handle.session.timed_out;
+}
+
+pub fn inspect(handle: *const Handle) Status {
+    assert(handle.name_len > 0);
+    return switch (handle.status) {
+        .starting => .starting,
+        .running => .running,
+        .stopped => .{ .stopped = handle.ended },
+    };
+}
+
+/// Everything a run's handle holds before the first check: what the caller gave, and the state
+/// of a run that has not begun. `start` does this first; so does a start refused before it (the
+/// library's trust gate, `trust/start_gate.zig`), which leaves the handle so.
+pub fn init_handle(
+    host: Host,
+    container: *const Spec,
+    options: StartOptions,
+    handle: *Handle,
+) void {
+    assert(container.devices.len <= constants.run_devices_max);
+    assert(@intFromPtr(handle) != 0);
+    handle.host = host;
+    handle.status = .starting;
+    handle.warn = options.warn;
+    handle.image_workspace = options.image_workspace;
+    handle.detached = options.detached;
+    handle.pid = 0;
+    handle.wait_options = .{ .timeout_ms = options.timeout_ms, .grace_ms = options.grace_ms };
+    handle.record_warned = false;
+    handle.notes_count = 0;
+    handle.limits = container.limits;
+    handle.rlimits = container.rlimits;
+    handle.sysctls = container.sysctls;
+    handle.network = container.network;
+    handle.publish_count = 0;
+    handle.listen = container.listen;
+    handle.lazy = options.lazy;
+    handle.pasta_path = .{};
+    handle.pasta_log = .{};
+    handle.end_reason = .none;
+    handle.name_len = 0; // Set by `choose_name`; a caller can tell whether it ever was.
+    handle.volumes.count = 0;
+    handle.mounts = &.{};
+    handle.devices = &.{};
+    handle.effective = &.{};
+    handle.cdi = null;
+    handle.user = container.user;
+    handle.binding = container.binding;
+    reset_log(handle, options);
+    handle.command = container.command;
+    handle.labels = container.labels;
+    handle.env_names = container.env_names;
+    assert(handle.status == .starting);
+    assert(handle.name_len == 0);
+}
+
+/// Starts the container described by `container`. On return the command has started and
+/// `handle` is running; on `StartFailed` it did not, `diag` says why, and the run record (if one
+/// was begun) says so too. `handle` is set up in place and must not move afterwards.
+pub fn start(
+    host: Host,
+    container: *const Spec,
+    options: StartOptions,
+    handle: *Handle,
+    diag: *Diag,
+) Error!void {
+    assert(diag.code == null);
+    init_handle(host, container, options, handle);
+    var cdi_storage: cdi_mod.Resolved = undefined;
+    defer handle.cdi = null; // The stack the pointer is into is gone; the plan holds counts only.
+    defer handle.plan.cdi = null;
+    try choose_name(host, container.name, handle, diag);
+    try check_identity(container, diag);
+    try check_command(container, diag);
+    try check_root(host, container, options, handle, diag);
+    try check_limits(container.limits, diag);
+    try check_knobs(host, container, diag);
+    try check_listen(container, diag);
+    try check_hosts_file(host, container, diag);
+    try check_network(host, container, handle, diag);
+    try check_lazy_sources(options, diag);
+    try resolve_mounts(host, container, handle, diag);
+    try resolve_devices(host, container, handle, &cdi_storage, diag);
+
+    const choice = try choose_ids(host, container, handle, diag);
+    // After the checks that need nothing from the host, and before anything is created: a run
+    // with a limit and no way to enforce it is refused here, with nothing to clean up.
+    const scope_input = try prepare_scope(handle, container.limits, options.build_step, diag);
+    if (options.lazy != null) assert(container.image != null);
+    if (options.lazy == null) assert(options.lazy_sources.len == 0);
+    if (container.image) |image| try prepare_image(handle, container, image, options, diag);
+    if (options.lazy) |lazy| try prepare_lazy(handle, lazy, options.lazy_sources, diag);
+    // The volumes last, so that nothing above can fail with them held; from here every way out
+    // of `start` that is not a running container lets them go.
+    volumes_mod.take(host, container.state, handle.name_slice(), &handle.volumes, diag) catch
+        return error.StartFailed;
+    errdefer volumes_mod.release(host, &handle.volumes);
+    build_plan(host, container, choice, scope_input, handle);
+    // Namespace setup must happen before any thread exists (docs/SPEC.md, M1 acceptance).
+    if (builtin.mode == .debug) assert_single_threaded(host);
+
+    handle.started = host.time_now();
+    begin_record(handle);
+    const capture = open_log(handle, options);
+    handle.session.start(host, &handle.plan, &handle.facts, capture);
+    handle.session.stdin_null = options.stdin_null;
+    if (options.lazy) |lazy| {
+        handle.session.serve_with(.{ .context = lazy.context, .serve = lazy.serve });
+    }
+    handle.session.execute(diag, run_info(handle)) catch |err| {
+        close_log(handle);
+        handle.ended = failed_start(diag); // Asserts that the diagnostic has a code.
+        handle.status = .stopped;
+        save_record(handle, .{ .start_failed = diag.code.? }, host.time_now(), diag);
+        finish_scope(handle);
+        return err;
+    };
+    collect_notes(handle);
+    handle.status = .running;
+    if (capture[0] or capture[1]) {
+        handle.wait_options.sink = .{ .context = handle, .call = log_sink };
+    }
+    assert(handle.session.pid != null);
+    handle.pid = handle.session.container_pid;
+    // Again, now that the container's pid is known: this is what a later process finds it by.
+    save_record(handle, .running, null, null);
+}
+
+/// A library caller's peer sources need a lazy run whose server takes them, and room for the
+/// registry: refused (E1208) before anything is created, never asserted.
+fn check_lazy_sources(options: StartOptions, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    const count = options.lazy_sources.len;
+    if (count == 0) return;
+    const problem: lazy_diagnose.SourcesProblem = if (options.lazy == null)
+        .no_lazy
+    else if (options.lazy.?.peers == null)
+        .no_peers_hook
+    else if (count >= constants.lazy_sources_max)
+        .too_many
+    else
+        return;
+    lazy_diagnose.sources_refused(diag, problem, count);
+    assert(diag.code.? == .E1208);
+    return error.StartFailed;
+}
+
+/// Hands the library caller's peers to the lazy server, then readies it for the image's tree.
+fn prepare_lazy(
+    handle: *const Handle,
+    lazy: Lazy,
+    sources: []const lazy_mod.Source,
+    diag: *Diag,
+) Error!void {
+    assert(diag.code == null);
+    assert(sources.len < constants.lazy_sources_max);
+    if (sources.len > 0) lazy.peers.?(lazy.context, sources);
+    if (!lazy.prepare(lazy.context, handle.image.digest, diag)) {
+        assert(diag.code != null);
+        return error.StartFailed;
+    }
+}
+
+/// Holds the mounts to their rules and looks at them on the host (`mounts.resolve`): the handle
+/// then keeps them with a `--mount`'s source resolved, which the plan and the record use.
+fn resolve_mounts(host: Host, container: *const Spec, handle: *Handle, diag: *Diag) Error!void {
+    assert(handle.mounts.len == 0);
+    assert(container.mounts.len <= constants.mounts_max);
+    const writable: mounts_mod.Writable = .{
+        .project = container.project,
+        .caches_root = container.caches_root,
+        .user = container.user,
+        .user_text = container.user_text,
+    };
+    const resolution = &handle.resolution;
+    mounts_mod.resolve(host, container.state, container.mounts, writable, resolution, diag) catch
+        return error.StartFailed;
+    handle.mounts = resolution.mounts[0..container.mounts.len];
+}
+
+/// Looks at each `--device` on the host (`devices.resolve`) and refuses the first that cannot be
+/// bound (E0225). A run with devices keeps the user's groups, which a note says once (W0209).
+fn resolve_devices(
+    host: Host,
+    container: *const Spec,
+    handle: *Handle,
+    storage: *cdi_mod.Resolved,
+    diag: *Diag,
+) Error!void {
+    assert(handle.devices.len == 0);
+    assert(handle.notes_count < handle.notes.len);
+    if (container.devices.len == 0) return;
+    if (devices_mod.list_problem(container.devices)) |problem| {
+        const at = problem.index() orelse 0; // Too many: the first is as good as any.
+        devices_diagnose.bad_path(diag, container.devices[at].path, problem);
+        return error.StartFailed;
+    }
+    if (devices_mod.resolve(host, container.devices)) |refusal| {
+        const path = container.devices[refusal.index].path;
+        devices_diagnose.refused(diag, path, refusal.problem);
+        return error.StartFailed;
+    }
+    if (!expand_gpu(host, container, handle, storage, diag)) return error.StartFailed;
+    if (!resolve_cdi(host, container, handle, storage, diag)) return error.StartFailed;
+    handle.devices = container.devices; // What was asked: the record keeps it.
+    var note: Diag = undefined;
+    note.reset();
+    devices_diagnose.groups_note(&note);
+    handle.report(&note);
+    assert(handle.devices.len <= constants.run_devices_max);
+}
+
+/// Turns `--gpu` keywords into devices (`gpu.expand`), into `handle.effective`. A run without a
+/// keyword looks at nothing more and keeps its devices as they were.
+fn expand_gpu(
+    host: Host,
+    container: *const Spec,
+    handle: *Handle,
+    storage: *cdi_mod.Resolved,
+    diag: *Diag,
+) bool {
+    assert(diag.code == null);
+    assert(handle.effective.len == 0);
+    var wants = false;
+    var wants_all = false;
+    for (container.devices) |device| {
+        const ask = gpu_mod.ask_of(device.path);
+        wants = wants or ask != null;
+        wants_all = wants_all or ask == .all;
+    }
+    if (!wants) {
+        handle.effective = container.devices;
+        return true;
+    }
+    var dri: gpu_mod.Dri = undefined;
+    gpu_mod.look_dri(host, &dri);
+    var nvidia = false;
+    var trouble = false;
+    // Only `all` looks at the specs: `dri` is the render nodes, with no vendor tooling. A
+    // resolution the caller gave replaces the host's specs, so there is nothing to probe.
+    const probe = gpu_mod.probe_nvidia;
+    const nvidia_probe = wants_all and container.cdi == null;
+    if (nvidia_probe) switch (probe(host, &handle.cdi_scratch, storage, diag)) {
+        .offered => nvidia = true,
+        .absent => {},
+        .trouble => trouble = true,
+        .refused => return false,
+    };
+    const out = &handle.gpu_expanded;
+    switch (gpu_mod.expand(container.devices, nvidia, &dri, trouble, out)) {
+        .given => {},
+        .nothing => |nothing| {
+            devices_diagnose.no_gpu(diag, nothing);
+            return false;
+        },
+        .too_many => {
+            const keyword: []const u8 = if (wants_all) "all" else "dri";
+            devices_diagnose.too_many_gpu_nodes(diag, dri.count, keyword);
+            return false;
+        },
+    }
+    handle.effective = out.slice();
+    return true;
+}
+
+/// The CDI devices among the asked ones: the caller's resolution if it gave one, else the specs
+/// of this host. The scratch of the resolving is the handle's, and is dead after this.
+fn resolve_cdi(
+    host: Host,
+    container: *const Spec,
+    handle: *Handle,
+    storage: *cdi_mod.Resolved,
+    diag: *Diag,
+) bool {
+    assert(handle.effective.len <= constants.run_devices_max);
+    assert(diag.code == null);
+    var asked: [constants.run_devices_max][]const u8 = undefined;
+    var count: usize = 0;
+    for (handle.effective) |device| {
+        if (devices_mod.is_path(device.path)) continue;
+        asked[count] = device.path;
+        count += 1;
+    }
+    if (count == 0) return true;
+    if (container.cdi) |given| {
+        // A set the caller resolved gets the host check the discovery gives its own: the kind of
+        // each mount source is looked up, and a missing node or source is refused here.
+        storage.* = given.*;
+        if (!cdi_discover.host_has(host, storage, asked[0..count], diag)) return false;
+    } else {
+        if (!cdi_discover.resolve(host, asked[0..count], &handle.cdi_scratch, storage, diag)) {
+            return false;
+        }
+    }
+    if (container.read_only and storage.mounts_count > 0) {
+        const owner = storage.mount_owner[0];
+        cdi_diagnose.read_only_mounts(diag, asked[if (owner < count) owner else 0]);
+        return false;
+    }
+    handle.cdi = storage;
+    return true;
+}
+
+/// Builds the plan in place in the handle. The host's resolv.conf is read here, in the parent,
+/// when the container shares the host's network: the child formats and reads nothing.
+fn build_plan(
+    host: Host,
+    container: *const Spec,
+    choice: ids.Choice,
+    scope_input: ?plan_mod.ScopeInput,
+    handle: *Handle,
+) void {
+    assert(handle.name_len > 0);
+    assert(handle.status == .starting);
+    var resolv: netfiles.Buffer = undefined;
+    const host_resolv = host_resolv_conf(host, container.network, &resolv, handle);
+    const input: plan_mod.Input = .{
+        .rootfs = handle.rootfs_slice(),
+        .name = handle.name_slice(),
+        .command = container.command,
+        .term = host.environment("TERM", constants.term_bytes_max),
+        .uid = host.uid(),
+        .gid = host.gid(),
+        .mapping = choice.mapping,
+        .scope = scope_input,
+        .read_only = container.read_only,
+        .env = container.env,
+        .workdir = container.workdir,
+        .user = container.user,
+        .overlay = if (handle.has_image) handle.image.overlay() else null,
+        .lazy = handle.has_image and handle.image.lazy,
+        .network = container.network,
+        .listen = if (container.listen) |listen| listen.port else null,
+        .host_resolv = host_resolv,
+        .hosts_file = container.hosts_file,
+        .pasta = if (container.network == .user) .{
+            .path = handle.pasta_path.slice(),
+            .log = handle.pasta_log.slice(),
+            .publish = handle.publish_slice(),
+        } else null,
+        .state = handle.volumes.input_slice(),
+        .mounts = handle.resolution.inputs[0..handle.mounts.len],
+        .devices = devices_mod.plan_input(handle.effective, &handle.device_paths),
+        .cdi = handle.cdi,
+        .keep_groups = handle.effective.len > 0,
+        .hostname = container.hostname,
+        .umask = container.umask,
+        .shm_bytes = container.limits.shm_bytes orelse constants.shm_bytes_default,
+        .rlimits = container.rlimits,
+        .sysctls = container.sysctls,
+    };
+    handle.plan.build(&input);
+    assert(handle.plan.count == handle.plan.steps_expected());
+}
+
+/// The host's `/etc/resolv.conf`, for a container that shares the host's network: whole lines,
+/// within the bound. A file that cannot be read gives none, and a note says so. Other modes
+/// need none.
+fn host_resolv_conf(
+    host: Host,
+    network: spec_mod.Network,
+    out: *netfiles.Buffer,
+    handle: *Handle,
+) []const u8 {
+    assert(handle.notes_count < handle.notes.len);
+    if (network != .host) return "";
+    var raw: netfiles.Buffer = undefined;
+    const found = host.read_prefix("/etc/resolv.conf", &raw) catch |err| {
+        const note = &handle.notes[handle.notes_count];
+        note.* = .{};
+        note.print("the host's /etc/resolv.conf could not be read ({s}): no nameserver", .{
+            @errorName(err),
+        });
+        handle.notes_count += 1;
+        return "";
+    };
+    return netfiles.whole_lines(out, found.bytes);
+}
+
+/// What the diagnostics say about this run.
+fn run_info(handle: *const Handle) diagnose.RunInfo {
+    assert(handle.name_len > 0);
+    assert(handle.name_len <= constants.container_name_bytes_max);
+    return .{
+        .name = handle.name_slice(),
+        .rootfs = handle.rootfs_slice(),
+        .tree = if (handle.has_image) handle.image.tree_text() else "",
+    };
+}
+
+/// A run's root is a directory (checked now) or a tree of the store (prepared later, once the
+/// ids and the scope are known).
+fn check_root(
+    host: Host,
+    container: *const Spec,
+    options: StartOptions,
+    handle: *Handle,
+    diag: *Diag,
+) Error!void {
+    handle.has_image = container.image != null;
+    if (container.image == null) return check_rootfs(host, container.rootfs, handle, diag);
+    assert(container.rootfs.len == 0); // A directory or a tree, not both.
+    assert(options.image_workspace != null);
+}
+
+/// Waits for the container to end, forwarding the signals this process receives. Call it once.
+pub fn wait(handle: *Handle) ExitReason {
+    assert(handle.status == .running);
+    const host = handle.host;
+    host.begin_step(@intCast(handle.plan.count - 1)); // The `reap` step.
+    // A terminal that closes is a write that fails, not a signal that ends this process.
+    const copies = handle.mirror or handle.stream_prefix_len > 0;
+    if (copies) host.ignore_broken_pipe(true);
+    const result = handle.session.wait(handle.wait_options);
+    // The last partial lines go while a closed pipe is still an error, not a signal.
+    stream_finish(handle);
+    if (copies) host.ignore_broken_pipe(false);
+    close_log(handle);
+    host.begin_step(host_mod.step_none);
+    // The container is gone (or zbx lost it, and `abandon` below ends it): pasta goes now, and
+    // the host's ports with it, before anything else is done.
+    handle.session.release_pasta();
+    handle.session.release_listener();
+    handle.status = .stopped;
+    const status = result catch |err| {
+        const failure: diagnose.Failure = .{
+            .step = @intCast(handle.plan.count - 1),
+            .err = err,
+            .errno = host.last_errno(),
+        };
+        handle.session.abandon();
+        handle.lost_diag.reset();
+        const info = run_info(handle);
+        diagnose.step_failed(host, &handle.lost_diag, &handle.plan, info, failure, .{
+            .facts = &handle.facts,
+        });
+        save_record(handle, .lost, host.time_now(), &handle.lost_diag);
+        finish_scope(handle); // `abandon` ended the container.
+        volumes_mod.release(host, &handle.volumes);
+        handle.ended = .lost;
+        return .lost;
+    };
+    // Right after the reap, while the keeper still holds the scope: the manager removes the
+    // cgroup as soon as nothing is left in it, and its counters go with it.
+    const events = if (handle.plan.scoped)
+        scope_mod.read_events(host, handle.session.scope_directory.slice())
+    else
+        scope_mod.Events{ .oom_kill = null, .pids_max = null };
+    // The keeper has held the scope open until now; with the counters read it can go, and the
+    // manager removes the scope.
+    handle.session.release_keeper();
+    const ended: Ended = switch (status) {
+        .exited => |code| .{ .exited = code },
+        .signaled => |number| .{ .signaled = number },
+    };
+    const reason = classify(ended, events, handle.limits);
+    handle.end_reason = switch (reason) {
+        .oom => .oom,
+        .pid_limit => .pid_limit,
+        .exited => .exited,
+        .signaled => .signal,
+        .start_failed, .lost => unreachable, // `classify` makes only the four above.
+    };
+    const exit: records.Exit = switch (ended) {
+        .exited => |code| .{ .exited = code },
+        .signaled => |number| .{ .signaled = number },
+    };
+    save_record(handle, exit, host.time_now(), null);
+    finish_scope(handle);
+    // The container is reaped: its volumes are free for the next run.
+    volumes_mod.release(host, &handle.volumes);
+    handle.ended = reason;
+    return reason;
+}
+
+/// What the container's end was, given what the cgroup counted. An OOM kill outranks a process
+/// limit; either outranks how PID 1 ended, which stays in the reason.
+pub fn classify(ended: Ended, events: scope_mod.Events, limits: spec_mod.Limits) ExitReason {
+    if (ended == .signaled) assert(ended.signaled > 0);
+    if (limits.memory_bytes) |bytes| assert(bytes >= constants.limit_memory_bytes_min);
+    if ((events.oom_kill orelse 0) > 0) {
+        return .{ .oom = .{ .limit_bytes = limits.memory_bytes, .ended = ended } };
+    }
+    if ((events.pids_max orelse 0) > 0) {
+        return .{ .pid_limit = .{ .limit = limits.pids, .ended = ended } };
+    }
+    return switch (ended) {
+        .exited => |code| .{ .exited = code },
+        .signaled => |number| .{ .signaled = number },
+    };
+}
+
+/// Sees that the scope is gone now that the container has ended; if it is not, a warning.
+fn finish_scope(handle: *Handle) void {
+    assert(handle.status == .stopped);
+    assert(handle.session.pid == null); // The container is gone: reaped or abandoned.
+    var problem: scope_mod.Problem = undefined;
+    const name = if (handle.plan.scoped) handle.plan.text(handle.plan.scope_name) else "";
+    switch (handle.session.cleanup_scope(&problem)) {
+        .none => return,
+        .done => |how| {
+            const note = &handle.notes[handle.notes_count];
+            note.* = .{};
+            var buffer: [160]u8 = undefined;
+            note.print("{s}", .{scope_text.cleanup_note(name, how, &buffer)});
+            handle.notes_count += 1;
+        },
+        .failed => {
+            var warning: Diag = undefined;
+            warning.reset();
+            diagnose.scope_not_cleaned(&warning, name, &problem);
+            handle.report(&warning);
+        },
+    }
+}
+
+/// Sends a signal to the container's PID 1 as the forwarding rule says: a signal it has no
+/// handler for is replaced by SIGKILL, so the signal's default action still happens.
+pub fn signal(handle: *Handle, number: u8) host_mod.Error!void {
+    assert(handle.status == .running);
+    assert(number > 0);
+    try handle.session.send(number, false);
+}
+
+/// Ends the container at once with SIGKILL, whatever PID 1 handles (a run whose listener could
+/// not be handed on, M8b). The caller still waits for it.
+pub fn stop(handle: *Handle) host_mod.Error!void {
+    assert(handle.status == .running);
+    assert(constants.signal_kill == 9);
+    try handle.session.kill();
+}
+
+/// The listener was never handed out (the send failed): the run's final record does not say
+/// it listens. Call it before `wait`, which writes that record.
+pub fn forget_listener(handle: *Handle) void {
+    assert(handle.status == .running);
+    assert(handle.listen != null);
+    handle.listen = null;
+}
+
+/// The exit reason of a run that did not start, from the diagnostic that said why.
+pub fn failed_start(diag: *const Diag) ExitReason {
+    assert(diag.code != null);
+    return .{ .start_failed = diag.* };
+}
+
+// ---- Checks --------------------------------------------------------------------------------
+
+/// A hostname the caller gives is held to the rules of a name, and a umask to its nine bits.
+fn check_identity(container: *const Spec, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    if (container.umask) |mask| assert(mask <= 0o777);
+    if (container.hostname) |name| {
+        if (spec_mod.name_problem(name)) |problem| {
+            diagnose.name_invalid(diag, name, problem);
+            return error.StartFailed;
+        }
+    }
+    assert(diag.code == null);
+}
+
+fn choose_name(host: Host, given: ?[]const u8, handle: *Handle, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    if (given) |name| {
+        if (spec_mod.name_problem(name)) |problem| {
+            diagnose.name_invalid(diag, name, problem);
+            return error.StartFailed;
+        }
+        @memcpy(handle.name[0..name.len], name);
+        handle.name_len = @intCast(name.len);
+        return;
+    }
+    const prefix = constants.container_name_prefix;
+    var random: [constants.container_name_hex_digits / 2]u8 = undefined;
+    // A name is a label, not an identity: if the system has no randomness, a fixed name is
+    // still a valid one, and failing a run over it would be worse.
+    host.random_bytes(&random) catch @memset(&random, 0);
+    const hex = "0123456789abcdef";
+    @memcpy(handle.name[0..prefix.len], prefix);
+    for (random, 0..) |byte, index| {
+        handle.name[prefix.len + 2 * index] = hex[byte >> 4];
+        handle.name[prefix.len + 2 * index + 1] = hex[byte & 15];
+    }
+    const length = prefix.len + constants.container_name_hex_digits;
+    handle.name_len = @intCast(length);
+    assert(spec_mod.name_problem(handle.name_slice()) == null);
+}
+
+/// Resolves the tree, materializes it and makes the container's directory (`image.zig`); the
+/// merged directory is then the rootfs. Anything that goes wrong is the run's start failing.
+fn prepare_image(
+    handle: *Handle,
+    container: *const Spec,
+    image: []const u8,
+    options: StartOptions,
+    diag: *Diag,
+) Error!void {
+    assert(handle.has_image);
+    const workspace = options.image_workspace.?;
+    // The container's own id map warns about a one-id host; the store's child would say it twice.
+    image_mod.prepare(
+        handle.host,
+        &handle.facts,
+        workspace,
+        image,
+        handle.name_slice(),
+        container.read_only,
+        options.lazy != null,
+        null,
+        options.tree_check,
+        &handle.image,
+        diag,
+    ) catch return error.StartFailed;
+    const merged = handle.image.merged.text();
+    if (merged.len > constants.rootfs_bytes_max) {
+        diagnose.rootfs_unusable(diag, merged, .{ .problem = .too_long });
+        return error.StartFailed;
+    }
+    @memcpy(handle.rootfs[0..merged.len], merged);
+    handle.rootfs_len = @intCast(merged.len);
+}
+
+fn check_command(container: *const Spec, diag: *Diag) Error!void {
+    const command = container.command;
+    const labels = container.labels;
+    // The command line parser refuses a missing program; a caller of the library must too.
+    assert(command.len > 0);
+    assert(command[0].len > 0);
+    if (spec_mod.command_problem(command)) |problem| {
+        diagnose.command_too_big(diag, problem);
+        return error.StartFailed;
+    }
+    if (spec_mod.labels_problem(labels)) |index| {
+        diagnose.label_too_big(diag, index);
+        return error.StartFailed;
+    }
+    if (spec_mod.env_problem(container.env, command)) |index| {
+        diagnose.env_too_big(diag, index);
+        return error.StartFailed;
+    }
+    // The caller (cli.zig) built `env_names` from the options it already checked.
+    assert(spec_mod.env_names_problem(container.env_names) == null);
+    if (spec_mod.workdir_problem(container.workdir)) {
+        diagnose.workdir_unusable(diag);
+        return error.StartFailed;
+    }
+}
+
+/// The id map this host gives the container, with the warning if it is the single one, and the
+/// refusal if the image's user needs more.
+fn choose_ids(host: Host, container: *const Spec, handle: *Handle, diag: *Diag) Error!ids.Choice {
+    assert(diag.code == null);
+    var choice: ids.Choice = undefined;
+    ids.choose(host, &handle.facts, &choice);
+    if (choice.warned) handle.report(&choice.warning);
+    handle.mapping = if (choice.warned) .single else .full;
+    try check_user(container, choice.warned, diag);
+    return choice;
+}
+
+/// An image that runs as a user needs the ids mapped; the single-id map has only root.
+fn check_user(container: *const Spec, single: bool, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    const user = container.user orelse return;
+    if (single and (user.uid != 0 or user.gid != 0)) {
+        image_diagnose.needs_id_map(diag, user.uid, user.gid);
+        return error.StartFailed;
+    }
+}
+
+fn check_rootfs(host: Host, rootfs: []const u8, handle: *Handle, diag: *Diag) Error!void {
+    if (spec_mod.rootfs_problem(rootfs)) |problem| {
+        diagnose.rootfs_unusable(diag, rootfs, .{ .problem = problem });
+        return error.StartFailed;
+    }
+    assert(rootfs.len > 0);
+    assert(diag.code == null);
+    const found = host.stat(rootfs) catch |err| {
+        const failure: diagnose.Failure = .{ .step = 0, .err = err, .errno = host.last_errno() };
+        diagnose.rootfs_unusable(diag, rootfs, .{ .unreadable = failure });
+        return error.StartFailed;
+    };
+    if (found.mode & std.posix.S.IFMT != std.posix.S.IFDIR) {
+        diagnose.rootfs_unusable(diag, rootfs, .not_a_directory);
+        return error.StartFailed;
+    }
+    @memcpy(handle.rootfs[0..rootfs.len], rootfs);
+    handle.rootfs_len = @intCast(rootfs.len);
+}
+
+/// A run with `--hosts-file` (ZB-6): `--net none`, an absolute path, and a regular file this
+/// user can read now. The plan binds the path at /etc/hosts, so a failure there is a failed
+/// start, not a note.
+fn check_hosts_file(host: Host, container: *const Spec, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    const path = container.hosts_file;
+    if (path.len == 0) return;
+    const problem = spec_mod.hosts_file_problem(container.network, path) orelse
+        hosts_file_look(host, path);
+    if (problem) |found| {
+        diagnose.hosts_file_invalid(diag, found, path);
+        return error.StartFailed;
+    }
+    assert(container.network == .none);
+}
+
+/// What the host says about a well-formed hosts file path: there, a regular file, readable. The
+/// first byte is read (an empty file reads none), which never blocks on a regular file; a FIFO
+/// would, and is refused before the read as not a regular file.
+fn hosts_file_look(host: Host, path: []const u8) ?spec_mod.HostsFileProblem {
+    assert(path.len > 0);
+    assert(path.len <= constants.mount_path_bytes_max);
+    const found = host.stat(path) catch |err| switch (err) {
+        error.NotFound => return .missing, // ENOENT, or ENOTDIR: a file where a directory is.
+        error.AccessDenied => return .unreadable, // A directory this user cannot search.
+        else => return .lookup_failed, // ELOOP, ENAMETOOLONG, EIO: not a permission problem.
+    };
+    if (found.mode & 0o170000 != 0o100000) return .not_a_file;
+    var first: [1]u8 = undefined;
+    _ = host.read_prefix(path, &first) catch |err| switch (err) {
+        error.AccessDenied => return .unreadable,
+        else => return .read_failed,
+    };
+    return null;
+}
+
+/// A run with `--listen`: it needs `--net none`, and no forwards (which imply `--net user`). The
+/// command line checks the descriptor it is given; a library caller hands the listener on itself.
+fn check_listen(container: *const Spec, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    const listen = container.listen orelse return;
+    assert(listen.port > 0);
+    if (spec_mod.listen_options_problem(container.network, true)) |problem| {
+        diagnose.listen_options_invalid(diag, problem, null);
+        return error.StartFailed;
+    }
+    assert(container.publish.len == 0); // Forwards imply `--net user`, refused above.
+}
+
+/// The listener the container made, owned by the caller from here (close it with the host). Null
+/// when the run had no `--listen`, or the listener was taken already. Call it once the run
+/// has started.
+pub fn take_listener(handle: *Handle) ?host_mod.Handle {
+    assert(handle.status == .running);
+    if (handle.listen) |listen| assert(listen.port > 0);
+    if (handle.listen == null) return null;
+    return handle.session.take_listener();
+}
+
+/// A run with `--net user`: the forwards are a list pasta can make, pasta is there and new
+/// enough, and no host port is below what the host lets a user bind. Everything is refused here,
+/// before anything is created. The path of pasta's log is chosen too.
+fn check_network(host: Host, container: *const Spec, handle: *Handle, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    assert(handle.publish_count == 0);
+    if (container.publish.len > 0) assert(container.network == .user);
+    if (container.network != .user) return;
+    if (spec_mod.publish_problem(.user, container.publish)) |problem| {
+        diagnose.publish_list_invalid(diag, problem);
+        return error.StartFailed;
+    }
+    @memcpy(handle.publish[0..container.publish.len], container.publish);
+    handle.publish_count = @intCast(container.publish.len);
+    doctor.gather_net(host, &handle.facts);
+    const pasta = &handle.facts.pasta;
+    if (!pasta.found) {
+        diagnose.pasta_missing(diag, container.network);
+        return error.StartFailed;
+    }
+    // A version line with no date ("unknown version", as Ubuntu 24.04's build prints) cannot be
+    // judged, and is not refused (docs/demos/m5.md).
+    if (pasta_mod.version_date(pasta.version.slice())) |date| {
+        if (date < constants.pasta_version_min_date) {
+            diagnose.pasta_too_old(diag, pasta.path.slice(), pasta.version.slice());
+            return error.StartFailed;
+        }
+    }
+    try check_low_ports(host, handle, diag);
+    handle.pasta_path.print("{s}", .{pasta.path.slice()});
+    choose_pasta_log(host, handle);
+    assert(handle.pasta_path.len > 0);
+}
+
+/// A host port below `net.ipv4.ip_unprivileged_port_start` is refused before pasta is started,
+/// with the bound in the message. A bound that cannot be read leaves it to pasta's own bind.
+fn check_low_ports(host: Host, handle: *const Handle, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    var buffer: [32]u8 = undefined;
+    const text = host.read_file("/proc/sys/net/ipv4/ip_unprivileged_port_start", &buffer) catch
+        return;
+    const bound = std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10) catch return;
+    for (handle.publish_slice()) |forward| {
+        if (forward.host < bound) {
+            diagnose.pasta_port_refused(diag, forward.host, bound, "");
+            return error.StartFailed;
+        }
+    }
+}
+
+/// pasta's log: `<state>/zbx/logs/<name>.pasta.log`, beside the runs directory. A run with no
+/// state directory, or one where the directory cannot be made, has none: pasta's stderr then
+/// goes to /dev/null, and a failure's diagnostic says so.
+fn choose_pasta_log(host: Host, handle: *Handle) void {
+    assert(handle.pasta_log.len == 0);
+    var dir: records.Dir = undefined;
+    if (!records.locate(host, &dir)) return;
+    var logs: records.Dir = undefined;
+    if (!logs_dir_of(&dir, &logs)) return;
+    records.ensure(host, &logs) catch return;
+    handle.pasta_log.print("{s}/{s}{s}", .{
+        logs.text(), handle.name_slice(), constants.pasta_log_suffix,
+    });
+    assert(handle.pasta_log.len > logs.len);
+}
+
+/// The logs directory beside a runs directory: the same path with "logs" for its last part.
+fn logs_dir_of(runs: *const records.Dir, out: *records.Dir) bool {
+    const text = runs.text();
+    if (!std.mem.endsWith(u8, text, "/runs")) return false;
+    out.* = runs.*;
+    @memcpy(out.path[out.len - "runs".len .. out.len], "logs");
+    assert(out.path[out.len] == 0);
+    assert(std.mem.endsWith(u8, out.text(), "/logs"));
+    return true;
+}
+
+/// The limits of a library caller, against the bounds the flags are held to.
+fn check_limits(limits: spec_mod.Limits, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    assert(diag.code == null);
+    const found = spec_mod.limits_problem(limits) orelse return;
+    var value: [constants.limit_text_bytes_max]u8 = undefined;
+    const number: u64 = switch (found.kind) {
+        .memory => limits.memory_bytes.?,
+        .pids => limits.pids.?,
+        .cpus => limits.cpu_millis.?,
+    };
+    // Cannot fail: a u64 has at most 20 digits and the buffer holds 24.
+    const text = std.fmt.bufPrint(&value, "{d}", .{number}) catch unreachable;
+    diagnose.limit_invalid(diag, found.kind, text, found.problem);
+    return error.StartFailed;
+}
+
+/// The workload knobs (`--ulimit`, `--shm-size`, `--sysctl`), against the caller's own limits,
+/// the host's memory and the run's network; then `--require-host`, against the host's settings.
+fn check_knobs(host: Host, container: *const Spec, diag: *Diag) Error!void {
+    assert(diag.code == null);
+    assert(container.sysctls.len <= std.math.maxInt(u32));
+    knobs_check.check(host, .{
+        .rlimits = container.rlimits,
+        .sysctls = container.sysctls,
+        .shm_bytes = container.limits.shm_bytes,
+        .memory_bytes = container.limits.memory_bytes,
+        .isolated = container.network.isolated(),
+    }, diag) catch return error.StartFailed;
+    host_settings_check.preflight(host, container.host_requirements, diag) catch
+        return error.StartFailed;
+}
+
+/// Decides whether this run has a scope. It has one if the user's systemd manager answers; if
+/// it does not, a run with a limit is refused (a limit nobody enforces is worse than none) and
+/// a run without goes on, warning once, as M1 did.
+fn prepare_scope(
+    handle: *Handle,
+    limits: spec_mod.Limits,
+    build_step: bool,
+    diag: *Diag,
+) Error!?plan_mod.ScopeInput {
+    assert(diag.code == null);
+    var found: scope_mod.Probe = undefined;
+    var problem: scope_mod.Problem = undefined;
+    if (scope_mod.probe(handle.host, &found, &problem)) {
+        if (found.via.refused != null) {
+            const note = &handle.notes[handle.notes_count];
+            var buffer: [160]u8 = undefined;
+            note.* = .{};
+            note.print("{s}", .{scope_text.fallback_note(&found.via, &buffer)});
+            handle.notes_count += 1;
+        }
+        return .{ .version = found.version, .limits = limits };
+    }
+    if (limits.any()) {
+        const asker: diagnose.LimitAsker = if (build_step) .build_step else .run;
+        diagnose.limit_without_cgroup(diag, &problem, limits, asker);
+        return error.StartFailed;
+    }
+    var warning: Diag = undefined;
+    warning.reset();
+    diagnose.running_without_scope(&warning, &problem);
+    handle.report(&warning);
+    return null;
+}
+
+// ---- The single-thread assertion ----------------------------------------------------------
+
+/// The thread count in the text of /proc/self/status, or null if there is no such line.
+pub fn threads_in_status(status: []const u8) ?u32 {
+    assert(status.len <= constants.status_bytes_max);
+    const key = "Threads:";
+    var lines = std.mem.splitScalar(u8, status, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const value = std.mem.trim(u8, line[key.len..], " \t");
+        return std.fmt.parseInt(u32, value, 10) catch null;
+    }
+    return null;
+}
+
+/// Debug builds only: the process has exactly one thread before `clone3`. An unreadable status
+/// is not a reason to stop (a debug aid must not break a run), but a count is believed.
+fn assert_single_threaded(host: Host) void {
+    var buffer: [constants.status_bytes_max]u8 = undefined;
+    const status = host.read_file("/proc/self/status", &buffer) catch return;
+    const threads = threads_in_status(status) orelse return;
+    assert(threads > 0); // This process is one of them.
+    assert(threads == 1);
+}
+
+// ---- The run record ------------------------------------------------------------------------
+
+/// Writes the record that says the run began, and prunes the oldest. Nothing here can stop the
+/// run: a record that cannot be kept is a warning (ZBX-W0202, ZBX-W0203).
+fn begin_record(handle: *Handle) void {
+    assert(handle.status == .starting);
+    assert(handle.name_len > 0);
+    var dir: records.Dir = undefined;
+    if (!records.locate(handle.host, &dir)) {
+        handle.record_dir = null;
+        warn_not_saved(handle, null, null);
+        return;
+    }
+    handle.record_dir = dir;
+    records.ensure(handle.host, &dir) catch |err| {
+        handle.record_dir = null;
+        warn_not_saved(
+            handle,
+            dir.text(),
+            .{ .step = 0, .err = err, .errno = handle.host.last_errno() },
+        );
+        return;
+    };
+    save_record(handle, .running, null, null);
+    if (handle.record_dir == null) return;
+    var skipped: records.Skipped = undefined;
+    var pruned: records.Pruned = undefined;
+    records.prune(handle.host, &dir, handle.name_slice(), &skipped, &pruned) catch return;
+    reclaim_layers(handle, &pruned);
+    remove_pasta_logs(handle, &dir, &pruned);
+    remove_logs(handle, &dir, &pruned);
+    if (skipped.count == 0) return;
+    var warning: Diag = undefined;
+    warning.reset();
+    diagnose.records_skipped(&warning, dir.text(), &skipped);
+    handle.report(&warning);
+}
+
+/// After `wait`: the run leaves nothing behind. Its record, its logs and the container's layer
+/// go, as pruning would take them (M7: a build step, whose log the caller has copied). Best
+/// effort: what cannot be removed stays as the record of an ordinary run, for pruning later.
+pub fn discard(handle: *Handle) void {
+    assert(handle.status == .stopped);
+    assert(handle.name_len > 0);
+    const dir = handle.record_dir orelse return;
+    var pruned: records.Pruned = undefined;
+    pruned.single(handle.name_slice());
+    reclaim_layers(handle, &pruned);
+    remove_pasta_logs(handle, &dir, &pruned);
+    remove_logs(handle, &dir, &pruned);
+    records.remove(handle.host, &dir, handle.name_slice()) catch {};
+}
+
+/// A record that was pruned takes its pasta log with it, if it had one. Best effort: a log that
+/// stays is a small file the next run of that name empties.
+fn remove_pasta_logs(handle: *Handle, dir: *const records.Dir, pruned: *const records.Pruned) void {
+    var logs: records.Dir = undefined;
+    if (!logs_dir_of(dir, &logs)) return;
+    for (0..pruned.count) |index| {
+        var path: [constants.state_path_bytes_max + 96]u8 = undefined;
+        const name = pruned.name(@intCast(index));
+        const format = "{s}/{s}" ++ constants.pasta_log_suffix;
+        // Cannot fail: a bounded directory and a run name of at most 63 bytes.
+        const text = std.fmt.bufPrintSentinel(&path, format, .{ logs.text(), name }, 0) catch
+            unreachable; // Same bound as above.
+        handle.host.remove_file(text) catch {};
+    }
+}
+
+/// A record that was pruned takes its log and its exec history with it; a run that takes a name
+/// again starts with no history of the execs of the run before. Best effort, like the pasta log.
+fn remove_logs(handle: *Handle, dir: *const records.Dir, pruned: *const records.Pruned) void {
+    const logs = logfile.dir_of(dir) orelse return;
+    const fs = handle.host.log_files();
+    exec_history.remove(fs, &logs, handle.name_slice()) catch {};
+    for (0..pruned.count) |index| {
+        logfile.remove(fs, &logs, pruned.name(@intCast(index))) catch {};
+        exec_history.remove(fs, &logs, pruned.name(@intCast(index))) catch {};
+    }
+}
+
+// ---- The log -------------------------------------------------------------------------------
+
+fn reset_log(handle: *Handle, options: StartOptions) void {
+    handle.log_active = false;
+    handle.log_warned = false;
+    handle.mirror = options.mirror;
+    assert(options.stream_prefix.len <= stream_prefix_bytes_max);
+    @memcpy(handle.stream_prefix[0..options.stream_prefix.len], options.stream_prefix);
+    handle.stream_prefix_len = @intCast(options.stream_prefix.len);
+    handle.stream_line_len = .{ 0, 0 };
+    handle.stream_stopped = false;
+    assert(!handle.log_active);
+    assert(handle.log_warned == false);
+}
+
+/// Opens the container's log, for a run that keeps one. True when the container's output is to
+/// be read through pipes: the log is open and there is a place for it. A run with no state
+/// directory has said so already (the record's warning); one whose log cannot be made says so
+/// here, once, and the container writes where it always did.
+fn open_log(handle: *Handle, options: StartOptions) [2]bool {
+    assert(!handle.log_active);
+    const none: [2]bool = .{ false, false };
+    if (!options.keep_log) return none;
+    const runs = handle.record_dir orelse return none;
+    const logs = logfile.dir_of(&runs) orelse return none;
+    // A stream that is a terminal stays the container's own: editors, pagers, colours and job
+    // control need the terminal itself, not a pipe. The log's header says which were left.
+    var capture: [2]bool = .{ true, true };
+    var not_kept: u8 = 0;
+    if (options.mirror) {
+        for ([_]host_mod.Stream{ .stdout, .stderr }, 0..) |stream, at| {
+            if (!handle.host.is_terminal(stream)) continue;
+            capture[at] = false;
+            not_kept |= @as(u8, 1) << @intCast(at);
+        }
+    }
+    const writer_options: logfile.WriterOptions = .{ .not_kept = not_kept };
+    const name = handle.name_slice();
+    handle.log.open(handle.host.log_files(), &logs, name, writer_options) catch |err| {
+        const failure: diagnose.Failure = .{
+            .step = 0,
+            .err = err,
+            .errno = handle.host.log_files().last_errno(),
+        };
+        warn_log_not_kept(handle, logs.text(), failure);
+        return none;
+    };
+    handle.log_active = true;
+    return capture;
+}
+
+fn close_log(handle: *Handle) void {
+    assert(handle.name_len > 0);
+    if (!handle.log_active) return;
+    handle.log.close();
+    handle.log_active = false;
+    assert(!handle.log.fd_open);
+}
+
+/// Tells the caller once per run that the output is not being kept. A detached run's supervisor
+/// can tell its caller only while the caller waits for it: once the start has been reported the
+/// warning has nowhere to go, so it is not sent.
+fn warn_log_not_kept(handle: *Handle, directory: []const u8, failure: diagnose.Failure) void {
+    if (handle.log_warned) return;
+    handle.log_warned = true;
+    if (handle.detached and handle.status != .starting) return;
+    var warning: Diag = undefined;
+    warning.reset();
+    diagnose.log_not_kept(&warning, directory, failure);
+    handle.report(&warning);
+}
+
+/// What the container wrote: to the terminal first (a foreground run's output must not depend on
+/// the log), then into the log. A log that fails stops for good and the run goes on. False when
+/// the terminal cannot be written to: the stream is closed, so the container's next write to it
+/// fails as it would have without a log.
+fn log_sink(context: *anyopaque, stream: host_mod.Stream, bytes: []const u8) bool {
+    const handle: *Handle = @ptrCast(@alignCast(context));
+    assert(bytes.len > 0);
+    var keep = true;
+    if (handle.mirror) {
+        handle.host.write_all(stream, bytes) catch {
+            keep = false;
+        };
+    }
+    if (handle.stream_prefix_len > 0) stream_lines(handle, stream, bytes);
+    if (!handle.log_active) return keep;
+    const which: logfile.Stream = if (stream == .stdout) .stdout else .stderr;
+    const time = @min(handle.host.time_now(), constants.log_time_max - 1);
+    handle.log.append(which, time, bytes) catch |err| {
+        const failure: diagnose.Failure = .{
+            .step = 0,
+            .err = err,
+            .errno = handle.host.log_files().last_errno(),
+        };
+        var runs = handle.record_dir.?;
+        const logs = logfile.dir_of(&runs).?;
+        warn_log_not_kept(handle, logs.text(), failure);
+    };
+    return keep;
+}
+
+/// Writes `bytes` to standard error, whole lines only, each behind the stream prefix. A stream's
+/// partial line waits in its buffer, so that two steps' lines never mix: each write is one line
+/// (or, for a line too long for the buffer, one piece of it with a newline of its own), at most
+/// `stream_write_bytes_max` and so atomic on a pipe. A write that fails stops streaming for the
+/// rest of the run (the log is the record of the output), and never fails the build.
+fn stream_lines(handle: *Handle, stream: host_mod.Stream, bytes: []const u8) void {
+    assert(bytes.len > 0);
+    assert(handle.stream_prefix_len > 0);
+    if (handle.stream_stopped) return;
+    const which: usize = if (stream == .stdout) 0 else 1;
+    const prefix = handle.stream_prefix[0..handle.stream_prefix_len];
+    const line = &handle.stream_line[which];
+    const length = &handle.stream_line_len[which];
+    var rest = bytes;
+    while (rest.len > 0) {
+        if (length.* == 0) {
+            @memcpy(line[0..prefix.len], prefix);
+            length.* = @intCast(prefix.len);
+        }
+        const step = stream_take(line, length, rest);
+        rest = rest[step.consumed..];
+        if (!step.complete) continue;
+        handle.host.write_all(.stderr, line[0..length.*]) catch {
+            handle.stream_stopped = true;
+            return;
+        };
+        length.* = 0;
+    }
+}
+
+/// Writes what a stream still holds as a line of its own, when the step has ended.
+fn stream_finish(handle: *Handle) void {
+    if (handle.stream_prefix_len == 0) return;
+    for (0..2) |which| {
+        const length = &handle.stream_line_len[which];
+        if (length.* == 0) continue;
+        assert(length.* < constants.stream_write_bytes_max);
+        handle.stream_line[which][length.*] = '\n';
+        length.* += 1;
+        if (!handle.stream_stopped) {
+            handle.host.write_all(.stderr, handle.stream_line[which][0..length.*]) catch {
+                handle.stream_stopped = true;
+            };
+        }
+        length.* = 0;
+    }
+}
+
+const StreamTake = struct { consumed: usize, complete: bool };
+
+/// Moves bytes of `rest` into the open line (`length` bytes, the prefix among them) up to its
+/// end. The line is complete, with its newline added, when `rest` held one, or when the buffer
+/// is full and more bytes follow. One byte stays free for the newline.
+fn stream_take(
+    line: *[constants.stream_write_bytes_max]u8,
+    length: *u32,
+    rest: []const u8,
+) StreamTake {
+    assert(rest.len > 0);
+    assert(length.* > 0);
+    assert(length.* < line.len);
+    const room = line.len - 1 - length.*;
+    const newline = std.mem.indexOfScalar(u8, rest, '\n');
+    const take = if (newline) |at| @min(at, room) else @min(rest.len, room);
+    @memcpy(line[length.*..][0..take], rest[0..take]);
+    length.* += @intCast(take);
+    const ended = if (newline) |at| at <= room else false;
+    const full = length.* == line.len - 1 and take < rest.len;
+    if (!ended and !full) return .{ .consumed = take, .complete = false };
+    line[length.*] = '\n';
+    length.* += 1;
+    return .{ .consumed = if (ended) take + 1 else take, .complete = true };
+}
+
+test "stream_take cuts lines, keeps a partial one, and splits a line longer than the buffer" {
+    // Goal: `--verbose` writes whole lines, each with its prefix, however the container's
+    // writes are cut. Method: feed chunks that end mid-line; then a line exactly as long as
+    // the room, one byte longer, and a very long one.
+    var line: [constants.stream_write_bytes_max]u8 = @splat(0xAA);
+    var length: u32 = 4;
+    @memcpy(line[0..4], "a | ");
+    const first = stream_take(&line, &length, "one\ntw");
+    try std.testing.expect(first.complete);
+    try std.testing.expectEqual(@as(usize, 4), first.consumed);
+    try std.testing.expectEqualStrings("a | one\n", line[0..length]);
+    length = 4;
+    const second = stream_take(&line, &length, "tw");
+    try std.testing.expect(!second.complete);
+    try std.testing.expectEqualStrings("a | tw", line[0..length]);
+    const third = stream_take(&line, &length, "o\nrest");
+    try std.testing.expect(third.complete);
+    try std.testing.expectEqualStrings("a | two\n", line[0..length]);
+    // The room is the buffer less the prefix and the newline; a line of exactly that many bytes
+    // fits with its own newline, one more is cut with a newline added.
+    const room = constants.stream_write_bytes_max - 1 - 4;
+    var long: [room + 2]u8 = @splat('x');
+    long[room] = '\n';
+    length = 4;
+    const exact = stream_take(&line, &length, long[0 .. room + 1]);
+    try std.testing.expect(exact.complete);
+    try std.testing.expectEqual(@as(usize, room + 1), exact.consumed);
+    try std.testing.expectEqual(constants.stream_write_bytes_max, length);
+    long[room] = 'y';
+    long[room + 1] = '\n';
+    length = 4;
+    const cut = stream_take(&line, &length, &long);
+    try std.testing.expect(cut.complete);
+    try std.testing.expectEqual(@as(usize, room), cut.consumed);
+    try std.testing.expectEqual(@as(u8, '\n'), line[length - 1]);
+    // A full buffer with nothing after it waits for the rest of its line.
+    length = 4;
+    const waits = stream_take(&line, &length, long[0..room]);
+    try std.testing.expect(!waits.complete);
+    try std.testing.expectEqual(constants.stream_write_bytes_max - 1, length);
+}
+
+/// A record that was pruned no longer needs the layers kept for it: they go, from inside the
+/// store's namespace. A layer that cannot be removed is a warning, never a failed run.
+fn reclaim_layers(handle: *Handle, pruned: *const records.Pruned) void {
+    const workspace = handle.image_workspace orelse return;
+    for (0..pruned.count) |index| {
+        var diag: Diag = undefined;
+        diag.reset();
+        image_mod.remove_container(
+            handle.host,
+            &handle.facts,
+            workspace,
+            pruned.name(@intCast(index)),
+            &diag,
+        ) catch {
+            if (diag.code == null) continue;
+            handle.report(&diag);
+        };
+    }
+}
+
+/// The diagnostic as the JSON line `--output json` prints, for the record. One too big to keep
+/// is replaced by an object that names its code and says it was cut.
+fn diagnostic_json(diag: *const Diag, buffer: *[constants.diag_json_bytes_max]u8) []const u8 {
+    assert(diag.code != null);
+    var big: [constants.output_bytes_max]u8 = undefined;
+    const line = std.mem.trimEnd(u8, render.render(diag, .json, false, &big), "\n");
+    if (line.len <= buffer.len) {
+        @memcpy(buffer[0..line.len], line);
+        return buffer[0..line.len];
+    }
+    const format = "{{\"code\":\"{s}\",\"truncated\":true}}";
+    // Cannot fail: a code name and a few words fit the buffer.
+    return std.fmt.bufPrint(buffer, format, .{codes.full_name(diag.code.?)}) catch unreachable;
+}
+
+fn save_record(handle: *Handle, exit: records.Exit, ended: ?u64, why: ?*const Diag) void {
+    const dir = handle.record_dir orelse return;
+    assert(handle.name_len > 0);
+    if (exit == .running) assert(ended == null);
+    var json: [constants.diag_json_bytes_max]u8 = undefined;
+    const writable_layers = handle.has_image and !handle.image.read_only;
+    const view: records.View = .{
+        .name = handle.name_slice(),
+        .rootfs = handle.rootfs_slice(),
+        .command = handle.command,
+        .labels = handle.labels,
+        .started = handle.started,
+        .ended = if (exit == .running) null else ended,
+        .exit = exit,
+        .ids = handle.mapping,
+        .reason = handle.end_reason,
+        .limits = handle.limits,
+        .scope = if (handle.plan.scoped) handle.plan.text(handle.plan.scope_name) else "",
+        .detached = handle.detached,
+        .timed_out = handle.session.timed_out,
+        .pid = handle.pid,
+        .supervisor = handle.host.own_pid(),
+        .tree = if (handle.has_image) handle.image.tree_text() else "",
+        .upper = if (writable_layers) handle.image.upper.text() else "",
+        .network = handle.network,
+        .publish = handle.publish_slice(),
+        .listen = handle.listen,
+        .env_names = handle.env_names,
+        .zbx_version = build_options.version,
+        .state = handle.volumes.mount_slice(),
+        .mounts = handle.mounts,
+        .devices = handle.devices,
+        .user = handle.user,
+        .binding = handle.binding,
+        .lazy = if (handle.lazy) |*lazy| lazy.record_now() else null,
+        .rlimits = handle.rlimits,
+        .sysctls = handle.sysctls,
+        .diagnostic = if (why) |found| diagnostic_json(found, &json) else "",
+    };
+    records.save(handle.host, &dir, &view) catch |err| {
+        const failure: diagnose.Failure = .{
+            .step = 0,
+            .err = err,
+            .errno = handle.host.last_errno(),
+        };
+        warn_not_saved(handle, dir.text(), failure);
+    };
+}
+
+/// Tells the caller once per run that the record is not being kept.
+fn warn_not_saved(handle: *Handle, directory: ?[]const u8, failure: ?diagnose.Failure) void {
+    if (handle.record_warned) return;
+    if (directory) |text| assert(text.len > 0);
+    handle.record_warned = true;
+    var warning: Diag = undefined;
+    warning.reset();
+    diagnose.record_not_saved(&warning, directory, failure);
+    handle.report(&warning);
+}
+
+fn collect_notes(handle: *Handle) void {
+    // The bus note, and the note that the host's resolv.conf could not be read.
+    assert(handle.notes_count <= 2);
+    assert(handle.notes.len >= handle.notes_count + 1); // Room for the scope's.
+    assert(handle.session.report.note_slice().len + handle.notes_count <= handle.notes.len);
+    for (handle.session.report.note_slice()) |record| {
+        if (handle.plan.steps[record.step].kind == .run_ldconfig) {
+            var warning: Diag = undefined;
+            warning.reset();
+            cdi_diagnose.no_ldconfig(&warning);
+            handle.report(&warning);
+            continue;
+        }
+        const note = &handle.notes[handle.notes_count];
+        note.* = .{};
+        var buffer: [160]u8 = undefined;
+        const text = diagnose.skipped_note(&handle.plan, record.step, record.errno, &buffer);
+        note.print("{s}", .{text});
+        handle.notes_count += 1;
+    }
+}
+
+const testing = std.testing;
+
+test "threads_in_status reads the Threads line and nothing else" {
+    // Goal: the debug assertion believes a count only when the line is well formed.
+    const typical = "Name:\tzbx\nThreads:\t1\nVmRSS: 3 kB\n";
+    try testing.expectEqual(@as(?u32, 1), threads_in_status(typical));
+    try testing.expectEqual(@as(?u32, 12), threads_in_status("Threads:   12\n"));
+    try testing.expectEqual(@as(?u32, null), threads_in_status("Name:\tzbx\n"));
+    try testing.expectEqual(@as(?u32, null), threads_in_status("Threads:\tmany\n"));
+    try testing.expectEqual(@as(?u32, null), threads_in_status(""));
+    try testing.expectEqual(@as(?u32, 2), threads_in_status("Threads: 2"));
+    try testing.expectEqual(@as(?u32, null), threads_in_status("xThreads: 2\n"));
+}
+
+test "a diagnostic line of diag_json_bytes_max bytes is kept whole, and one byte more is cut" {
+    // Goal: the record keeps the JSON line exactly up to its bound (3056, the lazy record's
+    // room, docs/decisions/2026-11-15-diag-json-bytes-3056.md); past it, the short object that
+    // names the code. Method: fill the whiles and the context, then add causes, growing the last
+    // one a byte at a time (the one before it full or shortened, to step over a new field's
+    // overhead) until the line is the bound, then one byte longer.
+    const max = constants.diag_json_bytes_max;
+    var diag: Diag = undefined;
+    var big: [constants.output_bytes_max]u8 = undefined;
+    var buffer: [max]u8 = undefined;
+    for ([_]usize{ max, max + 1 }) |target| {
+        const line = find: for (1..constants.diag_causes_count_max) |causes| {
+            for ([_]usize{ 0, 16 }) |shorter| {
+                for (1..constants.diag_field_bytes_max + 1) |length| {
+                    fill_diag(&diag, causes, shorter, length);
+                    const json = render.render(&diag, .json, false, &big);
+                    const rendered = std.mem.trimEnd(u8, json, "\n");
+                    if (rendered.len == target) break :find rendered;
+                }
+            }
+        } else return error.TestUnexpectedResult; // The fields no longer reach the bound.
+        const kept = diagnostic_json(&diag, &buffer);
+        if (target == max) {
+            try testing.expectEqualStrings(line, kept);
+        } else {
+            try testing.expectEqualStrings("{\"code\":\"ZBX-E0201\",\"truncated\":true}", kept);
+        }
+    }
+}
+
+/// Every while and context pair full, `causes` causes: the last `length` bytes long, the one
+/// before it `shorter` bytes short of full.
+fn fill_diag(diag: *Diag, causes: usize, shorter: usize, length: usize) void {
+    assert(causes >= 1);
+    const filler = @import("../test_util.zig").repeat('a', constants.diag_field_bytes_max);
+    diag.reset();
+    diag.raise(.E0201);
+    for (0..constants.diag_whiles_count_max) |_| diag.while_("{s}", .{filler});
+    const keys = [_][]const u8{ "ka", "kb", "kc", "kd", "ke", "kf" };
+    comptime assert(keys.len == constants.diag_context_count_max);
+    inline for (keys) |key| diag.context(key, "{s}", .{filler});
+    for (1..causes) |at| {
+        const cut = if (at + 1 == causes) shorter else 0;
+        diag.cause("{s}", .{filler[cut..]});
+    }
+    diag.cause("{s}", .{filler[0..length]});
+}

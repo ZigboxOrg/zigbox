@@ -1,0 +1,504 @@
+//! Tests of bundles, through the command line against the simulator: what a bundle holds, that
+//! nothing planted as a secret survives redaction (the CI redaction check the diagnostics
+//! standard asks for), the golden manifest, the automatic bundle on a bug, and the failures.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const build_options = @import("build_options");
+const bundle = @import("bundle.zig");
+const cli = @import("cli.zig");
+const constants = @import("constants.zig");
+const host_sim = @import("host_sim.zig");
+const test_util = @import("test_util.zig");
+const render = @import("diag/render.zig");
+const Diag = @import("diag/diag.zig").Diag;
+const sim_run = @import("runtime/sim_run.zig");
+
+/// The tests run one at a time, so one workspace serves them all.
+var test_workspace: bundle.Workspace = undefined;
+
+const testing = std.testing;
+const HostSim = host_sim.HostSim;
+const flate = std.compress.flate;
+
+// ---- Reading a bundle back -----------------------------------------------------------------
+
+/// The tar inside the gzip, decompressed with std's decompressor into `plain`.
+fn gunzip(gz: []const u8, plain: []u8) ![]const u8 {
+    var input: std.Io.Reader = .fixed(gz);
+    var window: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&input, .gzip, &window);
+    var output = std.Io.Writer.fixed(plain);
+    _ = try decompress.reader.streamRemaining(&output);
+    return output.buffered();
+}
+
+/// The content of the member called `name` (a path inside the archive) of a tar in memory.
+fn member(tar: []const u8, name: []const u8) ?[]const u8 {
+    var at: usize = 0;
+    while (at + 512 <= tar.len) {
+        const header = tar[at..][0..512];
+        if (header[0] == 0) return null;
+        const path = std.mem.sliceTo(header[0..100], 0);
+        const size_text = std.mem.trim(u8, header[124..136], " \x00");
+        const size = std.fmt.parseInt(usize, size_text, 8) catch return null;
+        const body = tar[at + 512 ..][0..size];
+        if (std.mem.endsWith(u8, path, name)) return body;
+        at += 512 + std.mem.alignForward(usize, size, 512);
+    }
+    return null;
+}
+
+/// The path `zbx bundle` printed, without its newline.
+fn printed_path(sim: *const HostSim) []const u8 {
+    return std.mem.trimEnd(u8, sim.stdout(), "\n");
+}
+
+fn run_args(sim: *HostSim, args: []const [:0]const u8) u8 {
+    var iterator: sim_run.SliceIterator = .{ .items = args };
+    return cli.run_from_iterator(sim.interface(), &iterator);
+}
+
+// ---- The planted secrets -------------------------------------------------------------------
+
+const env_secrets = [_]host_sim.EnvironmentVariable{
+    .{ .name = "HOME", .value = sim_run.home_path },
+    .{ .name = "GITHUB_TOKEN", .value = "ghp_FAKEenvtoken0123456789abcd" },
+    .{ .name = "DB_PASSWORD", .value = "FAKEenvpassw0rd!" },
+    .{ .name = "PLAIN_SETTING", .value = "FAKEenvplainvalue" },
+};
+
+const pem = "-----BEGIN PRIVATE KEY-----\nFAKEPEMBODY0123\n-----END PRIVATE KEY-----";
+const command_text = "curl -H 'Authorization: Bearer FAKEbearer123' --password=FAKEcmdpass " ++
+    "API_TOKEN=FAKEcmdtoken; echo FAKEenvpassw0rd!; " ++
+    "echo '{\"token\":\"FAKEregtoken0123\",\"expires_in\":300}'";
+const diagnostic_text =
+    "{\"code\":\"ZBX-E0204\",\"causes\":[\"the helper said api_key=FAKEdiagkey\"]}";
+
+/// Everything that must not be in any bundle made with redaction on.
+const planted = [_][]const u8{
+    "ghp_FAKEenvtoken0123456789abcd", "FAKEenvpassw0rd!", "FAKEenvplainvalue",
+    "FAKEbearer123",                  "FAKEcmdpass",      "FAKEcmdtoken",
+    "FAKEPEMBODY0123",                "FAKElabelvalue",   "FAKEdiagkey",
+    "FAKEregtoken0123",
+};
+
+fn prepare_secrets(sim: *HostSim) void {
+    sim_run.init(sim, 1);
+    sim.world.now = 1_792_873_384;
+    sim.environment_variables = &env_secrets;
+    var view = sim_run.sample_view("web-1", 1_792_873_000);
+    view.command = &.{ "sh", "-c", command_text, pem };
+    view.labels = &.{.{ .key = "owner", .value = "FAKElabelvalue" }};
+    view.diagnostic = diagnostic_text;
+    sim_run.put_record(sim, &view);
+}
+
+fn bundle_bytes(sim: *HostSim, plain: []u8) ![]const u8 {
+    const stored = sim.world.read_written(printed_path(sim)) orelse return error.NotWritten;
+    return gunzip(stored, plain);
+}
+
+test "redaction: no planted secret survives in a bundle, in any file" {
+    // Goal: the CI redaction check of DIAGNOSTICS.md. Method: plant fake secrets in the
+    // environment, in a run record's command, its labels and its diagnostic, make the bundle
+    // through the command line, read it back with std's gzip and tar, and search every byte.
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_secrets(&sim);
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &.{ "zbx", "bundle", "--last" }));
+    var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+    const tar = try bundle_bytes(&sim, &plain);
+    for (planted) |secret| try testing.expect(std.mem.indexOf(u8, tar, secret) == null);
+    const record = member(tar, "run-record.zon").?;
+    try testing.expect(std.mem.indexOf(u8, record, "[redacted:private-key]") != null);
+    try testing.expect(std.mem.indexOf(u8, record, "[redacted:label]") != null);
+    try testing.expect(std.mem.indexOf(u8, record, "--password=[redacted:password]") != null);
+    try testing.expect(std.mem.indexOf(u8, record, "[redacted:authorization]") != null);
+    try testing.expect(std.mem.indexOf(u8, record, "echo [redacted:env]") != null);
+    const diagnostic = member(tar, "diagnostic.json").?;
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "api_key=[redacted:key]") != null);
+    const names = member(tar, "environment.txt").?;
+    try testing.expect(std.mem.indexOf(u8, names, "GITHUB_TOKEN=[redacted:env]") != null);
+    try testing.expect(std.mem.indexOf(u8, names, "PLAIN_SETTING=[redacted:env]") != null);
+    try testing.expect(std.mem.indexOf(u8, record, "/srv/alpine") != null); // Not over-redacted.
+}
+
+test "redaction: the check can fail, because --no-redact leaves the secrets in" {
+    // Goal: the detector above is not vacuous. Method: the same run with --no-redact must
+    // contain every planted secret, and must warn.
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_secrets(&sim);
+    const args = [_][:0]const u8{ "zbx", "bundle", "--last", "--no-redact" };
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &args));
+    try testing.expect(std.mem.startsWith(u8, sim.stderr(), "warning[ZBX-W0701]: "));
+    var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+    const tar = try bundle_bytes(&sim, &plain);
+    for (planted) |secret| try testing.expect(std.mem.indexOf(u8, tar, secret) != null);
+    try testing.expect(
+        std.mem.indexOf(u8, member(tar, "MANIFEST.txt").?, "redaction: OFF") != null,
+    );
+}
+
+// ---- The variables of -e -------------------------------------------------------------------
+
+const given_marker = "bundle-given-value-NU-88";
+const copied_marker = "bundle-copied-value-XI-99";
+
+test "-e: a bundle holds the names that were set, never a value, with redaction on or off" {
+    // Goal: M6's rule that a value is never stored, where a bundle would show it. Method: really
+    // run a container with `-e SECRET_ONE=<marker>` and `-e COPY_ME` (a variable zbx's own
+    // environment has), make the bundle through the command line, and search every byte. The
+    // given value is in nothing, even with --no-redact (it was never kept); the copied value is
+    // zbx's own variable, redacted like every value of its environment, and shown only when the
+    // user asked for no redaction. The record names both variables.
+    for ([_]bool{ true, false }) |redact| {
+        var sim: HostSim = undefined;
+        sim_run.init(&sim, 41);
+        sim.world.now = 1_792_873_384;
+        sim.environment_variables = &.{
+            .{ .name = "HOME", .value = sim_run.home_path },
+            .{ .name = "COPY_ME", .value = copied_marker },
+        };
+        const start = [_][:0]const u8{ "zbx", "run", "-e", "SECRET_ONE=" ++ given_marker } ++
+            [_][:0]const u8{ "-e", "COPY_ME", "--rootfs", sim_run.rootfs_path, "--name" } ++
+            [_][:0]const u8{ "leak-1", "--", "sh" };
+        try testing.expectEqual(@as(u8, 0), run_args(&sim, &start));
+        const flags: []const [:0]const u8 = if (redact)
+            &.{ "zbx", "bundle", "leak-1" }
+        else
+            &.{ "zbx", "bundle", "leak-1", "--no-redact" };
+        try testing.expectEqual(@as(u8, 0), run_args(&sim, flags));
+        var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+        const tar = try bundle_bytes(&sim, &plain);
+        try testing.expect(std.mem.indexOf(u8, tar, given_marker) == null);
+        const copied_shown = std.mem.indexOf(u8, tar, copied_marker) != null;
+        try testing.expectEqual(!redact, copied_shown);
+        const record = member(tar, "run-record.zon").?;
+        const names = ".env_names = \"SECRET_ONE COPY_ME\",";
+        try testing.expect(std.mem.indexOf(u8, record, names) != null);
+        // The names of zbx's own environment are in the bundle, as they always were.
+        const environment = member(tar, "environment.txt").?;
+        try testing.expect(std.mem.indexOf(u8, environment, "COPY_ME=") != null);
+    }
+}
+
+var log_disk: @import("store/fs_sim.zig").SimFs = undefined;
+
+const output_marker = "container-output-AWS-AKIAIOSFODNN7EXAMPLE-ZETA-31";
+
+test "a bundle holds no byte of a container's log, with redaction on or off" {
+    // Goal: M6b slice 2's rule that a bundle never carries a log. `zbx bundle` collects the run
+    // record, the system files, the environment's names and the doctor's report, and reads
+    // nothing under logs/; this test keeps it so. Method: a container writes a secret-shaped
+    // marker to its output, the marker is shown to be in its log (so the test can fail), and
+    // it is in no byte of the bundle.
+    for ([_]bool{ true, false }) |redact| {
+        var sim: HostSim = undefined;
+        sim_run.init(&sim, 51);
+        sim.world.now = 1_792_873_384;
+        log_disk.init(51);
+        log_disk.put_dir("/home", 0o755);
+        log_disk.put_dir(sim_run.home_path, 0o755);
+        sim.log_fs = &log_disk;
+        const out = [_]@import("sim_world.zig").OutChunk{
+            .{ .stream = .stdout, .bytes = output_marker ++ "\n" },
+            .{ .stream = .stderr, .bytes = "password=" ++ output_marker ++ "\n" },
+        };
+        sim.world.out_script = &out;
+        const start = [_][:0]const u8{ "zbx", "run", "--rootfs", sim_run.rootfs_path, "--name" } ++
+            [_][:0]const u8{ "out-1", "--", "sh" };
+        try testing.expectEqual(@as(u8, 0), run_args(&sim, &start));
+        const log = log_disk.content_of(sim_run.logs_path ++ "/out-1.log").?;
+        try testing.expect(std.mem.indexOf(u8, log, output_marker) != null);
+        const flags: []const [:0]const u8 = if (redact)
+            &.{ "zbx", "bundle", "out-1" }
+        else
+            &.{ "zbx", "bundle", "out-1", "--no-redact" };
+        sim.stdout_len = 0; // The run showed its output; the path is all `bundle` prints.
+        try testing.expectEqual(@as(u8, 0), run_args(&sim, flags));
+        var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+        const tar = try bundle_bytes(&sim, &plain);
+        try testing.expect(std.mem.indexOf(u8, tar, output_marker) == null);
+        try testing.expect(std.mem.indexOf(u8, tar, "out-1") != null);
+    }
+}
+
+var exec_container: @import("runtime/run.zig").Handle = undefined;
+
+const exec_marker = "exec-env-value-AKIAIOSFODNN7EXAMPLE-ETA-12";
+
+test "a bundle notes the container's recent execs and never a value of their -e" {
+    // Goal: M6b slice 3's rule: `bundle` of a container notes its recent execs, the command and
+    // the exit, and an exec's environment is in no byte of it. Method: a running container, two
+    // execs through the command line (one with a secret-shaped `-e` value), then the bundle with
+    // redaction off, so that only the history's rule can keep the value out.
+    var sim: HostSim = undefined;
+    sim_run.init(&sim, 52);
+    sim.world.now = 1_792_873_384;
+    sim.world.command_runs_ms = 60_000;
+    log_disk.init(52);
+    log_disk.put_dir("/home", 0o755);
+    log_disk.put_dir(sim_run.home_path, 0o755);
+    sim.log_fs = &log_disk;
+    var diag: Diag = undefined;
+    diag.reset();
+    const spec: @import("runtime/run.zig").Spec = .{
+        .rootfs = sim_run.rootfs_path,
+        .name = "ex-1",
+        .command = &.{"/bin/sh"},
+    };
+    try @import("runtime/run.zig").start(sim.interface(), &spec, .{}, &exec_container, &diag);
+    exec_container.session.release_output();
+    const first = [_][:0]const u8{ "zbx", "exec", "ex-1", "-e", "TOKEN=" ++ exec_marker } ++
+        [_][:0]const u8{ "--", "/bin/sh", "-c", "echo made" };
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &first));
+    sim.world.command_exit = .{ .exited = 4 };
+    const second = [_][:0]const u8{ "zbx", "exec", "ex-1", "--", "/bin/sleep", "1" };
+    try testing.expectEqual(@as(u8, 4), run_args(&sim, &second));
+    sim.stdout_len = 0;
+    const flags = [_][:0]const u8{ "zbx", "bundle", "ex-1", "--no-redact" };
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &flags));
+    var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+    const tar = try bundle_bytes(&sim, &plain);
+    const execs = member(tar, "execs.txt").?;
+    try testing.expect(std.mem.indexOf(u8, execs, "2 recent execs of ex-1") != null);
+    try testing.expect(std.mem.indexOf(u8, execs, "exited 0  \"/bin/sh\" \"-c\"") != null);
+    try testing.expect(std.mem.indexOf(u8, execs, "exited 4  \"/bin/sleep\" \"1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, tar, exec_marker) == null);
+    exec_container.session.release_keeper();
+}
+
+// ---- The golden manifest -------------------------------------------------------------------
+
+/// `text` with the version of this build replaced, so a release does not change the golden.
+fn unversioned(text: []const u8, storage: []u8) []const u8 {
+    const size = std.mem.replacementSize(u8, text, build_options.version, "<version>");
+    assert(size <= storage.len);
+    _ = std.mem.replace(u8, text, build_options.version, "<version>", storage);
+    return storage[0..size];
+}
+
+fn prepare_golden(sim: *HostSim) void {
+    sim_run.init(sim, 1);
+    golden_state(sim);
+}
+
+/// The clock, the environment and one finished run, on a host that is already set up.
+fn golden_state(sim: *HostSim) void {
+    sim.world.now = 1_792_873_384;
+    sim.environment_variables = &env_secrets;
+    const view = sim_run.sample_view("web-1", 1_792_873_000);
+    sim_run.put_record(sim, &view);
+}
+
+test "golden: the manifest, with redaction on and off" {
+    // Goal: the manifest is the user's map of the bundle, so its text is part of the product.
+    var sim: HostSim = undefined;
+    const goldens = [_][]const u8{
+        @embedFile("testdata/bundle/manifest.txt"),
+        @embedFile("testdata/bundle/manifest.no_redact.txt"),
+    };
+    const flags = [_][]const [:0]const u8{
+        &.{ "zbx", "bundle", "web-1" },
+        &.{ "zbx", "bundle", "web-1", "--no-redact" },
+    };
+    for (goldens, flags) |golden, args| {
+        sim.init(1, &.{});
+        prepare_golden(&sim);
+        try testing.expectEqual(@as(u8, 0), run_args(&sim, args));
+        var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+        const tar = try bundle_bytes(&sim, &plain);
+        var storage: [constants.bundle_file_bytes_max]u8 = undefined;
+        const manifest = unversioned(member(tar, "MANIFEST.txt").?, &storage);
+        try testing.expectEqualStrings(golden, manifest);
+    }
+}
+
+test "the bundle's name and layout" {
+    // Goal: <state>/zbx/bundles/<UTC timestamp>-<name>.tar.gz, one directory inside, and every
+    // file the brief lists is there.
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &.{ "zbx", "bundle", "--last" }));
+    const expected = sim_run.bundles_path ++ "/2026-10-24T20-23-04Z-web-1.tar.gz";
+    try testing.expectEqualStrings(expected, printed_path(&sim));
+    var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+    const tar = try bundle_bytes(&sim, &plain);
+    const names = [_][]const u8{
+        "MANIFEST.txt", "run-record.zon", "version.txt", "mapping.txt",     "doctor.json",
+        "uname.txt",    "os-release.txt", "cgroup.txt",  "environment.txt",
+    };
+    for (names) |name| try testing.expect(member(tar, name) != null);
+    try testing.expect(std.mem.startsWith(u8, tar, "2026-10-24T20-23-04Z-web-1\x00"));
+    try testing.expect(member(tar, "diagnostic.json") == null); // The run did not fail.
+    try testing.expectEqualStrings(
+        "ids: full\nuid: 1000\ngid: 1000\n",
+        member(tar, "mapping.txt").?,
+    );
+    const doctor = member(tar, "doctor.json").?;
+    try testing.expect(std.mem.startsWith(u8, doctor, "{\"check\":\"kernel\",\"status\":"));
+}
+
+test "bundle --json prints the path as an object" {
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    const args = [_][:0]const u8{ "zbx", "--output", "json", "bundle", "--last" };
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &args));
+    try testing.expect(try test_util.json_is_valid(std.mem.trimEnd(u8, sim.stdout(), "\n")));
+    try testing.expect(std.mem.startsWith(u8, sim.stdout(), "{\"bundle\":\"/home/alice/"));
+}
+
+test "--last takes the newest record, a name takes that one" {
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    const newer = sim_run.sample_view("db-2", 1_792_873_200);
+    sim_run.put_record(&sim, &newer);
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &.{ "zbx", "bundle", "--last" }));
+    try testing.expect(std.mem.endsWith(u8, printed_path(&sim), "-db-2.tar.gz"));
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &.{ "zbx", "bundle", "web-1" }));
+    try testing.expect(std.mem.endsWith(u8, printed_path(&sim), "-web-1.tar.gz"));
+}
+
+// ---- Bounds and failures -------------------------------------------------------------------
+
+const huge_os_release = test_util.repeat('x', 40_000);
+
+test "a source over its bound is cut, and the manifest says so" {
+    var sim: HostSim = undefined;
+    const files = sim_run.files ++ [_]host_sim.File{
+        .{ .path = "/etc/os-release", .content = huge_os_release },
+    };
+    sim_run.start(&sim, 1, &files);
+    golden_state(&sim);
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &.{ "zbx", "bundle", "--last" }));
+    var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+    const tar = try bundle_bytes(&sim, &plain);
+    try testing.expectEqual(
+        @as(usize, constants.bundle_file_bytes_max),
+        member(tar, "os-release.txt").?.len,
+    );
+    const manifest = member(tar, "MANIFEST.txt").?;
+    try testing.expect(std.mem.indexOf(u8, manifest, "cut at a bound") != null);
+}
+
+test "a missing system file is named, not fatal" {
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    try testing.expectEqual(@as(u8, 0), run_args(&sim, &.{ "zbx", "bundle", "--last" }));
+    var plain: [constants.bundle_stage_bytes_max * 2]u8 = undefined;
+    const tar = try bundle_bytes(&sim, &plain);
+    const text = member(tar, "os-release.txt").?;
+    try testing.expectEqualStrings("unavailable: /etc/os-release could not be read\n", text);
+}
+
+fn expect_failure(sim: *HostSim, args: []const [:0]const u8, tag: []const u8, exit: u8) !void {
+    try testing.expectEqual(exit, run_args(sim, args));
+    var expected: [32]u8 = undefined;
+    const header = try std.fmt.bufPrint(&expected, "error[ZBX-{s}]: ", .{tag});
+    try testing.expect(std.mem.startsWith(u8, sim.stderr(), header));
+    try testing.expectEqual(@as(usize, 0), sim.stdout().len);
+}
+
+test "failures: no state directory, unknown name, no runs, a full disk" {
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    sim.environment_variables = &.{};
+    try expect_failure(&sim, &.{ "zbx", "bundle", "--last" }, "E0701", 2);
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    try expect_failure(&sim, &.{ "zbx", "bundle", "nothere" }, "E0703", 1);
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    try expect_failure(&sim, &.{ "zbx", "bundle", "../x" }, "E0703", 1); // Never a path.
+    // Found by the cli fuzzer: an empty name used to trip an assertion (a bug block, exit 70).
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    try expect_failure(&sim, &.{ "zbx", "bundle", "" }, "E0703", 1);
+    sim.init(1, &.{});
+    sim_run.init(&sim, 1);
+    try expect_failure(&sim, &.{ "zbx", "bundle", "--last" }, "E0704", 1);
+    sim.init(1, &.{});
+    prepare_golden(&sim);
+    sim.world.disk_full = true;
+    try expect_failure(&sim, &.{ "zbx", "bundle", "--last" }, "E0702", 2);
+    try testing.expect(std.mem.indexOf(u8, sim.stderr(), "no space left on the device") != null);
+    try testing.expectEqual(
+        @as(u32, 1),
+        sim.world.written_count,
+    ); // Only the record: no stray temp.
+}
+
+test "usage: --last or one name, never both or neither, and the flags are bundle's" {
+    var sim: HostSim = undefined;
+    const cases = [_]struct { args: []const [:0]const u8, tag: []const u8 }{
+        .{ .args = &.{ "zbx", "bundle" }, .tag = "E0006" },
+        .{ .args = &.{ "zbx", "bundle", "--last", "web-1" }, .tag = "E0003" },
+        .{ .args = &.{ "zbx", "bundle", "a", "b" }, .tag = "E0003" },
+        .{ .args = &.{ "zbx", "--last", "doctor" }, .tag = "E0004" },
+        .{ .args = &.{ "zbx", "doctor", "--no-redact" }, .tag = "E0004" },
+    };
+    for (cases) |case| {
+        sim.init(1, &.{});
+        try expect_failure(&sim, case.args, case.tag, 1);
+    }
+}
+
+// ---- The automatic bundle ------------------------------------------------------------------
+
+test "a bug from a run gets a bundle and a saved line; other diagnostics do not" {
+    // Goal: DIAGNOSTICS.md's bug block, with its `saved` line. Method: raise a B0001 for a
+    // recorded run, attach, and render in text and JSON.
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    prepare_secrets(&sim);
+    var bug: Diag = undefined;
+    bug.reset();
+    bug.raise(.B0001);
+    bug.cause("an invariant broke", .{});
+    bundle.attach_to_bug(sim.interface(), &test_workspace, "web-1", &bug);
+    const path = sim_run.bundles_path ++ "/2026-10-24T20-23-04Z-web-1.tar.gz";
+    try testing.expectEqualStrings(path, bug.saved.slice());
+    try testing.expect(sim.world.read_written(path) != null);
+    var buffer: [constants.output_bytes_max]u8 = undefined;
+    const text = render.render(&bug, .text, false, &buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "  saved  diagnostic bundle:") != null);
+    try testing.expect(std.mem.indexOf(u8, text, path) != null); // Wrapped, but whole.
+    const json = render.render(&bug, .json, false, &buffer);
+    try testing.expect(try test_util.json_is_valid(std.mem.trimEnd(u8, json, "\n")));
+    try testing.expect(std.mem.indexOf(u8, json, "\"saved\":\"" ++ path ++ "\"") != null);
+}
+
+test "a bug with no record or no room just has no saved line" {
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    sim_run.init(&sim, 1);
+    var bug: Diag = undefined;
+    bug.reset();
+    bug.raise(.B0001);
+    bundle.attach_to_bug(sim.interface(), &test_workspace, "web-1", &bug); // No record.
+    try testing.expectEqual(@as(u32, 0), bug.saved.len);
+    prepare_golden(&sim);
+    sim.world.disk_full = true;
+    bundle.attach_to_bug(sim.interface(), &test_workspace, "web-1", &bug); // No room.
+    try testing.expectEqual(@as(u32, 0), bug.saved.len);
+}
+
+test "timestamp: the form in DIAGNOSTICS.md" {
+    var buffer: [constants.timestamp_bytes]u8 = undefined;
+    try testing.expectEqualStrings("1970-01-01T00-00-00Z", bundle.timestamp(0, &buffer));
+    try testing.expectEqualStrings(
+        "2001-09-09T01-46-40Z",
+        bundle.timestamp(1_000_000_000, &buffer),
+    );
+    try testing.expectEqualStrings(
+        "2024-02-29T23-59-59Z",
+        bundle.timestamp(1_709_251_199, &buffer),
+    );
+}

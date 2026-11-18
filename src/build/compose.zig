@@ -1,0 +1,2015 @@
+//! `zbx build`, the thin composition of slice 2: for each step of the build file in graph order,
+//! the lock gives the base image, the image record its tree, platform and environment, the
+//! inputs are imported (`input_tree.zig`), the key is computed (`key.zig`), and the cache
+//! (`cache.zig`) either has the output (a hit starts no container) or `step.run_step` makes it
+//! and the cache records it.
+//!
+//! Steps run through `schedule.zig`: hits are found here, a miss runs in a worker process, a
+//! failure starts nothing new. A base that the lock names but the store lacks is pulled by the
+//! locked manifest digest (`pull.zig`, the library call). When every step is done the image
+//! step runs here, in this process: the base, the adds and the config become the image tree
+//! (`assemble.zig`, cached under the image key) and the build record (`result.zig`), whose digest
+//! is the build's result.
+//!
+//! The report is a header, one row per step as it ends (`  compile   miss   9.81 s`) and a
+//! footer with the result digest; with `json` it is one `zbx.build/1` line per step as it ends
+//! and a last `build_result` line (`zbx schema build`).
+
+const std = @import("std");
+const assert = std.debug.assert;
+const constants = @import("../constants.zig");
+const host_mod = @import("../host.zig");
+const doctor = @import("../doctor.zig");
+const errors = @import("../diag/errors.zig");
+const lock_file = @import("../lock_file.zig");
+const image_diagnose = @import("../image_diagnose.zig");
+const Diag = @import("../diag/diag.zig").Diag;
+const layout = @import("../store/layout.zig");
+const PathBuf = @import("../store/fs.zig").PathBuf;
+const images = @import("../store/images.zig");
+const lock = @import("../store/lock.zig");
+const store_diagnose = @import("../store/diagnose.zig");
+const digest_mod = @import("../store/digest.zig");
+const load_mod = @import("load.zig");
+const provenance_job = @import("provenance_job.zig");
+const file_mod = @import("file.zig");
+const key_mod = @import("key.zig");
+const cache = @import("cache.zig");
+const step_mod = @import("step.zig");
+const input_tree = @import("input_tree.zig");
+const input_job = @import("input_job.zig");
+const fetch_tree = @import("fetch_tree.zig");
+const inputs_mod = @import("inputs.zig");
+const diagnose = @import("diagnose.zig");
+const graph_mod = @import("graph.zig");
+const render = @import("../diag/render.zig");
+const schedule = @import("schedule.zig");
+const assemble = @import("assemble.zig");
+const copy_mod = @import("copy.zig");
+const image_user = @import("../image_user.zig");
+const copy_owner = @import("copy_owner.zig");
+const copy_job = @import("copy_job.zig");
+const result_mod = @import("result.zig");
+const roots = @import("../store/roots.zig");
+const pull_lib = @import("../pull.zig");
+const reference_mod = @import("../registry/reference.zig");
+const manifest = @import("../registry/manifest.zig");
+const digest_sha = @import("../registry/digest.zig");
+const trust_gate = @import("../trust/gate.zig");
+const trust_record = @import("../trust/record.zig");
+const fetch_mod = @import("fetch.zig");
+const blobs_mod = @import("../registry/blobs.zig");
+const registry_diagnose = @import("../registry/diagnose.zig");
+const pin_mod = @import("pin.zig");
+
+const Host = host_mod.Host;
+const Digest = digest_mod.Digest;
+const Store = layout.Store;
+
+pub const Error = error{ Failed, OutputFailed };
+
+/// The caller's memory for a build: large, so static or heap storage.
+pub const Workspace = struct {
+    /// The policy gate before a step starts: the files, and the base's signatures.
+    gate: trust_gate.Memory,
+    signatures: trust_record.Record,
+    record_work: trust_record.Work,
+    locking: lock_file.Workspace,
+    image: images.Image,
+    input: input_tree.Workspace,
+    input_problem: inputs_mod.Problem,
+    step: step_mod.Workspace,
+    cache: cache.Workspace,
+    result: step_mod.Result,
+    outputs: [constants.build_steps_max]Digest,
+    /// By step index: what its output is checked against (`pin.zig`), set in `begin`.
+    wants: [constants.build_steps_max]pin_mod.Want,
+    /// The output excludes of the step `begin` is keying (`pin.excludes`).
+    output_paths: [constants.build_output_excludes_max][]const u8,
+    base_env: [constants.env_vars_count_max][]const u8,
+    env: [constants.build_step_env_max][]const u8,
+    argv: [constants.build_step_argv_max][]const u8,
+    needs: [constants.build_step_needs_max]key_mod.Need,
+    key: key_mod.Key,
+    row: [row_bytes]u8,
+    slots: [constants.build_parallel_max]Slot,
+    plan: schedule.Plan,
+    side_diag: Diag,
+    /// When each step began and ended (milliseconds into the build), by step index; the image
+    /// is `image_slot`.
+    timings: [constants.build_steps_max + 1]Timing,
+    /// The library pull of a base the lock names and the store lacks.
+    pull: pull_lib.Workspace,
+    /// The image step: the assembly's memory and failure, the record and its bytes.
+    assembly: assemble.Workspace,
+    assembly_failure: assemble.Failure,
+    record: result_mod.Record,
+    empty_settings: images.Settings,
+    record_bytes: [constants.build_result_bytes_max]u8,
+    adds: [constants.build_image_adds_max]assemble.Add,
+    image_adds: [constants.build_image_adds_max]key_mod.ImageAdd,
+    /// By step index: the input tree each step was keyed with, and its key, for the provenance.
+    step_inputs: [constants.build_steps_max]Digest,
+    step_keys: [constants.build_steps_max]Digest,
+    provenance: provenance_job.Workspace,
+    /// A copy step: the selection's memory, each entry's key part and its patterns.
+    copying: copy_mod.Workspace,
+    user_ws: image_user.Workspace,
+    copy_keys: [constants.build_copy_entries_max]key_mod.Copy,
+    /// A copy step's `.chown` and `.chmod`: each entry's stamp, its `.to`, and the selection as
+    /// the stamp leaves it (the selection itself when the entry has neither).
+    copy_stamps: [constants.build_copy_entries_max]copy_owner.Stamp,
+    copy_tos: [constants.build_copy_entries_max][]const u8,
+    copy_chowns: [constants.build_copy_entries_max]?[]const u8,
+    copy_stamped: [constants.build_copy_entries_max]Digest,
+    copy_selections: [constants.build_copy_entries_max]Digest,
+    copy_owner: copy_owner.Workspace,
+    cache_mounts: [constants.build_step_caches_max]key_mod.CacheMount,
+    bind_keys: [constants.build_step_binds_max]key_mod.Bind,
+    /// How many users of each tree this build rooted are still at work (`hold`, `unroot`): one
+    /// root record exists per digest, so the first user to finish must not drop it under the
+    /// others. Entries are packed at the front.
+    holds: [constants.build_root_holds_max]Hold,
+    holds_count: u32,
+    copy_patterns: [constants.build_copy_sources_max][]const u8,
+    /// The download of a `.fetch` whose blob the store lacks, on its copy step's miss.
+    fetcher: fetch_mod.Fetcher,
+    /// A fetch entry's `.to` with the URL's file name added when it ends in `/`, by entry.
+    fetch_tos: [constants.build_copy_entries_max][fetch_to_bytes_max]u8,
+};
+
+/// The longest resolved `.to` of a fetch: a `.to` and the last segment of a URL.
+const fetch_to_bytes_max = constants.build_string_bytes_max + constants.registry_url_bytes_max;
+
+/// The source digest a fetch entry's key part holds until its selection is made: the key never
+/// reads it (`key.Copy.fetch`), and it is never dropped.
+const fetch_placeholder: Digest = .{ .bytes = @splat(0) };
+
+/// The input a copy step whose first entry is a fetch records: the pinned SHA-256.
+fn fetch_input(sha256_hex: []const u8) Digest {
+    const sha256 = digest_sha.Sha256.from_hex(sha256_hex).?; // Checked at load.
+    const input: Digest = .{ .bytes = sha256.bytes };
+    assert(!input.eql(fetch_placeholder));
+    assert(input.bytes.len == sha256.bytes.len);
+    return input;
+}
+
+const Hold = struct { digest: Digest, users: u32 };
+
+/// The timings slot of the image step.
+const image_slot = constants.build_steps_max;
+
+pub const Timing = struct {
+    start_ms: u64,
+    end_ms: u64,
+    key: Digest,
+    output: Digest,
+    hit: bool,
+    network: bool,
+    /// The step mounts a cache (`.caches`): its output can depend on what the cache held.
+    caches: bool,
+};
+
+/// What the caller asks of the build besides the file.
+pub const Options = struct {
+    /// `--output json`: one `zbx.build/1` record per line on stdout.
+    json: bool,
+    /// `--verbose`: stream each step's output to stderr, a `<step> | ` before each line, and
+    /// render a warning with its whole cause chain.
+    verbose: bool,
+    /// `--clear-caches`: empty this build file's cache directories before any step runs.
+    clear_caches: bool = false,
+    /// `--pin`, `--locked` or `--hermetic` (M9 slice 3c, `pin.zig`).
+    pins: pin_mod.Mode = .plain,
+};
+
+/// The most a report line holds: a JSON step record (two digests, a name, numbers) is the
+/// longest, with room to spare.
+const row_bytes = 640;
+const name_gap = "   ";
+
+/// Builds every step of the loaded build file with the scheduler (`schedule.zig`): hits are
+/// found here, in this process; a miss runs in a worker process (`worker_entry`) that this process
+/// waits for with pidfds. A row is written as each step ends.
+pub fn run_steps(
+    host: Host,
+    facts: *doctor.Facts,
+    loaded: *const load_mod.Workspace,
+    ws: *Workspace,
+    options: Options,
+    diag: *Diag,
+) Error!void {
+    assert(diag.code == null);
+    assert(loaded.graph.count == loaded.file.steps_count);
+    var failure: lock_file.Failure = undefined;
+    lock_file.open_project(host, host.filesystem(), &ws.locking, &failure) catch {
+        image_diagnose.lock_failure(diag, lock_file.file_name, failure);
+        return error.Failed;
+    };
+    var store: Store = undefined;
+    if (!store.locate(host)) {
+        store_diagnose.no_data_directory(diag);
+        return error.Failed;
+    }
+    var group_storage: [step_mod.log_group_bytes]u8 = undefined;
+    const group = step_mod.log_group(&group_storage, loaded.path.text());
+    var context: Context = .{
+        .host = host,
+        .facts = facts,
+        .loaded = loaded,
+        .ws = ws,
+        .diag = diag,
+        .store = &store,
+        .group = group,
+        .row_failed = null,
+        .json = options.json,
+        .verbose = options.verbose,
+        .pins = options.pins,
+        .started_ms = host.monotonic_ms(),
+        .started_s = host.time_now(),
+        .name_width = name_width(&loaded.file),
+        .hits = 0,
+        .misses = 0,
+        .gate_loaded = false,
+        .records_max = constants.trust_records_max,
+    };
+    for (&ws.slots) |*slot| slot.active = false;
+    ws.holds_count = 0;
+    // A Ctrl-C or a SIGTERM must reach `abort_step` and the roots' removal, which a process
+    // killed by the signal never runs; the scheduler sees it in `begin` and `wait`.
+    host.catch_interrupts(true);
+    defer host.catch_interrupts(false);
+    try context.sweep();
+    if (options.clear_caches) try context.clear_caches();
+    try context.header();
+    context.warn_network();
+    context.warn_caches();
+    if (options.pins == .hermetic) try context.check_hermetic();
+    make_plan(loaded, &ws.plan);
+    const executor: schedule.Executor = .{
+        .context = &context,
+        .begin = Context.begin_step,
+        .wait = Context.wait_step,
+        .abort = Context.abort_step,
+    };
+    const outcome = schedule.run(&ws.plan, parallel_bound(host), executor);
+    try context.finish(outcome);
+    try context.build_image();
+    // Once, and only when the build succeeded: a failed build leaves the lock as it was.
+    if (options.pins == .pin) try context.save_pins();
+}
+
+/// The width of the name column: the longest step name, or `image`.
+fn name_width(file: *const file_mod.BuildFile) u8 {
+    var width: usize = "image".len;
+    for (file.steps_slice()) |step| width = @max(width, file.text(step.name).len);
+    assert(width <= constants.build_step_name_bytes_max);
+    return @intCast(width);
+}
+
+/// How many steps may run at once: the constant (a cut: the CPUs online are not counted).
+fn parallel_bound(host: Host) u8 {
+    _ = host;
+    return constants.build_parallel_max;
+}
+
+fn make_plan(loaded: *const load_mod.Workspace, plan: *schedule.Plan) void {
+    const graph = &loaded.graph;
+    plan.count = graph.count;
+    for (graph.order_slice(), 0..) |index, at| plan.order[at] = index;
+    for (0..graph.count) |index| {
+        // The scheduler waits for everything the step reads, not only for its `needs`: a base
+        // or a copy source is a step too (`after_slice`).
+        const needs = graph.after_slice(@intCast(index));
+        for (needs, 0..) |need, at| plan.needs[index][at] = need;
+        plan.needs_count[index] = @intCast(needs.len);
+    }
+    cache_edges(&loaded.file, plan);
+    assert(plan.valid());
+}
+
+/// Steps that share a cache id run one at a time (`sharing=locked`): each step comes after the
+/// nearest step before it, in the plan's order, that holds one of its caches.
+pub fn cache_edges(file: *const file_mod.BuildFile, plan: *schedule.Plan) void {
+    for (plan.order[0..plan.count], 0..) |step, position| {
+        for (file.step_caches(&file.steps[step])) |held| {
+            const before = holder_before(file, plan, position, file.text(held.id)) orelse continue;
+            if (std.mem.indexOfScalar(u8, plan.needs_of(step), before) != null) continue;
+            const at = plan.needs_count[step];
+            // One more per cache, and the bound has room.
+            assert(at < constants.build_step_edges_max);
+            plan.needs[step][at] = before;
+            plan.needs_count[step] = at + 1;
+        }
+    }
+}
+
+/// The step nearest before `position` in the plan's order that has a cache `id`, or null.
+fn holder_before(
+    file: *const file_mod.BuildFile,
+    plan: *const schedule.Plan,
+    position: usize,
+    id: []const u8,
+) ?u8 {
+    var at = position;
+    while (at > 0) {
+        at -= 1;
+        const step = plan.order[at];
+        for (file.step_caches(&file.steps[step])) |other| {
+            if (std.mem.eql(u8, file.text(other.id), id)) return step;
+        }
+    }
+    return null;
+}
+
+/// A miss that is running in a worker process.
+pub const Slot = struct {
+    active: bool,
+    index: u8,
+    pid: host_mod.Pid,
+    report: host_mod.Pipe,
+    key: key_mod.Key,
+    /// The trees the step's binds select, rooted until the step settles or is aborted.
+    binds: [constants.build_step_binds_max]Digest,
+    binds_count: u8,
+};
+
+/// What the worker needs: it runs on a copy of this process's memory.
+const Job = struct {
+    request: *const step_mod.Request,
+    ws: *step_mod.Workspace,
+    write: host_mod.Handle,
+    host: Host,
+};
+
+/// The worker: runs the step as a container and answers on the pipe, the output's digest or the
+/// encoded diagnostic, each behind a tag byte. The exit code is 0 only with an answer.
+fn worker_entry(raw: *anyopaque) u8 {
+    const job: *Job = @ptrCast(@alignCast(raw));
+    // The parent's handlers are not the worker's: a signal ends the worker as it always did.
+    job.host.catch_interrupts(false);
+    // A killed build takes its workers with it, as it took its one step before.
+    job.host.die_with_parent() catch return 1;
+    var diag: Diag = undefined;
+    diag.reset();
+    var result: step_mod.Result = undefined;
+    step_mod.run_step(job.request, job.ws, &result, &diag) catch {
+        var bytes: [failure_bytes_max]u8 = undefined;
+        bytes[0] = tag_failure;
+        const encoded = diag.encode(bytes[1..][0..constants.diag_carry_bytes_max]);
+        job.host.write_handle_all(job.write, bytes[0 .. 1 + encoded.len]) catch {};
+        return diag.exit_code();
+    };
+    var answer: [answer_bytes]u8 = undefined;
+    answer[0] = tag_output;
+    @memcpy(answer[1..], &result.output.bytes);
+    job.host.write_handle_all(job.write, &answer) catch return 1;
+    return 0;
+}
+
+/// The first byte of what a worker writes: an output's digest follows, or an encoded diagnostic.
+/// A tag, not a length, tells them apart, so no diagnostic can pass for an output or the reverse.
+pub const tag_output: u8 = 1;
+pub const tag_failure: u8 = 2;
+
+/// The answer on the pipe: the tag, then the output's digest.
+pub const answer_bytes = 1 + constants.store_digest_bytes;
+
+/// The most a worker writes: the tag and a diagnostic.
+pub const failure_bytes_max = 1 + constants.diag_carry_bytes_max;
+
+pub const Answer = union(enum) { output: Digest, failed };
+
+/// What a worker's end and the bytes it wrote mean. Only a clean exit with exactly a tagged
+/// answer is an output; a tagged diagnostic that decodes is the worker's; anything else blames
+/// the worker (a signal, or an exit with no answer). `diag` is set on `.failed`.
+pub fn decode_answer(status: host_mod.ExitStatus, bytes: []const u8, diag: *Diag) Answer {
+    const clean = status == .exited and status.exited == 0;
+    if (clean and bytes.len == answer_bytes and bytes[0] == tag_output) {
+        var output: Digest = undefined;
+        @memcpy(&output.bytes, bytes[1..]);
+        return .{ .output = output };
+    }
+    if (bytes.len > 1 and bytes[0] == tag_failure and diag.decode(bytes[1..])) return .failed;
+    diag.reset();
+    const fault: store_diagnose.WorkerFault = switch (status) {
+        .signaled => |number| .{ .signaled = number },
+        .exited => .{ .report = "a build step's worker ended with no answer" },
+    };
+    store_diagnose.worker_ended(diag, fault);
+    assert(diag.code != null);
+    return .failed;
+}
+
+pub const Context = struct {
+    host: Host,
+    facts: *doctor.Facts,
+    loaded: *const load_mod.Workspace,
+    ws: *Workspace,
+    diag: *Diag,
+    store: *Store,
+    group: []const u8,
+    row_failed: ?Error,
+    json: bool,
+    verbose: bool,
+    /// `--pin`, `--locked`, `--hermetic`, or none of them.
+    pins: pin_mod.Mode = .plain,
+    started_ms: u64,
+    /// The wall clock at the start, in the seconds a root record keeps (`unroot`).
+    started_s: u64,
+    name_width: u8,
+    hits: u32,
+    misses: u32,
+    /// The policy files have been read (once per build).
+    gate_loaded: bool,
+    /// `trust_records_max`; a test lowers it.
+    records_max: u32,
+
+    pub fn request(context: *const Context, spec: *const key_mod.Spec) step_mod.Request {
+        return .{
+            .host = context.host,
+            .facts = context.facts,
+            .spec = spec,
+            .file = context.loaded.shown(),
+            .group = context.group,
+            .stream = context.verbose,
+        };
+    }
+
+    fn begin_step(raw: *anyopaque, index: u8) schedule.Error!schedule.Begin {
+        const context: *Context = @ptrCast(@alignCast(raw));
+        return context.begin(index) catch error.Failed;
+    }
+
+    fn wait_step(raw: *anyopaque) schedule.Error!schedule.Ended {
+        const context: *Context = @ptrCast(@alignCast(raw));
+        return context.wait() catch error.Failed;
+    }
+
+    /// The build's answer once the scheduler is done. A row that could not be written fails its
+    /// step; only the returned error value is then the output's (`OutputFailed`), not the
+    /// step's. What the user reads is `diag`, which keeps the first failure (a later row failure
+    /// goes to `side_diag`). A failed `hit` row never sets `row_failed`: `begin_step` turns its
+    /// error into `Failed`, so the ordering covers `built` rows only.
+    pub fn finish(context: *Context, outcome: schedule.Outcome) Error!void {
+        if (context.row_failed) |err| return err;
+        if (outcome.failed == null and !outcome.aborted) return;
+        if (context.diag.code == null) {
+            context.diag.raise(.B0001);
+            context.diag.cause("a build step failed with no diagnostic", .{});
+        }
+        return error.Failed;
+    }
+
+    /// `--clear-caches`: empties the cache directories of this build file.
+    fn clear_caches(context: *Context) Error!void {
+        const spec: key_mod.Spec = .{
+            .platform = "linux/amd64",
+            .base_tree = Digest.of("clear"),
+            .base_env = &.{},
+            .input_tree = Digest.of("clear"),
+            .needs = &.{},
+            .argv = &.{},
+            .env = &.{},
+            .network = false,
+            .name = "clear",
+        };
+        const clear_request = context.request(&spec);
+        step_mod.clear_caches(&clear_request, &context.ws.step, context.diag) catch
+            return error.Failed;
+    }
+
+    /// Clears what a killed build left in `build/work`, before this one starts steps.
+    fn sweep(context: *Context) Error!void {
+        const spec: key_mod.Spec = .{
+            .platform = "linux/amd64",
+            .base_tree = Digest.of("sweep"),
+            .base_env = &.{},
+            .input_tree = Digest.of("sweep"),
+            .needs = &.{},
+            .argv = &.{},
+            .env = &.{},
+            .network = false,
+            .name = "sweep",
+        };
+        const sweep_request = context.request(&spec);
+        step_mod.sweep(&sweep_request, &context.ws.step, context.diag) catch return error.Failed;
+    }
+
+    /// Resolves the step's key; a cached output is a hit, anything else starts a worker.
+    pub fn begin(context: *Context, index: u8) Error!schedule.Begin {
+        const loaded = context.loaded;
+        const ws = context.ws;
+        const file = &loaded.file;
+        assert(index < file.steps_count);
+        try context.check_interrupt();
+        const step = &file.steps[index];
+        const name = file.text(step.name);
+        // A literal naming only the fields without defaults: the M9 fields then take theirs by
+        // construction, and a field added to the spec later cannot be left holding stack bytes.
+        var spec: key_mod.Spec = .{
+            .platform = undefined,
+            .base_tree = undefined,
+            .base_env = undefined,
+            .input_tree = undefined,
+            .needs = undefined,
+            .argv = undefined,
+            .env = undefined,
+            .network = step.network,
+            .name = name,
+        };
+        spec.root_output = step.output == .root;
+        if (step.user) |user| spec.user = file.text(user);
+        if (step.workdir) |workdir| spec.workdir = file.text(workdir);
+        try context.resolve_base(index, &spec);
+        spec.input_tree = if (step.copy.given)
+            std.mem.zeroes(Digest)
+        else
+            try context.import_inputs(index, null);
+        ws.step_inputs[index] = spec.input_tree;
+        if (!step.copy.given) context.hold(spec.input_tree);
+        // The import rooted the input tree for the worker; it is dropped on a hit, on an error,
+        // and when the worker's step settles or is aborted.
+        var handed_over = false;
+        defer if (!handed_over and !step.copy.given) context.drop(spec.input_tree);
+        fill_lists(file, step, ws, &spec);
+        const lock_pin = context.output_excludes(index, &spec);
+        spec.needs = fill_needs(loaded, index, ws);
+        if (!step.copy.given) try context.resolve_binds(index, &spec);
+        // The binds' selections are rooted too; they go as the input tree goes, and a worker
+        // that starts takes them over (`fork_worker`).
+        defer if (!handed_over) for (spec.binds) |bind| context.drop(bind.source);
+        // An import can take seconds: a signal that came during it stops the step here, before
+        // a worker starts.
+        try context.check_interrupt();
+        if (step.copy.given) return context.begin_copy(index, &spec);
+        if (try context.lookup(index, &spec, lock_pin)) |output| {
+            ws.outputs[index] = output;
+            try context.report(index, true, output);
+            return .hit;
+        }
+        // A `step:` base is a tree this build made: the gate judged the image the chain
+        // started from when that step ran, and a derived tree has no statement of its own.
+        if (loaded.graph.base_step[index] == null) {
+            try context.check_base(file.text(step.base), &spec);
+        }
+        try context.fork_worker(index, &spec);
+        handed_over = true; // The slot holds the roots now; `settle` or `abort_step` drops them.
+        return .running;
+    }
+
+    /// Computes the run step's key into `ws.key`, judges its pin, and looks the key up: the
+    /// output on a hit, once it is checked against the pin; null on a miss.
+    fn lookup(
+        context: *Context,
+        index: u8,
+        spec: *const key_mod.Spec,
+        lock_pin: ?*const lock_file.Pin,
+    ) Error!?Digest {
+        const ws = context.ws;
+        const step = &context.loaded.file.steps[index];
+        assert(!step.copy.given);
+        key_mod.compute(spec, &ws.key) catch {
+            const shown = context.loaded.shown();
+            diagnose.step_env_refused(context.diag, spec.name, shown, step.env.count, "");
+            return error.Failed;
+        };
+        try context.judge_pin(index, lock_pin);
+        var failure: cache.Failure = undefined;
+        const found = cache.lookup(context.store, &ws.cache, &ws.key, &failure) catch {
+            return context.cache_failed(&failure);
+        };
+        return switch (found) {
+            .hit => |output| if (try context.stale(spec, output))
+                null
+            else
+                try context.check_pin(index, output),
+            .miss => null,
+        };
+    }
+
+    /// Whether the hit `output` is an output the step cannot make on this machine
+    /// (`step.cached_output_holds`): an older zbx's, with Rosetta's cache in it. Its entry is
+    /// removed, and the step runs as on a miss.
+    fn stale(context: *Context, spec: *const key_mod.Spec, output: Digest) Error!bool {
+        const ws = context.ws;
+        const store = context.store;
+        if (step_mod.cached_output_holds(context.host, store, &ws.step, spec, output)) return false;
+        try store_diagnose.hold(context.diag, store, .shared, "build", "dropping a stale entry");
+        defer lock.release(store);
+        var failure: cache.Failure = undefined;
+        cache.forget(store, &ws.cache, &ws.key, output, &failure) catch
+            return context.cache_failed(&failure);
+        return true;
+    }
+
+    /// The policy gate on a step that is about to run (a hit runs nothing and is not checked):
+    /// the base is judged like a run's tree, bound to the manifest the lock names.
+    pub fn check_base(
+        context: *Context,
+        reference: []const u8,
+        spec: *const key_mod.Spec,
+    ) Error!void {
+        assert(spec.name.len > 0);
+        const ws = context.ws;
+        const diag = context.diag;
+        if (!context.gate_loaded) {
+            trust_gate.load(context.host, &ws.gate, diag) catch return error.Failed;
+            context.gate_loaded = true;
+        }
+        if (!trust_gate.any_checks(&ws.gate)) return;
+        const entry = ws.locking.lock.entries[ws.locking.lock.find(reference).?];
+        var text: [constants.oci_digest_text_bytes + 129]u8 = undefined;
+        const shown = base_text(&text, reference, entry.manifest);
+        // A base derives nothing (M8 slice 14 cut): its labels are not in the base's record, so
+        // only a tree-only or manifest-bound statement can count for it.
+        const subject: trust_gate.Subject = .{
+            .tree = spec.base_tree,
+            .binding = .{ .manifest = entry.manifest.bytes },
+            .text = shown,
+            .step = spec.name,
+        };
+        const host = context.host;
+        trust_gate.judge_all(host, &ws.gate, &ws.signatures, &ws.record_work, subject, diag) catch
+            return error.Failed;
+    }
+
+    pub fn fork_worker(
+        context: *Context,
+        index: u8,
+        spec: *const key_mod.Spec,
+    ) Error!void {
+        const ws = context.ws;
+        const slot = for (&ws.slots) |*candidate| {
+            if (!candidate.active) break candidate;
+        } else unreachable; // The bound never exceeds the slots.
+        const host = context.host;
+        const pipe = host.pipe() catch |err| {
+            store_diagnose.worker_ended(context.diag, .{ .step = .{
+                .name = "pipe",
+                .err = err,
+                .errno = host.last_errno(),
+            } });
+            return error.Failed;
+        };
+        const run_request = context.request(spec);
+        var job: Job = .{
+            .request = &run_request,
+            .ws = &ws.step,
+            .write = pipe.write,
+            .host = host,
+        };
+        const pid = host.fork_child(false, worker_entry, &job) catch |err| {
+            host.close(pipe.read);
+            host.close(pipe.write);
+            store_diagnose.worker_ended(context.diag, .{ .step = .{
+                .name = "starting a build step's worker",
+                .err = err,
+                .errno = host.last_errno(),
+            } });
+            return error.Failed;
+        };
+        host.close(pipe.write);
+        ws.timings[index].start_ms = context.elapsed();
+        slot.* = .{
+            .active = true,
+            .index = index,
+            .pid = pid,
+            .report = pipe,
+            .key = ws.key,
+            .binds = undefined,
+            .binds_count = @intCast(spec.binds.len),
+        };
+        for (spec.binds, 0..) |bind, at| slot.binds[at] = bind.source;
+    }
+
+    /// Fails the build with E0808 when a SIGINT or SIGTERM arrived: the scheduler then aborts
+    /// the running steps, and every root this build made is removed on the way out. Called
+    /// before each step starts, after each import (the longest work done here) and around the
+    /// image's assembly; a wait sees the signal itself. A build that already failed keeps its
+    /// first diagnostic and stops all the same.
+    pub fn check_interrupt(context: *Context) Error!void {
+        const signal = context.host.interrupt_signal();
+        if (signal == 0) return;
+        if (context.diag.code == null) diagnose.build_interrupted(context.diag, signal);
+        assert(context.diag.code != null);
+        return error.Failed;
+    }
+
+    /// Waits for the first worker to end and settles its step.
+    pub fn wait(context: *Context) Error!schedule.Ended {
+        const ws = context.ws;
+        const host = context.host;
+        var pids: [constants.build_parallel_max]host_mod.Pid = undefined;
+        var which: [constants.build_parallel_max]u8 = undefined;
+        var count: u8 = 0;
+        for (&ws.slots, 0..) |*slot, at| {
+            if (!slot.active) continue;
+            pids[count] = slot.pid;
+            which[count] = @intCast(at);
+            count += 1;
+        }
+        assert(count > 0);
+        const reaped = host.wait_any(pids[0..count], 0) catch |err| {
+            if (err == error.Interrupted) try context.check_interrupt();
+            store_diagnose.worker_ended(context.diag, .{ .step = .{
+                .name = "waiting for a build step",
+                .err = err,
+                .errno = host.last_errno(),
+            } });
+            return error.Failed;
+        } orelse unreachable; // A wait with no time does not time out.
+        return context.settle(&ws.slots[which[reaped.index]], reaped.status);
+    }
+
+    /// Ends every worker still running: SIGKILL, reap, close its pipe. Best effort: a worker
+    /// that is already gone is not an error here.
+    pub fn abort_step(raw: *anyopaque) void {
+        const context: *Context = @ptrCast(@alignCast(raw));
+        const host = context.host;
+        var ended: u8 = 0;
+        for (&context.ws.slots) |*slot| {
+            if (!slot.active) continue;
+            host.signal(slot.pid, constants.signal_kill) catch {};
+            _ = host.wait_for(slot.pid) catch {};
+            host.close(slot.report.read);
+            context.drop(context.ws.step_inputs[slot.index]);
+            context.drop_binds(slot);
+            slot.active = false;
+            ended += 1;
+        }
+        assert(ended > 0);
+    }
+
+    /// Reads the answer of the worker that ended with `status`, and settles its step: the output
+    /// is recorded and its row written, or the step failed with a diagnostic.
+    pub fn settle(context: *Context, slot: *Slot, status: host_mod.ExitStatus) schedule.Ended {
+        const ws = context.ws;
+        const host = context.host;
+        assert(slot.active);
+        slot.active = false;
+        defer host.close(slot.report.read);
+        defer context.drop(ws.step_inputs[slot.index]);
+        defer context.drop_binds(slot);
+        var bytes: [failure_bytes_max]u8 = undefined;
+        var length: usize = 0;
+        while (length < bytes.len) {
+            const got = host.read_some(slot.report.read, bytes[length..]) catch break;
+            if (got == 0) break;
+            length += got;
+        }
+        // A second failure is told to nobody: the first diagnostic is the build's.
+        const outer = context.diag;
+        if (outer.code != null) {
+            ws.side_diag.reset();
+            context.diag = &ws.side_diag;
+        }
+        defer context.diag = outer;
+        const output = switch (decode_answer(status, bytes[0..length], context.diag)) {
+            .failed => return .{ .index = slot.index, .ok = false },
+            .output => |digest| digest,
+        };
+        ws.key = slot.key;
+        // An output refused for drift is not cached: a later `--locked` build runs the step
+        // again rather than hitting the refused output for ever.
+        if (context.pins.enforces()) {
+            _ = context.check_pin(slot.index, output) catch {
+                context.unroot(output);
+                return .{ .index = slot.index, .ok = false };
+            };
+        }
+        const kept = context.record(output) catch return .{ .index = slot.index, .ok = false };
+        ws.outputs[slot.index] = context.check_pin(slot.index, kept) catch {
+            return .{ .index = slot.index, .ok = false };
+        };
+        context.report(slot.index, false, kept) catch |err| {
+            context.row_failed = err;
+            return .{ .index = slot.index, .ok = false };
+        };
+        return .{ .index = slot.index, .ok = true };
+    }
+
+    /// The base's platform, tree and environment. A locked image gives all three. A `step:` base
+    /// gives the tree (the output of that step, which ran before this one) and takes the
+    /// platform and environment from the image its chain started from: config is inherited
+    /// field by field from there, not from a step's output.
+    fn resolve_base(context: *Context, index: u8, spec: *key_mod.Spec) Error!void {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const graph = &context.loaded.graph;
+        const start = graph_mod.chain_start(graph, index);
+        const entry = try context.load_base(file.text(file.steps[start].base), spec.name);
+        spec.platform = entry.platform_text();
+        spec.base_tree = if (graph.base_step[index]) |target| ws.outputs[target] else ws.image.tree;
+        const count = ws.image.settings.count(.env);
+        assert(count <= ws.base_env.len);
+        for (0..count) |word| ws.base_env[word] = ws.image.settings.word(.env, @intCast(word));
+        spec.base_env = ws.base_env[0..count];
+    }
+
+    /// Reads the locked base's image record into `ws.image`. An image the lock names and the
+    /// store lacks is pulled by the locked manifest digest; one the lock does not name is
+    /// refused (E0804), because a build never resolves a tag itself.
+    pub fn load_base(
+        context: *Context,
+        reference: []const u8,
+        name: ?[]const u8,
+    ) Error!*const lock_file.Entry {
+        const ws = context.ws;
+        const at = ws.locking.lock.find(reference) orelse {
+            diagnose.base_not_locked(context.diag, name, reference, false);
+            const file = &context.loaded.file;
+            if (graph_mod.step_named(file, reference) != null) {
+                diagnose.step_name_hint(context.diag, reference);
+            }
+            return error.Failed;
+        };
+        const entry = &ws.locking.lock.entries[at];
+        var errno: u16 = 0;
+        images.load(context.store, entry.manifest, &ws.image, &errno) catch |first| {
+            if (first != error.NotFound) return context.image_unreadable(errno);
+            try context.pull_locked(reference, name, entry);
+            images.load(context.store, entry.manifest, &ws.image, &errno) catch |err| {
+                if (err != error.NotFound) return context.image_unreadable(errno);
+                diagnose.base_not_locked(context.diag, name, reference, true);
+                return error.Failed;
+            };
+        };
+        return entry;
+    }
+
+    /// A lock entry that cannot be pulled by digest (its reference does not parse again).
+    fn stale_lock(context: *Context, name: ?[]const u8, reference: []const u8) Error {
+        diagnose.base_not_locked(context.diag, name, reference, true);
+        return error.Failed;
+    }
+
+    fn image_unreadable(context: *Context, errno: u16) Error {
+        const operation = "reading the base image's record";
+        const failed = error.IoFailed;
+        store_diagnose.write_failed(context.diag, context.store, operation, failed, errno);
+        return error.Failed;
+    }
+
+    /// Pulls the image the lock names by its manifest digest, for the lock's platform.
+    fn pull_locked(
+        context: *Context,
+        reference: []const u8,
+        name: ?[]const u8,
+        entry: *const lock_file.Entry,
+    ) Error!void {
+        const ws = context.ws;
+        reference_mod.parse(reference, &ws.pull.reference) catch
+            return context.stale_lock(name, reference);
+        var text: [constants.reference_bytes_max]u8 = undefined;
+        const by_digest = std.fmt.bufPrint(&text, "{s}/{s}@{s}", .{
+            ws.pull.reference.registry(),
+            ws.pull.reference.repository(),
+            &entry.manifest.text(),
+        }) catch return context.stale_lock(name, reference);
+        const mirrors = context.host.environment(
+            "ZBX_REGISTRY_MIRRORS",
+            constants.registry_mirrors_bytes_max,
+        );
+        const architecture = manifest.architecture_of_platform(entry.platform_text());
+        const pulling: pull_lib.Request = .{
+            .reference = by_digest,
+            .platform = .{ .architecture = architecture },
+            .mirrors = mirrors orelse "",
+        };
+        try context.say_pulling(by_digest);
+        var pulled: pull_lib.Result = undefined;
+        const import_ws = &ws.step.import;
+        const host = context.host;
+        const facts = context.facts;
+        const diag = context.diag;
+        pull_lib.pull(host, facts, &pulling, null, &ws.pull, import_ws, &pulled, diag) catch {
+            return error.Failed;
+        };
+        if (!pulled.manifest_digest.eql(entry.manifest)) {
+            const returned = pulled.manifest_digest.text();
+            const locked = entry.manifest.text();
+            diagnose.locked_manifest_mismatch(context.diag, reference, &returned, &locked);
+            return error.Failed;
+        }
+    }
+
+    /// `pulling <base>@<digest>`: a pull can take a while, and the report has no row for it. On
+    /// stderr under `--output json`, so stdout stays one record per line.
+    fn say_pulling(context: *Context, by_digest: []const u8) Error!void {
+        var line: [constants.reference_bytes_max + 16]u8 = undefined;
+        const format = "pulling {s}\n";
+        const text = std.fmt.bufPrint(&line, format, .{by_digest}) catch unreachable; // Fits.
+        if (!context.json) return context.emit(text);
+        context.host.write_all(.stderr, text) catch |err| {
+            errors.output_failed(context.diag, .stderr, err, context.host.last_errno());
+            return error.OutputFailed;
+        };
+    }
+
+    fn import_inputs(context: *Context, index: u8, entry: ?u32) Error!Digest {
+        const ws = context.ws;
+        const job: input_job.Request = .{
+            .host = context.host,
+            .facts = context.facts,
+            .store = context.store,
+            .loaded = context.loaded,
+            .step = index,
+            .entry = entry,
+            .ws = &ws.input,
+            .problem = &ws.input_problem,
+        };
+        return input_job.import(&job, context.diag) catch return error.Failed;
+    }
+
+    /// A copy step (`.copy`): the output is the base with each entry's selection laid over it,
+    /// made here, in this process, under one shared lock; no command runs. Each entry's
+    /// selection is in the key, so a file the patterns do not take never changes it.
+    fn begin_copy(context: *Context, index: u8, spec: *key_mod.Spec) Error!schedule.Begin {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const step = &file.steps[index];
+        ws.timings[index].start_ms = context.elapsed();
+        const entries = file.copy_entries(step);
+        assert(entries.len > 0);
+        assert(entries.len <= ws.copy_keys.len);
+        // Each selection is rooted by `copy_select` and dropped when this step is done with it.
+        var rooted: usize = 0;
+        defer for (ws.copy_keys[0..rooted]) |part| {
+            if (!part.source.eql(fetch_placeholder)) context.drop(part.source);
+        };
+        for (entries, 0..) |entry, at| {
+            if (entry.fetch) |fetch| {
+                // The step's input is the pinned SHA-256, on a hit and on a miss alike: the
+                // tree made from the blob exists only on a miss, and provenance must not
+                // depend on which it was.
+                if (at == 0) ws.step_inputs[index] = fetch_input(file.text(fetch.sha256));
+                ws.copy_keys[at] = context.fetch_key(@intCast(at), &entry, fetch);
+                rooted += 1;
+                continue;
+            }
+            const source = try context.copy_source(index, @intCast(at), &entry);
+            if (at == 0) ws.step_inputs[index] = source;
+            // A project source was rooted by its import; the selection is what the key keeps.
+            // A source that is also a selection made here keeps its root until the end.
+            defer if (entry.from == null and !context.is_selection(rooted, source)) {
+                context.unroot(source);
+            };
+            const selected = try context.copy_select(index, &entry, source);
+            ws.copy_keys[at] = .{
+                .source = selected,
+                .to = file.text(entry.to),
+                .chown = if (entry.chown) |text| file.text(text) else null,
+                .chmod = if (entry.chmod) |text| file.text(text) else null,
+            };
+            rooted += 1;
+            try context.check_interrupt(); // An entry's import and selection can take seconds.
+        }
+        spec.copies = ws.copy_keys[0..entries.len];
+        spec.root_output = true; // The output is the whole tree, as a root step's is.
+        key_mod.compute(spec, &ws.key) catch {
+            diagnose.step_env_refused(context.diag, spec.name, context.loaded.shown(), 0, "");
+            return error.Failed;
+        };
+        const store = context.store;
+        try store_diagnose.hold(context.diag, store, .shared, "build", "copying files");
+        defer lock.release(store);
+        var failure: cache.Failure = undefined;
+        const found = cache.lookup(store, &ws.cache, &ws.key, &failure) catch
+            return context.cache_failed(&failure);
+        var hit = true;
+        const output = switch (found) {
+            .hit => |existing| existing,
+            .miss => blk: {
+                hit = false;
+                break :blk try context.copy_miss(index, spec, entries);
+            },
+        };
+        context.unroot(output);
+        ws.outputs[index] = output;
+        try context.report(index, hit, output);
+        return .hit;
+    }
+
+    /// A copy step's miss, under the shared lock: its base checked, the fetched files and the
+    /// selections stamped, the tree assembled and recorded. The stamped trees are written under
+    /// this lock, so `store gc` cannot take them before the cache entry holds their output.
+    fn copy_miss(
+        context: *Context,
+        index: u8,
+        spec: *key_mod.Spec,
+        entries: []const file_mod.CopyEntry,
+    ) Error!Digest {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        assert(entries.len > 0);
+        assert(entries.len <= ws.copy_keys.len);
+        if (context.loaded.graph.base_step[index] == null) {
+            try context.check_base(file.text(file.steps[index].base), spec);
+        }
+        try context.download_entries(index, entries);
+        try context.fetch_selections(index, entries);
+        try context.copy_stamp(index, spec.base_tree, entries.len);
+        try context.check_interrupt(); // A restamp of a large selection takes seconds.
+        const made = try context.copy_assemble(spec.base_tree, entries.len);
+        var failure: cache.Failure = undefined;
+        return cache.record(context.store, &ws.cache, &ws.key, made, &failure) catch
+            return context.cache_failed(&failure);
+    }
+
+    /// The key part of fetch entry `at`: its hash and where the file lands, `.to` with the URL's
+    /// file name added when `.to` ends in `/` (Docker's remote `ADD`). Its tree is made only on a
+    /// miss (`fetch_selections`).
+    fn fetch_key(
+        context: *Context,
+        at: u32,
+        entry: *const file_mod.CopyEntry,
+        fetch: file_mod.Fetch,
+    ) key_mod.Copy {
+        const file = &context.loaded.file;
+        const sha256 = digest_sha.Sha256.from_hex(file.text(fetch.sha256)).?; // Checked at load.
+        const to = file.text(entry.to);
+        assert(to.len > 0);
+        var resolved: []const u8 = to;
+        if (to[to.len - 1] == '/') {
+            const name = file_mod.fetch_name(file.text(fetch.url)).?; // Checked at load.
+            const storage = &context.ws.fetch_tos[at];
+            // `fetch_tos` holds the longest `.to` and the longest URL, so the name fits.
+            resolved = std.fmt.bufPrint(storage, "{s}{s}", .{ to, name }) catch unreachable;
+        }
+        return .{
+            .source = fetch_placeholder,
+            .to = resolved,
+            .chown = if (entry.chown) |text| file.text(text) else null,
+            .chmod = if (entry.chmod) |text| file.text(text) else null,
+            .fetch = sha256.bytes,
+        };
+    }
+
+    /// On a miss, under the store's shared lock: each fetch entry's blob read into a one-file
+    /// tree (`fetch_tree`, in the store's namespace) and laid at its resolved `.to`. The
+    /// selection takes the placeholder's place in `copy_keys`, rooted and held as `copy_select`
+    /// holds a selection, so the step's drop removes it.
+    fn fetch_selections(
+        context: *Context,
+        index: u8,
+        entries: []const file_mod.CopyEntry,
+    ) Error!void {
+        const ws = context.ws;
+        assert(entries.len <= ws.copy_keys.len);
+        assert(ws.copy_keys[0].to.len > 0);
+        for (entries, 0..) |entry, at| {
+            if (entry.fetch == null) continue;
+            const part = &ws.copy_keys[at];
+            assert(part.source.eql(fetch_placeholder));
+            const job: input_job.Request = .{
+                .host = context.host,
+                .facts = context.facts,
+                .store = context.store,
+                .loaded = context.loaded,
+                .step = index,
+                .entry = @intCast(at),
+                .fetch = .{
+                    .sha256 = .{ .bytes = part.fetch.? },
+                    .name = fetch_tree.name_default,
+                },
+                .ws = &ws.input,
+                .problem = &ws.input_problem,
+            };
+            const tree = input_job.import(&job, context.diag) catch return error.Failed;
+            part.source = try context.fetch_select(index, tree, part.to);
+        }
+    }
+
+    /// The one file of a fetch's tree, laid at `to`. The caller holds the shared lock.
+    fn fetch_select(context: *Context, index: u8, tree: Digest, to: []const u8) Error!Digest {
+        const ws = context.ws;
+        const store = context.store;
+        assert(to.len > 1);
+        assert(to[to.len - 1] != '/');
+        const name = context.loaded.file.text(context.loaded.file.steps[index].name);
+        const assembling: assemble.Context = .{
+            .store = store,
+            .ws = &ws.copying.assemble,
+            .failure = &ws.assembly_failure,
+        };
+        ws.copy_patterns[0] = fetch_tree.name_default;
+        const picked = copy_mod.select(assembling, &ws.copying, tree, ws.copy_patterns[0..1], to);
+        // The import rooted the one-file tree; the selection is what the step keeps.
+        defer context.unroot(tree);
+        const selected = picked catch |err| {
+            switch (err) {
+                error.Failed => context.assembly_failed(name, to),
+                // One file, matched by its own name, laid at a path that names a file.
+                error.PoolFull, error.NoMatch, error.ManyToOne => unreachable,
+            }
+            return error.Failed;
+        };
+        if (!input_job.root_tree(store, selected, name, context.diag)) return error.Failed;
+        context.hold(selected);
+        return selected;
+    }
+
+    /// The tree entry `at` of step `index` takes from: the project's matched paths, imported, or
+    /// the output of the `step:` it names.
+    fn copy_source(
+        context: *Context,
+        index: u8,
+        at: u32,
+        entry: *const file_mod.CopyEntry,
+    ) Error!Digest {
+        const file = &context.loaded.file;
+        const from = entry.from orelse return context.import_inputs(index, at);
+        const name = file_mod.step_ref(file.text(from)) orelse unreachable; // Refused earlier.
+        const target = graph_mod.step_named(file, name) orelse unreachable; // The graph check.
+        assert(target < index);
+        return context.ws.outputs[target];
+    }
+
+    /// Whether `digest` is one of the first `count` selections of the copy step being begun.
+    fn is_selection(context: *const Context, count: usize, digest: Digest) bool {
+        for (context.ws.copy_keys[0..count]) |part| {
+            if (part.source.eql(digest)) return true;
+        }
+        return false;
+    }
+
+    fn copy_select(
+        context: *Context,
+        index: u8,
+        entry: *const file_mod.CopyEntry,
+        source: Digest,
+    ) Error!Digest {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const texts = file.texts(entry.src);
+        for (texts, 0..) |text, at| ws.copy_patterns[at] = file.text(text);
+        const store = context.store;
+        try store_diagnose.hold(context.diag, store, .shared, "build", "selecting files to copy");
+        defer lock.release(store);
+        const assembling: assemble.Context = .{
+            .store = store,
+            .ws = &ws.copying.assemble,
+            .failure = &ws.assembly_failure,
+        };
+        const patterns = ws.copy_patterns[0..texts.len];
+        const to = file.text(entry.to);
+        const name = file.text(file.steps[index].name);
+        const picked = copy_mod.select(assembling, &ws.copying, source, patterns, to);
+        const selected = picked catch |err| {
+            switch (err) {
+                error.PoolFull => {
+                    const failed = ws.copying.failed_pattern;
+                    diagnose.glob_pool_full(context.diag, patterns[failed]);
+                },
+                error.NoMatch => {
+                    const from = if (entry.from) |text| file.text(text) else "the project";
+                    diagnose.copy_nothing(context.diag, name, patterns[0], from);
+                },
+                error.ManyToOne => {
+                    const count = ws.copying.items_count;
+                    diagnose.copy_many_to_one(context.diag, name, to, count);
+                },
+                error.Failed => context.assembly_failed(name, to),
+            }
+            return error.Failed;
+        };
+        // Between this write and the cache entry the selection is nothing's output: a root keeps
+        // a `store gc` from taking it.
+        if (!input_job.root_tree(store, selected, name, context.diag)) return error.Failed;
+        context.hold(selected);
+        return selected;
+    }
+
+    /// Each bind of the step becomes the tree its `.source` selects in the output of the `step:`
+    /// it names, the whole output for `/`; the tree's digest is what the key holds, so a file
+    /// the source does not take never changes it. A bind from the project or an image never
+    /// gets here (`graph.unrunnable`). A selection is a plain tree of its own and mounts
+    /// read-only at `.to`.
+    pub fn resolve_binds(context: *Context, index: u8, spec: *key_mod.Spec) Error!void {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const step = &file.steps[index];
+        const binds = file.step_binds(step);
+        assert(binds.len <= ws.bind_keys.len);
+        for (binds, 0..) |found, at| {
+            const from = found.from orelse unreachable; // `unrunnable` refused a project bind.
+            const name = file_mod.step_ref(file.text(from)) orelse unreachable; // Same: an image.
+            const target = graph_mod.step_named(file, name) orelse unreachable; // The graph check.
+            assert(target != index);
+            const source = file.text(found.source);
+            const output = ws.outputs[target];
+            const text = file.text(from);
+            const selected = context.bind_select(index, output, source, text) catch |err| {
+                for (ws.bind_keys[0..at]) |done| context.drop(done.source);
+                return err;
+            };
+            ws.bind_keys[at] = .{ .to = file.text(found.to), .source = selected };
+        }
+        spec.binds = ws.bind_keys[0..binds.len];
+    }
+
+    fn bind_select(
+        context: *Context,
+        index: u8,
+        output: Digest,
+        source: []const u8,
+        from: []const u8,
+    ) Error!Digest {
+        const ws = context.ws;
+        const store = context.store;
+        try store_diagnose.hold(context.diag, store, .shared, "build", "selecting a bind's files");
+        defer lock.release(store);
+        const assembling: assemble.Context = .{
+            .store = store,
+            .ws = &ws.copying.assemble,
+            .failure = &ws.assembly_failure,
+        };
+        ws.copy_patterns[0] = source;
+        const patterns = ws.copy_patterns[0..1];
+        const name = context.loaded.file.text(context.loaded.file.steps[index].name);
+        const picked = copy_mod.select(assembling, &ws.copying, output, patterns, "/");
+        const selected = picked catch |err| {
+            switch (err) {
+                error.PoolFull => diagnose.glob_pool_full(context.diag, source),
+                error.NoMatch => diagnose.bind_nothing(context.diag, name, source, from),
+                error.Failed => context.assembly_failed(name, "/"),
+                error.ManyToOne => unreachable, // `to` is "/", which ends in `/`.
+            }
+            return error.Failed;
+        };
+        // The selection is nothing's output and no cache entry names it: until the worker has
+        // mounted it, a root is all that keeps a `store gc` from taking it (N8). The root is
+        // written before the shared lock is let go.
+        if (!input_job.root_tree(store, selected, name, context.diag)) return error.Failed;
+        context.hold(selected);
+        return selected;
+    }
+
+    fn assembly_failed(context: *Context, name: []const u8, to: []const u8) void {
+        const ws = context.ws;
+        const store = context.store;
+        switch (ws.assembly_failure) {
+            .io => |io| store_diagnose.write_failed(context.diag, store, io.step, io.err, io.errno),
+            .damaged => {
+                const operation = "reading a tree to copy";
+                store_diagnose.write_failed(context.diag, store, operation, error.IoFailed, 0);
+            },
+            else => diagnose.copy_refused(context.diag, &ws.assembly_failure, name, to),
+        }
+    }
+
+    /// The base with every entry's selection laid over it (a later file replaces an earlier one).
+    fn copy_assemble(context: *Context, base: Digest, count: usize) Error!Digest {
+        const ws = context.ws;
+        const merging: assemble.Context = .{
+            .store = context.store,
+            .ws = &ws.assembly,
+            .failure = &ws.assembly_failure,
+            .replace = true,
+        };
+        var tree = base;
+        for (ws.copy_keys[0..count], ws.copy_stamped[0..count]) |part, stamped| {
+            tree = assemble.merge(merging, tree, stamped) catch {
+                context.assembly_failed("copy", part.to);
+                return error.Failed;
+            };
+        }
+        return tree;
+    }
+
+    /// Each entry's selection with its `.chown` and `.chmod` applied (`copy_job`), in
+    /// `ws.copy_stamped`. A `.chown` name is looked up in the step's base, as `.user` is.
+    fn copy_stamp(context: *Context, index: u8, base: Digest, count: usize) Error!void {
+        const ws = context.ws;
+        const name = context.loaded.file.text(context.loaded.file.steps[index].name);
+        for (ws.copy_keys[0..count], 0..) |part, at| {
+            ws.copy_selections[at] = part.source;
+            ws.copy_tos[at] = part.to;
+            ws.copy_stamps[at] = .{};
+            if (part.chmod) |text| ws.copy_stamps[at].mode = copy_owner.mode_of(text);
+            ws.copy_chowns[at] = part.chown;
+            const text = part.chown orelse continue;
+            const found = image_user.resolve(context.store, &ws.user_ws, base, text, context.diag);
+            const resolved = found catch {
+                context.diag.reset();
+                const refusal: diagnose.OwnerRefusal = if (ws.user_ws.too_large) |file|
+                    .{ .too_large = file }
+                else
+                    .missing;
+                diagnose.copy_owner_not_found(context.diag, name, text, refusal);
+                return error.Failed;
+            };
+            var owner: copy_owner.Owner = .{ .uid = resolved.user.uid, .gid = resolved.user.gid };
+            // BuildKit: a uid alone, as a number, is its own group, whatever passwd says.
+            if (copy_owner.uid_alone(text)) owner.gid = owner.uid;
+            if (owner.uid == copy_owner.id_unowned or owner.gid == copy_owner.id_unowned) {
+                diagnose.copy_owner_not_found(context.diag, name, text, .unowned);
+                return error.Failed;
+            }
+            ws.copy_stamps[at].owner = owner;
+        }
+        const job: copy_job.Request = .{
+            .host = context.host,
+            .facts = context.facts,
+            .store = context.store,
+            .name = name,
+            .selections = ws.copy_selections[0..count],
+            .tos = ws.copy_tos[0..count],
+            .chowns = ws.copy_chowns[0..count],
+            .stamps = ws.copy_stamps[0..count],
+            .ws = &ws.copy_owner,
+            .stamped = ws.copy_stamped[0..count],
+        };
+        copy_job.restamp(&job, context.diag) catch return error.Failed;
+    }
+
+    /// Writes the entry under the shared lock, and returns the tree it names.
+    fn record(context: *Context, output: Digest) Error!Digest {
+        const store = context.store;
+        try store_diagnose.hold(context.diag, store, .shared, "build", "recording a build step");
+        defer lock.release(store);
+        var failure: cache.Failure = undefined;
+        const ws = context.ws;
+        const kept = cache.record(store, &ws.cache, &ws.key, output, &failure) catch {
+            return context.cache_failed(&failure);
+        };
+        context.unroot(output);
+        return kept;
+    }
+
+    /// The entry roots the output now: drops the root the step's import left (N8), for a tree
+    /// this step never counted (an output, a project source a copy step imported). A tree some
+    /// step holds (`hold`) keeps its root: its last holder drops it (`drop`).
+    fn unroot(context: *Context, output: Digest) void {
+        if (context.held(output)) return;
+        context.remove_root(output);
+    }
+
+    /// Only a root this build made goes: its source starts with `build:` and it was written at
+    /// or after the build's start; a root the user made earlier (the import left it as it was)
+    /// stays. A failure to drop it is no failure of the build: the next `store gc` shows the
+    /// root and the user may remove it.
+    fn remove_root(context: *Context, digest: Digest) void {
+        const store = context.store;
+        var root: roots.Root = undefined;
+        var errno: u16 = 0;
+        roots.load(store, digest, &root, &errno) catch return;
+        if (!std.mem.startsWith(u8, root.source_text(), step_mod.output_root_prefix)) return;
+        if (root.time < context.started_s) return;
+        roots.remove(store, digest) catch {};
+    }
+
+    /// Counts one more user of a tree this build has rooted (or found rooted).
+    fn hold(context: *Context, digest: Digest) void {
+        const ws = context.ws;
+        assert(ws.holds_count <= ws.holds.len);
+        for (ws.holds[0..ws.holds_count]) |*entry| {
+            if (!entry.digest.eql(digest)) continue;
+            assert(entry.users > 0);
+            entry.users += 1;
+            return;
+        }
+        // The bound is the most trees a build has in use at once (constants.zig).
+        assert(ws.holds_count < ws.holds.len);
+        ws.holds[ws.holds_count] = .{ .digest = digest, .users = 1 };
+        ws.holds_count += 1;
+    }
+
+    /// Whether some step holds the tree.
+    fn held(context: *const Context, digest: Digest) bool {
+        const ws = context.ws;
+        assert(ws.holds_count <= ws.holds.len);
+        for (ws.holds[0..ws.holds_count]) |entry| {
+            if (entry.digest.eql(digest)) return true;
+        }
+        return false;
+    }
+
+    /// One holder of the tree is done with it: the callers are those that counted it (`hold`).
+    /// The root goes with the last holder; a tree nobody holds (a slot a test made) is dropped
+    /// as `unroot` drops one.
+    fn drop(context: *Context, digest: Digest) void {
+        const ws = context.ws;
+        assert(ws.holds_count <= ws.holds.len);
+        for (ws.holds[0..ws.holds_count], 0..) |*entry, at| {
+            if (!entry.digest.eql(digest)) continue;
+            assert(entry.users > 0);
+            entry.users -= 1;
+            if (entry.users > 0) return;
+            ws.holds_count -= 1;
+            ws.holds[at] = ws.holds[ws.holds_count];
+            context.remove_root(digest);
+            return;
+        }
+        context.remove_root(digest);
+    }
+
+    fn drop_binds(context: *Context, slot: *const Slot) void {
+        assert(slot.binds_count <= slot.binds.len);
+        for (slot.binds[0..slot.binds_count]) |digest| context.drop(digest);
+    }
+
+    fn cache_failed(context: *Context, failure: *const cache.Failure) Error {
+        const operation = "reading the build cache";
+        switch (failure.*) {
+            .io => |io| {
+                store_diagnose.write_failed(context.diag, context.store, io.step, io.err, io.errno);
+            },
+            .tree => store_diagnose.write_failed(
+                context.diag,
+                context.store,
+                operation,
+                error.IoFailed,
+                0,
+            ),
+        }
+        return error.Failed;
+    }
+    fn elapsed(context: *const Context) u64 {
+        const now = context.host.monotonic_ms();
+        assert(now >= context.started_ms);
+        return now - context.started_ms;
+    }
+
+    /// `build: <file>, <n> steps` (the steps and the image), in text mode only.
+    fn header(context: *Context) Error!void {
+        if (context.json) return;
+        const file = &context.loaded.file;
+        const line = std.fmt.bufPrint(&context.ws.row, "build: {s}, {d} steps\n", .{
+            context.loaded.shown(), file.steps_count + 1,
+        }) catch unreachable; // `row_bytes` holds a shown path and a count.
+        return context.emit(line);
+    }
+
+    /// On a miss, under the shared lock: each fetch entry's blob downloaded if the store lacks
+    /// it, and checked against its `.sha256` (`fetch.zig`). A hit never gets here, so a warm
+    /// store builds with no network even when a blob has gone, and `store gc`, which takes the
+    /// lock whole, cannot remove a blob before the cache entry holds the output made from it.
+    fn download_entries(
+        context: *Context,
+        index: u8,
+        entries: []const file_mod.CopyEntry,
+    ) Error!void {
+        const file = &context.loaded.file;
+        const store = context.store;
+        const fetcher = &context.ws.fetcher;
+        const blobs: blobs_mod.Blobs = .{ .fs = store.fs, .root = store.root_text() };
+        assert(blobs.root.len > 1);
+        assert(entries.len > 0);
+        const interrupt: fetch_mod.Interrupt = .{ .context = context, .signal = interrupt_of };
+        for (entries) |entry| {
+            const fetch = entry.fetch orelse continue;
+            const sha256 = digest_sha.Sha256.from_hex(file.text(fetch.sha256)).?; // Load.
+            fetcher.init(blobs, context.host.network(), interrupt);
+            // A name of this process's own: two builds fetching one pin never share a file.
+            var partial: PathBuf = undefined;
+            const partial_text = store.tmp_path(&partial);
+            const url = file.text(fetch.url);
+            _ = fetcher.fetch(url, sha256, partial_text) catch {
+                context.fetch_failed(file.text(file.steps[index].name), url, sha256);
+                return error.Failed;
+            };
+            try context.check_interrupt();
+        }
+    }
+
+    fn interrupt_of(pointer: *anyopaque) u8 {
+        const context: *Context = @ptrCast(@alignCast(pointer));
+        assert(@intFromPtr(context.ws) != 0);
+        const signal = context.host.interrupt_signal();
+        assert(signal <= 64); // A Linux signal number.
+        return signal;
+    }
+
+    /// The diagnostic for `ws.fetcher.reason`: a cache write is E0416/E0417 as a pull's is, a
+    /// hash that differs E0821, anything else E0820.
+    fn fetch_failed(
+        context: *Context,
+        step: []const u8,
+        url: []const u8,
+        expected: digest_sha.Sha256,
+    ) void {
+        const diag = context.diag;
+        assert(diag.code == null);
+        assert(url.len > 0);
+        switch (context.ws.fetcher.reason) {
+            .io => |*failure| registry_diagnose.cache_failed(
+                diag,
+                context.store.root_text(),
+                failure,
+            ),
+            .interrupted => |signal| diagnose.build_interrupted(diag, signal),
+            .mismatch => |received| {
+                const expected_hex = expected.hex();
+                const received_hex = received.hex();
+                diagnose.fetch_mismatch(diag, step, url, &expected_hex, &received_hex);
+            },
+            else => |reason| diagnose.fetch_failed(diag, step, url, reason),
+        }
+    }
+
+    /// Sets the step's output excludes in `spec` (`pin.excludes`) and returns its lock pin.
+    /// Every step's want starts as none; `judge_pin` sets it once the key is known.
+    fn output_excludes(context: *Context, index: u8, spec: *key_mod.Spec) ?*const lock_file.Pin {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const step = &file.steps[index];
+        ws.wants[index] = .none;
+        const lock_pin = pin_mod.lock_pin(&ws.locking.lock, context.loaded.shown(), file, step);
+        const keyed = pin_mod.keyed(step, lock_pin != null, context.pins);
+        spec.output_exclude = pin_mod.excludes(file, step, keyed, &ws.output_paths);
+        assert(keyed == (spec.output_exclude != null));
+        return lock_pin;
+    }
+
+    /// What the step's output is checked against, now that `ws.key` is its key; a stale lock
+    /// pin under `--locked` or `--hermetic` is E0822.
+    pub fn judge_pin(context: *Context, index: u8, lock_pin: ?*const lock_file.Pin) Error!void {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const step = &file.steps[index];
+        assert(ws.wants[index] == .none);
+        const expect: ?Digest = if (step.expect) |text|
+            Digest.parse(file.text(text)) orelse unreachable // The parser checked it.
+        else
+            null;
+        switch (pin_mod.judge(step, expect, lock_pin, ws.key.digest, context.pins)) {
+            .want => |want| ws.wants[index] = want,
+            .stale => |pinned_key| {
+                diagnose.pin_stale(context.diag, file.text(step.name), pinned_key, ws.key.digest);
+                return error.Failed;
+            },
+        }
+    }
+
+    /// The output a step's dependents are keyed by: its pin when it matches. Drift is E0822
+    /// under `--locked` or `--hermetic` (no dependent runs), else W0803 and the new output.
+    fn check_pin(context: *Context, index: u8, output: Digest) Error!Digest {
+        const pinned = switch (context.ws.wants[index]) {
+            .none, .pinning => return output,
+            .expect => |digest| digest,
+        };
+        if (pinned.eql(output)) return pinned;
+        const name = context.loaded.file.text(context.loaded.file.steps[index].name);
+        if (context.pins.enforces()) {
+            diagnose.pin_drifted(context.diag, true, name, pinned, output);
+            return error.Failed;
+        }
+        var warning: Diag = undefined;
+        warning.reset();
+        diagnose.pin_drifted(&warning, false, name, pinned, output);
+        context.write_warning(&warning);
+        assert(!pinned.eql(output));
+        return output;
+    }
+
+    /// `--hermetic`: E0814 for the first step with a cache mount or an unpinned network step,
+    /// before any step runs.
+    pub fn check_hermetic(context: *Context) Error!void {
+        assert(context.pins == .hermetic);
+        const loaded = context.loaded;
+        const lock_held = &context.ws.locking.lock;
+        const shown = loaded.shown();
+        const found = pin_mod.hermetic_refusal(lock_held, shown, &loaded.file) orelse return;
+        const name = loaded.file.text(loaded.file.steps[found.index].name);
+        diagnose.hermetic_step(context.diag, name, found.cache);
+        return error.Failed;
+    }
+
+    /// `--pin`: records the steps being pinned, with their keys and outputs, and writes the
+    /// lock once, atomically. Nothing to pin leaves the lock as it is.
+    pub fn save_pins(context: *Context) Error!void {
+        assert(context.pins == .pin);
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const locking = &ws.locking;
+        var count: u32 = 0;
+        var failure: lock_file.Failure = undefined;
+        for (0..file.steps_count) |index| {
+            if (ws.wants[index] != .pinning) continue;
+            const name = file.text(file.steps[index].name);
+            const key = ws.timings[index].key;
+            locking.lock.put_pin(context.loaded.shown(), name, key, ws.outputs[index]) catch {
+                image_diagnose.lock_failure(context.diag, locking.located.text(), .full);
+                return error.Failed;
+            };
+            count += 1;
+        }
+        if (count == 0) return;
+        lock_file.save(context.host, context.host.filesystem(), locking, &failure) catch {
+            image_diagnose.lock_failure(context.diag, locking.located.text(), failure);
+            return error.Failed;
+        };
+    }
+
+    /// `W0801` once, on stderr, before any step runs, when the build file has steps with
+    /// `network = true`. Only a warning: a stderr that cannot be written loses it and the build
+    /// goes on.
+    pub fn warn_network(context: *Context) void {
+        const file = &context.loaded.file;
+        var names: [constants.build_steps_max][]const u8 = undefined;
+        var count: u32 = 0;
+        for (file.steps_slice()) |*step| {
+            if (!step.network) continue;
+            names[count] = file.text(step.name);
+            count += 1;
+        }
+        if (count == 0) return;
+        comptime assert(constants.diag_field_bytes_max >= diagnose.network_label.len + 8);
+        var joined: [constants.diag_field_bytes_max - diagnose.network_label.len]u8 = undefined;
+        var warning: Diag = undefined;
+        warning.reset();
+        diagnose.network_steps(&warning, diagnose.network_names(&joined, names[0..count]), count);
+        context.write_warning(&warning);
+    }
+
+    /// `W0802` once, on stderr, after `W0801`, when the build file has steps with `.caches`.
+    pub fn warn_caches(context: *Context) void {
+        const file = &context.loaded.file;
+        var names: [constants.build_steps_max][]const u8 = undefined;
+        var count: u32 = 0;
+        for (file.steps_slice()) |*step| {
+            if (step.caches.count == 0) continue;
+            names[count] = file.text(step.name);
+            count += 1;
+        }
+        if (count == 0) return;
+        comptime assert(constants.diag_field_bytes_max >= diagnose.cache_label.len + 8);
+        var joined: [constants.diag_field_bytes_max - diagnose.cache_label.len]u8 = undefined;
+        var warning: Diag = undefined;
+        warning.reset();
+        diagnose.cache_steps(&warning, diagnose.network_names(&joined, names[0..count]), count);
+        context.write_warning(&warning);
+    }
+
+    /// `warning` on stderr in the build's output mode; a stderr that cannot be written loses it.
+    fn write_warning(context: *Context, warning: *const Diag) void {
+        const mode: render.Mode = if (context.json)
+            .json
+        else if (context.verbose)
+            .verbose
+        else
+            .text;
+        const color = mode != .json and context.host.color_enabled(.stderr);
+        var buffer: [constants.output_bytes_max]u8 = undefined;
+        const text = render.render(warning, mode, color, &buffer);
+        context.host.write_all(.stderr, text) catch return;
+    }
+
+    fn emit(context: *Context, line: []const u8) Error!void {
+        context.host.write_all(.stdout, line) catch |err| {
+            errors.output_failed(context.diag, .stdout, err, context.host.last_errno());
+            return error.OutputFailed;
+        };
+    }
+
+    /// Tells that step `index` (or the image, `image_slot`) ended: a row, or a `zbx.build/1`
+    /// line. A hit starts and ends when it is found.
+    fn report(context: *Context, index: u32, hit: bool, output: Digest) Error!void {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        assert(index <= image_slot);
+        if (index != image_slot) assert(index < file.steps_count);
+        const timing = &ws.timings[index];
+        timing.end_ms = context.elapsed();
+        if (hit) timing.start_ms = timing.end_ms;
+        timing.hit = hit;
+        timing.output = output;
+        timing.key = ws.key.digest;
+        const name = if (index == image_slot) "image" else file.text(file.steps[index].name);
+        timing.network = index != image_slot and file.steps[index].network;
+        timing.caches = index != image_slot and file.steps[index].caches.count > 0;
+        if (hit) context.hits += 1 else context.misses += 1;
+        var writer = std.Io.Writer.fixed(&ws.row);
+        const word = if (hit) "hit" else "miss";
+        if (context.json) {
+            writer.print("{{\"schema\":\"zbx.build/1\",\"step\":\"{s}\",\"cache\":\"{s}\"," ++
+                "\"key\":\"{s}\",\"output\":\"{s}\",\"start_ms\":{d},\"end_ms\":{d}," ++
+                "\"network\":{s}{s}}}\n", .{
+                name,
+                word,
+                &timing.key.text(),
+                &output.text(),
+                timing.start_ms,
+                timing.end_ms,
+                if (timing.network) "true" else "false",
+                // Only a step with caches has the member: a line without it is unchanged.
+                if (timing.caches) ",\"caches\":true" else "",
+            }) catch unreachable; // `row_bytes` holds the longest record.
+        } else {
+            const took = timing.end_ms - timing.start_ms;
+            writer.print("  {s}", .{name}) catch unreachable; // Fits `row_bytes`.
+            writer.splatByteAll(' ', context.name_width - name.len) catch unreachable; // Fits.
+            writer.print("{s}{s: <4}{s}{d}.{d:0>2} s", .{
+                name_gap, word, name_gap, took / 1000, took % 1000 / 10,
+            }) catch unreachable; // Fits.
+            if (timing.network) writer.print("{s}net", .{name_gap}) catch unreachable; // Fits.
+            if (timing.caches) writer.print("{s}cache", .{name_gap}) catch unreachable; // Fits.
+            writer.writeByte('\n') catch unreachable; // Fits.
+        }
+        return context.emit(writer.buffered());
+    }
+
+    /// The image step: the base, the adds and the config become the image tree and the build
+    /// record. Runs after every step has an output, in this process, under one shared lock so
+    /// that a gc cannot take the trees assembled before the cache entry roots them.
+    pub fn build_image(context: *Context) Error!void {
+        // Every step is done; a signal that came meanwhile stops the build before its image.
+        try context.check_interrupt();
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        ws.timings[image_slot].start_ms = context.elapsed();
+        var base_tree: ?Digest = null;
+        var base: *const images.Settings = &ws.empty_settings;
+        ws.empty_settings.clear();
+        if (context.loaded.graph.image_base) |target| {
+            // The result starts from a step's output and inherits the config of the image the
+            // chain of `step:` bases began with.
+            const start = graph_mod.chain_start(&context.loaded.graph, target);
+            _ = try context.load_base(file.text(file.steps[start].base), null);
+            base_tree = ws.outputs[target];
+            base = &ws.image.settings;
+        } else if (file.image.base) |text| {
+            _ = try context.load_base(file.text(text), null);
+            base_tree = ws.image.tree;
+            base = &ws.image.settings;
+        }
+        if (result_mod.resolve(base, file, &ws.record.config)) |refusal| {
+            diagnose.config_too_large(context.diag, refusal);
+            return error.Failed;
+        }
+        const adds = try context.fill_adds();
+        ws.record.tree = std.mem.zeroes(Digest);
+        var overflowed: result_mod.Refusal = undefined;
+        const encoded = result_mod.encode_field(&ws.record, &ws.record_bytes, &overflowed);
+        const config_bytes = encoded catch {
+            diagnose.config_too_large(context.diag, overflowed);
+            return error.Failed;
+        };
+        const spec: key_mod.ImageSpec = .{
+            .base_tree = base_tree orelse std.mem.zeroes(Digest),
+            .adds = ws.image_adds[0..adds.len],
+            .config = Digest.of(config_bytes),
+        };
+        key_mod.compute_image(&spec, &ws.key) catch unreachable; // Adds and paths are bounded.
+        const store = context.store;
+        try store_diagnose.hold(context.diag, store, .shared, "build", "assembling the image");
+        defer lock.release(store);
+        var hit = true;
+        var failure: cache.Failure = undefined;
+        const found = cache.lookup(store, &ws.cache, &ws.key, &failure) catch
+            return context.cache_failed(&failure);
+        const tree = switch (found) {
+            .hit => |existing| existing,
+            .miss => blk: {
+                hit = false;
+                const made = try context.assemble_image(base_tree, adds);
+                break :blk cache.record(store, &ws.cache, &ws.key, made, &failure) catch
+                    return context.cache_failed(&failure);
+            },
+        };
+        ws.record.tree = tree;
+        // Assembly can take seconds: a signal during it means no result is saved, and the
+        // build does not exit 0. The assembled tree is in the cache, as a finished step's is.
+        try context.check_interrupt();
+        try context.numeric_user();
+        var saved: result_mod.Failure = undefined;
+        const digest = result_mod.save(store, &ws.record, &ws.record_bytes, &saved) catch {
+            const err = saved.err;
+            store_diagnose.write_failed(context.diag, store, saved.step, err, saved.errno);
+            return error.Failed;
+        };
+        try context.write_provenance(tree, digest);
+        try context.report(image_slot, hit, tree);
+        try context.footer(digest);
+    }
+
+    /// A `config.user` written as a name becomes its `uid:gid`, looked up in the result's tree: the
+    /// record holds numbers only. The key had the name, so a changed passwd in the tree is a new
+    /// result only through the tree.
+    pub fn numeric_user(context: *Context) Error!void {
+        const ws = context.ws;
+        const settings = &ws.record.config.settings;
+        const text = settings.get(.user);
+        if (text.len == 0) return;
+        if (file_mod.is_numeric_user(text)) return;
+        const tree = ws.record.tree;
+        const store = context.store;
+        const found = image_user.resolve(store, &ws.user_ws, tree, text, context.diag) catch {
+            context.diag.reset();
+            // The name may come from the base image's config, which the file never wrote.
+            const set_here = context.loaded.file.image.config.user != null;
+            const where = if (set_here) ".image .config" else "the base image's config";
+            diagnose.user_not_found(context.diag, where, text, ws.user_ws.too_large);
+            return error.Failed;
+        };
+        var buffer: [24]u8 = undefined;
+        const numbers = std.fmt.bufPrint(&buffer, "{d}:{d}", .{
+            found.user.uid, found.user.gid,
+        }) catch unreachable; // Two 32-bit numbers and a colon.
+        // The settings store only grows: the name stays in it beside the numbers, so a base
+        // image whose config fills the budget refuses here, as the same field does when composed.
+        if (settings.set(.user, numbers) == null) {
+            diagnose.config_too_large(context.diag, .user);
+            return error.Failed;
+        }
+    }
+
+    /// The provenance record of the result just saved (the store lock is held).
+    fn write_provenance(context: *Context, tree: Digest, result: Digest) Error!void {
+        const ws = context.ws;
+        const count = context.loaded.file.steps_count;
+        for (ws.timings[0..count], 0..) |timing, index| ws.step_keys[index] = timing.key;
+        const asked: provenance_job.Request = .{
+            .host = context.host,
+            .store = context.store,
+            .loaded = context.loaded,
+            .locking = &ws.locking,
+            .keys = ws.step_keys[0..count],
+            .inputs = ws.step_inputs[0..count],
+            .outputs = ws.outputs[0..count],
+            .image_key = ws.key.digest,
+            .tree = tree,
+            .result = result,
+            .started = context.started_s,
+            .records_max = context.records_max,
+        };
+        const outcome = provenance_job.write(&asked, &ws.provenance, context.diag) catch {
+            return error.Failed;
+        };
+        if (outcome == .written) return;
+        // The result is built and usable; only its provenance record is missing, so a run under
+        // `require_provenance` will be refused until room is made.
+        var warning: Diag = undefined;
+        warning.reset();
+        diagnose.provenance_store_full(&warning);
+        context.write_warning(&warning);
+    }
+
+    /// The adds as the assembly and the key take them: each source is its step's output.
+    fn fill_adds(context: *Context) Error![]const assemble.Add {
+        const ws = context.ws;
+        const file = &context.loaded.file;
+        const given = file.adds_slice();
+        assert(given.len <= ws.adds.len);
+        for (given, 0..) |add, at| {
+            const from = file.text(add.from);
+            const source = for (file.steps_slice(), 0..) |step, index| {
+                if (std.mem.eql(u8, file.text(step.name), from)) break ws.outputs[index];
+            } else unreachable; // The graph check refused an add from no step.
+            ws.adds[at] = .{ .source = source, .to = file.text(add.to) };
+            ws.image_adds[at] = .{ .source = source, .to = file.text(add.to) };
+        }
+        return ws.adds[0..given.len];
+    }
+
+    fn assemble_image(
+        context: *Context,
+        base: ?Digest,
+        adds: []const assemble.Add,
+    ) Error!Digest {
+        const ws = context.ws;
+        const assembling: assemble.Context = .{
+            .store = context.store,
+            .ws = &ws.assembly,
+            .failure = &ws.assembly_failure,
+        };
+        return assemble.assemble(assembling, base, adds) catch {
+            const store = context.store;
+            switch (ws.assembly_failure) {
+                .io => |io| {
+                    store_diagnose.write_failed(context.diag, store, io.step, io.err, io.errno);
+                },
+                .damaged => {
+                    const operation = "reading an image tree";
+                    store_diagnose.write_failed(context.diag, store, operation, error.IoFailed, 0);
+                },
+                else => {
+                    const file = &context.loaded.file;
+                    const failed = ws.assembly.failed_add;
+                    const add = file.adds_slice()[failed];
+                    var earlier: ?diagnose.AddText = null;
+                    if (ws.assembly_failure == .conflict) {
+                        const conflict = &ws.assembly_failure.conflict;
+                        const path = conflict.path[0..conflict.path_len];
+                        const found = assemble.earlier_source(assembling, adds, failed, path);
+                        if (found) |at| {
+                            const before = file.adds_slice()[at];
+                            earlier = .{
+                                .from = file.text(before.from),
+                                .to = file.text(before.to),
+                            };
+                        }
+                    }
+                    diagnose.assembly_refused(
+                        context.diag,
+                        &ws.assembly_failure,
+                        failed,
+                        file.text(add.from),
+                        file.text(add.to),
+                        earlier,
+                    );
+                },
+            }
+            return error.Failed;
+        };
+    }
+
+    /// `built <result digest> (<hits> hits, <misses> misses, <s> s)`, or the `build_result` line.
+    fn footer(context: *Context, digest: Digest) Error!void {
+        const total = context.elapsed();
+        var writer = std.Io.Writer.fixed(&context.ws.row);
+        if (context.json) {
+            writer.print("{{\"schema\":\"zbx.build/1\",\"build_result\":{{\"digest\":\"{s}\"," ++
+                "\"hits\":{d},\"misses\":{d},\"elapsed_ms\":{d}}}}}\n", .{
+                &digest.text(), context.hits, context.misses, total,
+            }) catch unreachable; // `row_bytes` holds it.
+        } else {
+            var hits: [16]u8 = undefined;
+            var misses: [16]u8 = undefined;
+            writer.print("built {s}  ({s}, {s}, {d}.{d} s)\n", .{
+                &digest.text(),
+                count_text(&hits, context.hits, "hit", "hits"),
+                count_text(&misses, context.misses, "miss", "misses"),
+                total / 1000,
+                total % 1000 / 100,
+            }) catch unreachable; // `row_bytes` holds it.
+        }
+        return context.emit(writer.buffered());
+    }
+};
+
+/// `1 hit`, `2 hits`: the count and its noun, the singular only for one.
+fn count_text(buffer: *[16]u8, count: u32, one: []const u8, many: []const u8) []const u8 {
+    assert(one.len < many.len);
+    const word = if (count == 1) one else many;
+    return std.fmt.bufPrint(buffer, "{d} {s}", .{ count, word }) catch unreachable; // Fits.
+}
+
+test "the footer counts say hit once and hits otherwise" {
+    // Goal: the grammar of the footer's counts. Method: 0, 1 and 2 of each noun.
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("0 hits", count_text(&buffer, 0, "hit", "hits"));
+    try std.testing.expectEqualStrings("1 hit", count_text(&buffer, 1, "hit", "hits"));
+    try std.testing.expectEqualStrings("2 hits", count_text(&buffer, 2, "hit", "hits"));
+    try std.testing.expectEqualStrings("1 miss", count_text(&buffer, 1, "miss", "misses"));
+    try std.testing.expectEqualStrings("2 misses", count_text(&buffer, 2, "miss", "misses"));
+    try std.testing.expectEqualStrings("0 misses", count_text(&buffer, 0, "miss", "misses"));
+}
+
+fn fill_lists(
+    file: *const file_mod.BuildFile,
+    step: *const file_mod.Step,
+    ws: *Workspace,
+    spec: *key_mod.Spec,
+) void {
+    for (step.run.slice(), 0..) |word, at| ws.argv[at] = file.text(word);
+    for (step.env.slice(), 0..) |word, at| ws.env[at] = file.text(word);
+    spec.argv = ws.argv[0..step.run.count];
+    spec.env = ws.env[0..step.env.count];
+    for (file.step_caches(step), 0..) |wanted, at| {
+        ws.cache_mounts[at] = .{
+            .id = file.text(wanted.id),
+            .path = file.text(wanted.path),
+            .ro = wanted.ro,
+            // A mode was checked by the parser (`is_mode`): octal digits.
+            .mode = if (wanted.mode) |text|
+                std.fmt.parseInt(u16, file.text(text), 8) catch null
+            else
+                null,
+            .uid = wanted.uid,
+            .gid = wanted.gid,
+        };
+    }
+    spec.caches = ws.cache_mounts[0..step.caches.count];
+}
+
+fn fill_needs(loaded: *const load_mod.Workspace, index: u8, ws: *Workspace) []const key_mod.Need {
+    const file = &loaded.file;
+    const wanted = loaded.graph.needs_slice(file, index);
+    for (wanted, 0..) |need, at| {
+        ws.needs[at] = .{ .name = file.text(file.steps[need].name), .output = ws.outputs[need] };
+    }
+    return ws.needs[0..wanted.len];
+}
+
+comptime {
+    assert(row_bytes > 2 * constants.store_digest_text_bytes + constants.build_step_name_bytes_max +
+        200);
+    assert(answer_bytes == 1 + constants.store_digest_bytes);
+}
+
+/// What `zbx sign` takes for a base: the reference's name and the manifest the lock names,
+/// `alpine@sha256:<hex>`. A name too long for `out` is cut (the digest is what is signed).
+fn base_text(out: []u8, reference: []const u8, manifest_digest: digest_sha.Sha256) []const u8 {
+    assert(out.len >= constants.oci_digest_text_bytes + 1);
+    var name = reference;
+    if (std.mem.indexOfScalar(u8, name, '@')) |at| name = name[0..at];
+    const slash = std.mem.lastIndexOfScalar(u8, name, '/') orelse 0;
+    if (std.mem.indexOfScalarPos(u8, name, slash, ':')) |colon| name = name[0..colon];
+    const room = out.len - constants.oci_digest_text_bytes - 1;
+    name = name[0..@min(name.len, room)];
+    const digest = manifest_digest.text();
+    return std.fmt.bufPrint(out, "{s}@{s}", .{ name, &digest }) catch unreachable; // Room made.
+}

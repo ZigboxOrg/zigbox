@@ -1,0 +1,3095 @@
+//! The production `Host`: raw Linux syscalls through `std.os.linux`, no libc. This file,
+//! `host_real_fs.zig` (the store's file system), `host_real_net.zig` (sockets) and `host.zig` are
+//! the only places that may name syscalls, or paths under /proc and /sys.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const bpf = @import("runtime/bpf.zig");
+const capabilities = @import("runtime/capabilities.zig");
+const knobs = @import("runtime/knobs.zig");
+const constants = @import("constants.zig");
+const host = @import("host.zig");
+const host_real_fs = @import("host_real_fs.zig");
+const host_real_net = @import("host_real_net.zig");
+const host_real_fuse = @import("host_real_fuse.zig");
+const registry_net = @import("registry/net.zig");
+const store_fs = @import("store/fs.zig");
+
+/// Writes to stderr with no state, no vtable and no error path, for the panic handler: when an
+/// invariant has broken, nothing else can be trusted. Short writes and errors are ignored
+/// because there is nowhere left to report them.
+pub fn write_stderr_best_effort(bytes: []const u8) void {
+    assert(bytes.len <= constants.output_bytes_max);
+    var written: usize = 0;
+    var calls: u32 = 0;
+    while (written < bytes.len and calls < constants.write_calls_max) : (calls += 1) {
+        const result = linux.write(linux.STDERR_FILENO, bytes[written..].ptr, bytes.len - written);
+        if (linux.errno(result) != .SUCCESS) return;
+        written += result;
+    }
+    assert(written <= bytes.len);
+}
+
+/// Ends the process at once, without unwinding, flushing or running anything else.
+pub fn exit_now(code: u8) noreturn {
+    assert(code != 0);
+    linux.exit_group(code);
+}
+
+fn timespec_of(ms: u64) linux.timespec {
+    assert(ms <= std.math.maxInt(u32));
+    return .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+}
+
+fn monotonic_now_ms() u64 {
+    var now: linux.timespec = undefined;
+    const result = linux.clock_gettime(.MONOTONIC, &now);
+    assert(linux.errno(result) == .SUCCESS); // A valid clock and a valid pointer.
+    assert(now.sec >= 0);
+    return @as(u64, @intCast(now.sec)) * 1000 + @as(u64, @intCast(now.nsec)) / 1_000_000;
+}
+
+/// The errno of the most recent call checked by `check`, 0 after a success. One per thread,
+/// because `check` is a free function used by the probe code too and the library is called from
+/// several threads (each caller's host reads the errno of its own last call); a forked child has
+/// its own copy.
+//
+// The alignment is a workaround for a std defect, not decoration. The binary's TLS segment is
+// already 256 KiB: std's default `signal_stack_size` (1 << 18) is a `threadlocal` alternate
+// signal stack that `std.Thread.maybeAttachSignalStack` installs for every thread. A static
+// binary without libc lays out its own thread area at startup (`std.os.linux.tls.initStatic`),
+// and with this two-byte variable added to the segment it put the thread control block at a
+// misaligned offset and panicked (`incorrectAlignment`) before `main`, in ReleaseSafe only. That
+// is a defect in `std.os.linux.tls`: minimal programs with a `u16` threadlocal do not reproduce
+// it, so it depends on the layout of the whole segment. `align(16)` made the layout work here.
+// The guard is the `zig build release` smoke run, which starts the binary: a later change to
+// the thread-locals, or a new Zig, can break this again and only that run would show it.
+pub threadlocal var errno_last: u16 align(16) = 0;
+
+pub const HostReal = struct {
+    /// Files opened and not yet closed. Pair assertion for the simulator's handle table: a
+    /// close without a matching open is a programmer error. Changed only atomically
+    /// (`count_open`, `count_close`), so that a `HostReal` shared by mistake between threads
+    /// keeps a true count instead of tripping an assertion. Sharing is still not supported:
+    /// the rule is one `HostReal` per thread (src/zigbox.zig).
+    open_count: u32 = 0,
+    /// Directory under which the overlay probe makes its scratch directory.
+    scratch_parent: [:0]const u8 = "/tmp",
+    probe_timeout_ms: u32 = constants.probe_timeout_ms,
+    /// Test hook: replaces the body of the probe child, to exercise timeout, signal and
+    /// exit-code handling without depending on what the host kernel allows.
+    child_hook: ?*const fn () noreturn = null,
+    /// The process environment, for NO_COLOR. Empty unless `main` provides it.
+    environ: std.process.Environ = .empty,
+    /// The memory the real network works in (`host_real_net.Memory`, about 2.4 MiB): the caller's,
+    /// set before the first request and initialised with `Memory.init`. Null for a host that
+    /// makes none, which asserts if it does.
+    network_memory: ?*host_real_net.Memory = null,
+
+    pub fn interface(self: *HostReal) host.Host {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable: host.VTable = .{
+        .open_read = open_read,
+        .read = read,
+        .close = close,
+        .write = write,
+        .uname = uname,
+        .stat = stat,
+        .device_node = device_node,
+        .read_capability = read_capability,
+        .seccomp_mode = seccomp_mode,
+        .is_terminal = is_terminal,
+        .no_color = no_color,
+        .last_errno = last_errno,
+        .uid = uid,
+        .probe = probe,
+        .probe_idmap = probe_idmap,
+        .pipe = pipe,
+        .write_handle = write_handle,
+        .spawn = spawn,
+        .start_keeper = start_keeper,
+        .start_program = start_program,
+        .wait = wait,
+        .signal = signal,
+        .write_id_map = write_id_map,
+        .mount = mount,
+        .unmount_detach = unmount_detach,
+        .pivot_root = pivot_root,
+        .change_directory = change_directory,
+        .make_directory = make_directory,
+        .remove_directory = remove_directory,
+        .create_file = create_file,
+        .bring_up_loopback = bring_up_loopback,
+        .channel = channel,
+        .listen_loopback = listen_loopback,
+        .mount_fuse = mount_fuse,
+        .tcp4_socket = tcp4_socket,
+        .send_handle = send_handle,
+        .receive_handle = receive_handle,
+        .is_unix_stream = is_unix_stream,
+        .symlink = symlink,
+        .set_hostname = set_hostname,
+        .set_umask = set_umask,
+        .seal_descriptors = seal_descriptors,
+        .die_with_parent = die_with_parent,
+        .pipe_has_reader = pipe_has_reader,
+        .pipe_capacity = pipe_capacity,
+        .restrict_capabilities = restrict_capabilities,
+        .clear_ambient = clear_ambient,
+        .no_new_privs = no_new_privs,
+        .set_user = set_user,
+        .get_rlimit = get_rlimit,
+        .set_rlimit = set_rlimit,
+        .write_sysctl = write_sysctl,
+        .unshare_cgroup = unshare_cgroup,
+        .install_seccomp = install_seccomp,
+        .exec = exec,
+        .gid = gid,
+        .environment = environment,
+        .environment_at = environment_at,
+        .random_bytes = random_bytes,
+        .run_helper = run_helper,
+        .block_signals = block_signals,
+        .wait_event = wait_event,
+        .wait_event_watching = wait_event_watching,
+        .log_files = log_files,
+        .own_pid = own_pid,
+        .working_directory = working_directory,
+        .sleep_ms = sleep_ms,
+        .monotonic_ms = monotonic_ms,
+        .fork_supervisor = fork_supervisor,
+        .wait_any = wait_any,
+        .exit_now = exit_process,
+        .signal_state = signal_state,
+        .time_now = time_now,
+        .write_file = write_file,
+        .rename = rename,
+        .remove_file = remove_file,
+        .list_directory = list_directory,
+        .ignore_broken_pipe = ignore_broken_pipe,
+        .catch_interrupts = catch_interrupts,
+        .interrupt_signal = interrupt_signal,
+        .socket_connect = socket_connect,
+        .read_timeout = read_timeout,
+        .begin_step = begin_step,
+        .open_namespace = open_namespace,
+        .join_namespace = join_namespace,
+        .open_terminal = open_terminal,
+        .copy_window_size = copy_window_size,
+        .input_raw = input_raw,
+        .attach_terminal = attach_terminal,
+        .standard_input = standard_input,
+        .input_is_terminal = input_is_terminal,
+        .filesystem = filesystem,
+        .network = network,
+    };
+
+    fn from_context(context: *anyopaque) *HostReal {
+        return @ptrCast(@alignCast(context));
+    }
+
+    /// Counts `count` newly opened descriptors.
+    pub fn count_open(self: *HostReal, count: u32) void {
+        assert(count > 0);
+        assert(count <= 2);
+        const before = @atomicRmw(u32, &self.open_count, .Add, count, .monotonic);
+        assert(before < std.math.maxInt(u32) - count);
+    }
+
+    /// Counts one closed descriptor; a close with nothing open is a programmer error.
+    pub fn count_close(self: *HostReal) void {
+        const before = @atomicRmw(u32, &self.open_count, .Sub, 1, .monotonic);
+        assert(before > 0);
+        assert(before != std.math.maxInt(u32));
+    }
+
+    /// The descriptors open now, read atomically.
+    pub fn opened_now(self: *const HostReal) u32 {
+        return @atomicLoad(u32, &self.open_count, .monotonic);
+    }
+
+    fn open_read(context: *anyopaque, path: [:0]const u8) host.Error!host.Handle {
+        const self = from_context(context);
+        assert(path.len > 0);
+        assert(path.len <= constants.path_bytes_max);
+        const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+        const result = linux.open(path.ptr, flags, 0);
+        try check(result);
+        assert(result <= std.math.maxInt(i32)); // A descriptor, not an errno-shaped value.
+        self.count_open(1);
+        const descriptor: i32 = @intCast(result);
+        return @intCast(descriptor);
+    }
+
+    fn read(context: *anyopaque, handle: host.Handle, buffer: []u8) host.Error!u32 {
+        const self = from_context(context);
+        // Descriptor 0 is standard input (`--password-stdin`), which no open_read produced.
+        if (handle != 0) assert(self.opened_now() > 0);
+        assert(buffer.len > 0);
+        assert(buffer.len <= constants.record_file_bytes_max); // A run record is the largest read.
+        const descriptor: i32 = @intCast(handle);
+        const result = linux.read(descriptor, buffer.ptr, buffer.len);
+        try check(result);
+        assert(result <= buffer.len);
+        return @intCast(result);
+    }
+
+    fn close(context: *anyopaque, handle: host.Handle) void {
+        const self = from_context(context);
+        assert(self.opened_now() > 0);
+        self.count_close();
+        assert(handle <= std.math.maxInt(i32)); // A descriptor, as open_read produced it.
+        const descriptor: i32 = @intCast(handle);
+        // A close error on a read-only descriptor loses no data and cannot be acted on.
+        _ = linux.close(descriptor);
+    }
+
+    fn write(context: *anyopaque, stream: host.Stream, bytes: []const u8) host.Error!u32 {
+        _ = from_context(context);
+        assert(bytes.len > 0);
+        assert(bytes.len <= constants.output_bytes_max);
+        const descriptor: i32 = switch (stream) {
+            .stdout => linux.STDOUT_FILENO,
+            .stderr => linux.STDERR_FILENO,
+        };
+        const result = linux.write(descriptor, bytes.ptr, bytes.len);
+        try check(result);
+        assert(result <= bytes.len);
+        return @intCast(result);
+    }
+
+    fn uname(context: *anyopaque) host.Error!host.Uname {
+        _ = from_context(context);
+        var raw: linux.utsname = undefined;
+        try check(linux.uname(&raw));
+        const release = std.mem.sliceTo(&raw.release, 0);
+        const machine = std.mem.sliceTo(&raw.machine, 0);
+        assert(release.len < constants.uname_field_bytes);
+        assert(machine.len < constants.uname_field_bytes);
+        return .{
+            .release = host.Text.from_slice(release),
+            .machine = host.Text.from_slice(machine),
+        };
+    }
+
+    fn stat(context: *anyopaque, path: [:0]const u8) host.Error!host.Stat {
+        _ = from_context(context);
+        assert(path.len > 0);
+        const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+        var buffer: linux.Statx = undefined;
+        try check(linux.statx(linux.AT.FDCWD, path.ptr, 0, mask, &buffer));
+        // A filesystem may leave a field out (a clear bit, the field garbage): that file is
+        // refused as unsupported, not asserted on, since the kernel's answer is input.
+        const complete = buffer.mask.TYPE and buffer.mask.MODE and buffer.mask.UID;
+        if (!complete) return error.Unsupported;
+        assert(buffer.mask.MODE); // Past the refusal, every field read below is the kernel's.
+        assert(buffer.mask.UID);
+        return .{ .mode = buffer.mode, .uid = buffer.uid };
+    }
+
+    fn device_node(context: *anyopaque, path: [:0]const u8) host.Error!host.DeviceNode {
+        _ = from_context(context);
+        assert(path.len > 0);
+        const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .GID = true };
+        var buffer: linux.Statx = undefined;
+        try check(linux.statx(linux.AT.FDCWD, path.ptr, 0, mask, &buffer));
+        // As in `stat`: a field the filesystem left out refuses the node, never asserts.
+        const complete = buffer.mask.TYPE and buffer.mask.MODE and buffer.mask.UID and
+            buffer.mask.GID;
+        if (!complete) return error.Unsupported;
+        assert(buffer.mask.UID); // Past the refusal, every field read below is the kernel's.
+        assert(buffer.mask.GID);
+        // The kernel's own answer, for the ids and the groups the process holds (zbx is never
+        // setuid, so its real and effective ids are the same).
+        const access = linux.access(path.ptr, linux.R_OK | linux.W_OK);
+        return .{
+            .mode = buffer.mode,
+            .uid = buffer.uid,
+            .gid = buffer.gid,
+            .can_open = linux.errno(access) == .SUCCESS,
+            .member = in_group(buffer.gid),
+        };
+    }
+
+    fn read_capability(
+        context: *anyopaque,
+        path: [:0]const u8,
+        buffer: []u8,
+    ) host.Error!u32 {
+        _ = from_context(context);
+        assert(path.len > 0);
+        assert(buffer.len > 0);
+        const result = linux.getxattr(path.ptr, "security.capability", buffer.ptr, buffer.len);
+        if (linux.errno(result) == .OPNOTSUPP) return error.NoData; // Filesystem without xattrs.
+        try check(result);
+        assert(result <= buffer.len);
+        return @intCast(result);
+    }
+
+    fn seccomp_mode(context: *anyopaque) host.Error!u32 {
+        _ = from_context(context);
+        const result = linux.prctl(@backingInt(linux.PR.GET_SECCOMP), 0, 0, 0, 0);
+        try check(result);
+        assert(result <= std.math.maxInt(u32));
+        assert(result <= 2);
+        return @intCast(result);
+    }
+
+    fn is_terminal(context: *anyopaque, stream: host.Stream) bool {
+        _ = from_context(context);
+        const descriptor: i32 = switch (stream) {
+            .stdout => linux.STDOUT_FILENO,
+            .stderr => linux.STDERR_FILENO,
+        };
+        var attributes: linux.termios = undefined;
+        return linux.errno(linux.tcgetattr(descriptor, &attributes)) == .SUCCESS;
+    }
+
+    fn last_errno(context: *anyopaque) u16 {
+        _ = from_context(context);
+        assert(errno_last < 4096);
+        return errno_last;
+    }
+
+    fn no_color(context: *anyopaque) bool {
+        return from_context(context).environ.containsUnemptyConstant("NO_COLOR");
+    }
+
+    fn uid(context: *anyopaque) u32 {
+        _ = from_context(context);
+        return linux.getuid();
+    }
+
+    fn probe(context: *anyopaque, kind: host.ProbeKind) host.Error!host.ProbeOutcome {
+        const self = from_context(context);
+        assert(self.probe_timeout_ms >= constants.probe_poll_ms);
+        assert(self.scratch_parent.len > 0);
+        return probe_run(self, kind, "");
+    }
+
+    fn probe_idmap(context: *anyopaque, path: [:0]const u8) host.Error!host.ProbeOutcome {
+        const self = from_context(context);
+        assert(self.probe_timeout_ms >= constants.probe_poll_ms);
+        assert(path.len > 0);
+        return probe_run(self, .idmap, path);
+    }
+
+    // ---- Containers ----
+
+    fn pipe(context: *anyopaque) host.Error!host.Pipe {
+        const self = from_context(context);
+        var descriptors: [2]i32 = undefined;
+        try check(linux.pipe2(&descriptors, .{ .CLOEXEC = true }));
+        self.count_open(2);
+        assert(descriptors[0] >= 0);
+        assert(descriptors[1] >= 0);
+        return .{ .read = @intCast(descriptors[0]), .write = @intCast(descriptors[1]) };
+    }
+
+    fn socket_connect(context: *anyopaque, path: [:0]const u8) host.Error!host.Handle {
+        const self = from_context(context);
+        assert(path.len > 0);
+        assert(path.len <= constants.dbus_socket_path_bytes_max);
+        const kind = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        const created = linux.socket(linux.AF.UNIX, kind, 0);
+        try check(created);
+        const descriptor: i32 = @intCast(created);
+        var address: linux.sockaddr.un = .{ .path = @splat(0) };
+        @memcpy(address.path[0..path.len], path);
+        const length: u32 = @intCast(@sizeOf(linux.sa_family_t) + path.len + 1);
+        check(linux.connect(descriptor, &address, length)) catch |err| {
+            const errno_connect = errno_last;
+            _ = linux.close(descriptor);
+            errno_last = errno_connect; // The close must not hide why the connect failed.
+            return err;
+        };
+        self.count_open(1);
+        return @intCast(descriptor);
+    }
+
+    /// Waits for the first byte with poll(2), then reads. A hang-up with nothing to read is end
+    /// of file (the read returns 0), which the caller treats as the peer closing.
+    fn read_timeout(
+        context: *anyopaque,
+        handle: host.Handle,
+        buffer: []u8,
+        timeout_ms: u32,
+    ) host.Error!u32 {
+        const self = from_context(context);
+        assert(self.opened_now() > 0);
+        assert(buffer.len > 0);
+        const descriptor: i32 = @intCast(handle);
+        var poll_set = [1]linux.pollfd{.{ .fd = descriptor, .events = linux.POLL.IN }};
+        const waited = linux.poll(&poll_set, 1, @intCast(timeout_ms));
+        try check(waited);
+        if (waited == 0) {
+            errno_last = 0;
+            return error.TimedOut;
+        }
+        const result = linux.read(descriptor, buffer.ptr, buffer.len);
+        try check(result);
+        assert(result <= buffer.len);
+        return @intCast(result);
+    }
+
+    fn write_handle(context: *anyopaque, handle: host.Handle, bytes: []const u8) host.Error!u32 {
+        _ = from_context(context);
+        assert(bytes.len > 0);
+        assert(bytes.len <= constants.output_bytes_max);
+        const descriptor: i32 = @intCast(handle);
+        const result = linux.write(descriptor, bytes.ptr, bytes.len);
+        try check(result);
+        assert(result <= bytes.len);
+        return @intCast(result);
+    }
+
+    fn spawn(
+        context: *anyopaque,
+        flags: host.SpawnFlags,
+        entry: host.ChildEntry,
+        entry_context: *anyopaque,
+    ) host.Error!host.Pid {
+        _ = from_context(context);
+        var arguments: CloneArgs = std.mem.zeroes(CloneArgs);
+        arguments.flags = clone_flags(flags);
+        // A sibling takes the caller's own exit signal; clone3 refuses one given with it.
+        arguments.exit_signal = if (flags.sibling) 0 else @backingInt(linux.SIG.CHLD);
+        const result = linux.syscall2(.clone3, @intFromPtr(&arguments), @sizeOf(CloneArgs));
+        // clone3 returns twice. In the child (result 0) nothing below this line runs: the entry
+        // function does the setup and the child ends here, never returning into the caller.
+        if (result == 0) {
+            if (flags.stdin_null) redirect_stdin_null();
+            if (flags.output) |pipes| redirect_output(pipes);
+            linux.exit_group(entry(entry_context));
+        }
+        try check(result);
+        assert(result > 0);
+        assert(result <= std.math.maxInt(i32));
+        return @intCast(result);
+    }
+
+    fn start_keeper(context: *anyopaque, hold: host.Handle) host.Error!host.Pid {
+        _ = from_context(context);
+        const parent: i32 = linux.getpid();
+        const forked = linux.fork();
+        // In the child (result 0) only raw system calls run, and it never returns into the
+        // caller: `keeper_main` ends it.
+        if (forked == 0) keeper_main(parent, @intCast(hold));
+        try check(forked);
+        assert(forked > 1);
+        assert(forked <= std.math.maxInt(i32));
+        return @intCast(forked);
+    }
+
+    /// Opens the child's stdin and stderr here, where a failure can be reported, then forks;
+    /// the child (`program_child`) makes only raw system calls before `execve`.
+    fn start_program(
+        context: *anyopaque,
+        request: host.ExecRequest,
+        stdout: host.Handle,
+        log: [:0]const u8,
+    ) host.Error!host.Pid {
+        _ = from_context(context);
+        assert(request.path.len > 0);
+        assert(stdout > 2); // A pipe's end, never one of our own standard streams.
+        const input = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        try check(input);
+        const stdin_fd: i32 = @intCast(input);
+        const log_flags: linux.O = .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        };
+        const null_flags: linux.O = .{ .ACCMODE = .WRONLY, .CLOEXEC = true };
+        // A log that cannot be made (a full disk, a directory gone) is not a reason to refuse the
+        // run: pasta's stderr then goes to /dev/null, as for a run with no state directory.
+        var output: usize = if (log.len > 0) linux.open(log.ptr, log_flags, 0o600) else 0;
+        if (log.len == 0 or linux.errno(output) != .SUCCESS) {
+            output = linux.open("/dev/null", null_flags, 0);
+        }
+        check(output) catch |err| {
+            const errno_open = errno_last;
+            _ = linux.close(stdin_fd);
+            errno_last = errno_open; // The close must not hide why the open failed.
+            return err;
+        };
+        const stderr_fd: i32 = @intCast(output);
+        const parent: i32 = linux.getpid();
+        const forked = linux.fork();
+        // In the child (result 0) only raw system calls run, and it never returns.
+        if (forked == 0) program_child(request, parent, stdin_fd, @intCast(stdout), stderr_fd);
+        const errno_fork = linux.errno(forked);
+        _ = linux.close(stdin_fd); // The child has its copies; ours would only leak.
+        _ = linux.close(stderr_fd);
+        if (errno_fork != .SUCCESS) {
+            errno_last = @backingInt(errno_fork);
+            return host.error_for_errno(errno_last);
+        }
+        errno_last = 0;
+        assert(forked > 1);
+        assert(forked <= std.math.maxInt(i32));
+        return @intCast(forked);
+    }
+
+    fn wait(context: *anyopaque, pid: host.Pid) host.Error!host.ExitStatus {
+        _ = from_context(context);
+        assert(pid > 0);
+        var status: i32 = 0;
+        const result = linux.wait4(@intCast(pid), &status, 0, null);
+        try check(result);
+        assert(result == pid);
+        const bits: u32 = @bitCast(status);
+        if (linux.W.IFEXITED(bits)) return .{ .exited = linux.W.EXITSTATUS(bits) };
+        if (linux.W.IFSIGNALED(bits)) {
+            const number: u32 = @backingInt(linux.W.TERMSIG(bits));
+            assert(number > 0);
+            assert(number < constants.signal_number_max);
+            return .{ .signaled = @intCast(number) };
+        }
+        return error.IoFailed; // Stopped or continued: wait4 was not asked for those.
+    }
+
+    fn signal(context: *anyopaque, pid: host.Pid, number: u8) host.Error!void {
+        _ = from_context(context);
+        assert(pid > 0);
+        // Raw, so that number 0 (does the process exist?) is expressible.
+        try check(linux.syscall2(.kill, pid, number));
+    }
+
+    fn write_id_map(
+        context: *anyopaque,
+        pid: host.Pid,
+        kind: host.IdMapKind,
+        bytes: []const u8,
+    ) host.Error!void {
+        _ = from_context(context);
+        assert(pid > 0);
+        assert(bytes.len > 0);
+        var path: [64:0]u8 = undefined;
+        const format = "/proc/{d}/{s}";
+        // Cannot fail: a pid has at most ten digits and the names are at most eight bytes.
+        const text = std.fmt.bufPrintSentinel(&path, format, .{ pid, @tagName(kind) }, 0) catch
+            unreachable; // Same bound as above.
+        const opened = linux.open(text.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        const written = linux.write(descriptor, bytes.ptr, bytes.len);
+        const result = check(written);
+        _ = linux.close(descriptor); // Nothing buffered: the write above was the operation.
+        try result;
+        if (written != bytes.len) return error.IoFailed; // A map is written whole or not at all.
+    }
+
+    fn mount(context: *anyopaque, request: host.MountRequest) host.Error!void {
+        _ = from_context(context);
+        assert(request.target.len > 0);
+        const target = request.target.ptr;
+        const bind_source: ?[*:0]const u8 = if (request.source) |source| source.ptr else null;
+        const result = switch (request.kind) {
+            .make_private => linux.mount(null, target, null, linux.MS.REC | linux.MS.PRIVATE, 0),
+            .bind_tree => linux.mount(bind_source, target, null, linux.MS.BIND | linux.MS.REC, 0),
+            .bind_file => linux.mount(bind_source, target, null, linux.MS.BIND, 0),
+            .move => linux.mount(bind_source, target, null, linux.MS.MOVE, 0),
+            .remount_readonly => return remount_readonly(request.target),
+            .remount_readonly_tree => return remount_readonly_tree(request.target),
+            .user_tmpfs => linux.mount(
+                "tmpfs",
+                target,
+                "tmpfs",
+                linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
+                @intFromPtr(bind_source.?), // The mount data; `Host.mount` asserted it is set.
+            ),
+            // `/dev/shm`: the plan's data gives the mode and the size (`--shm-size`, by default
+            // `constants.shm_bytes_default`).
+            .shm_tmpfs => linux.mount(
+                "tmpfs",
+                target,
+                "tmpfs",
+                linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
+                @intFromPtr(bind_source.?), // The mount data; `Host.mount` asserted it is set.
+            ),
+            .overlay => linux.mount(
+                "overlay",
+                target,
+                "overlay",
+                0,
+                @intFromPtr(bind_source.?), // The mount data; `Host.mount` asserted it is set.
+            ),
+            .proc,
+            .sysfs,
+            .cgroup_cover,
+            .cgroup2,
+            .dev_tmpfs,
+            .devpts,
+            .tmp_tmpfs,
+            .run_tmpfs,
+            => blk: {
+                const fresh = fresh_filesystem(request.kind);
+                const data = @intFromPtr(fresh.data.ptr);
+                break :blk linux.mount(fresh.source, target, fresh.type, fresh.flags, data);
+            },
+        };
+        try check(result);
+    }
+
+    fn unmount_detach(context: *anyopaque, path: [:0]const u8) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        try check(linux.umount2(path.ptr, linux.MNT.DETACH));
+    }
+
+    fn pivot_root(
+        context: *anyopaque,
+        new_root: [:0]const u8,
+        put_old: [:0]const u8,
+    ) host.Error!void {
+        _ = from_context(context);
+        assert(new_root.len > 0);
+        assert(put_old.len > 0);
+        try check(linux.pivot_root(new_root.ptr, put_old.ptr));
+    }
+
+    fn change_directory(context: *anyopaque, path: [:0]const u8) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        try check(linux.chdir(path.ptr));
+    }
+
+    fn make_directory(context: *anyopaque, path: [:0]const u8, exist_ok: bool) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        const result = linux.mkdir(path.ptr, 0o755);
+        if (exist_ok) {
+            if (linux.errno(result) == .EXIST) {
+                errno_last = 0;
+                return;
+            }
+        }
+        try check(result);
+    }
+
+    fn remove_directory(context: *anyopaque, path: [:0]const u8) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        try check(linux.rmdir(path.ptr));
+    }
+
+    fn create_file(context: *anyopaque, path: [:0]const u8, exist_ok: bool) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        // Without O_EXCL, creating a file that is there opens it and leaves it as it is: no
+        // O_TRUNC, and read-only, so a file the user may read but not write is fine.
+        const flags: linux.O = .{
+            .ACCMODE = .RDONLY,
+            .CREAT = true,
+            .EXCL = !exist_ok,
+            .CLOEXEC = true,
+        };
+        const opened = linux.open(path.ptr, flags, 0o644);
+        try check(opened);
+        _ = linux.close(@intCast(opened)); // An empty file: nothing was written to lose.
+    }
+
+    /// `lo` up: `SIOCGIFFLAGS`, then `SIOCSIFFLAGS` with `IFF_UP` added, on a datagram socket
+    /// that is closed again. A new network namespace has `lo`, down; the kernel then brings up
+    /// `127.0.0.1` and `::1` with it. The socket needs no privilege, the flag change needs
+    /// `CAP_NET_ADMIN` in the user namespace that owns the network namespace, which the
+    /// container's root has until the capabilities are restricted.
+    fn bring_up_loopback(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        assert(@sizeOf(linux.ifreq) == 40); // The kernel's struct ifreq.
+        const opened = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        const result = set_interface_up(descriptor, "lo");
+        _ = linux.close(descriptor); // Nothing buffered: the ioctls were the operation.
+        try result;
+    }
+
+    fn channel(context: *anyopaque) host.Error!host.Pipe {
+        const self = from_context(context);
+        var descriptors: [2]i32 = undefined;
+        const kind = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        try check(linux.socketpair(linux.AF.UNIX, kind, 0, &descriptors));
+        self.count_open(2);
+        assert(descriptors[0] >= 0);
+        assert(descriptors[1] >= 0);
+        return .{ .read = @intCast(descriptors[0]), .write = @intCast(descriptors[1]) };
+    }
+
+    /// `socket`, `bind` to 127.0.0.1, `listen`. Close-on-exec, so that the command never gets it
+    /// even if the child forgot to close it. A failure closes the socket and keeps the errno of
+    /// the call that failed.
+    fn listen_loopback(context: *anyopaque, port: u16) host.Error!host.Handle {
+        const self = from_context(context);
+        assert(port > 0);
+        const created = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try check(created);
+        const descriptor: i32 = @intCast(created);
+        const loopback: u32 = std.mem.nativeToBig(u32, 0x7f000001);
+        const address: linux.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = loopback,
+        };
+        const bound = check(linux.bind(descriptor, @ptrCast(&address), @sizeOf(@TypeOf(address))));
+        bound catch |err| return close_failed(descriptor, err);
+        check(linux.listen(descriptor, constants.listen_backlog)) catch |err| {
+            return close_failed(descriptor, err);
+        };
+        self.count_open(1);
+        return @intCast(descriptor);
+    }
+
+    /// `socket(AF_INET, SOCK_STREAM)`, close-on-exec, and nothing more: the caller binds,
+    /// listens or connects it, wherever it ends up.
+    fn tcp4_socket(context: *anyopaque) host.Error!host.Handle {
+        const self = from_context(context);
+        const created = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try check(created);
+        self.count_open(1);
+        const descriptor: i32 = @intCast(created);
+        assert(descriptor >= 0);
+        return @intCast(descriptor);
+    }
+
+    /// `open` of `/dev/fuse`, then the mount (`host_real_fuse.mount`). A refused mount closes
+    /// the descriptor and keeps the mount's errno.
+    fn mount_fuse(context: *anyopaque, target: [:0]const u8) host.Error!host.Handle {
+        const self = from_context(context);
+        const opened = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        const mounted = host_real_fuse.mount(descriptor, target);
+        errno_last = @backingInt(mounted);
+        if (mounted != .SUCCESS) {
+            return close_failed(descriptor, host.error_for_errno(@backingInt(mounted)));
+        }
+        self.open_count += 1;
+        return @intCast(descriptor);
+    }
+
+    fn close_failed(descriptor: i32, err: host.Error) host.Error {
+        const errno_call = errno_last;
+        _ = linux.close(descriptor);
+        errno_last = errno_call; // The close must not hide why the call failed.
+        return err;
+    }
+
+    /// One byte of data carries the descriptor: `SCM_RIGHTS` needs at least one.
+    fn send_handle(
+        context: *anyopaque,
+        channel_end: host.Handle,
+        handle: host.Handle,
+    ) host.Error!void {
+        _ = from_context(context);
+        var byte = [1]u8{0};
+        var iov = [1]std.posix.iovec_const{.{ .base = &byte, .len = 1 }};
+        const Control = extern struct { header: linux.cmsghdr, fd: i32, pad: i32 = 0 };
+        comptime assert(@sizeOf(Control) == 24); // CMSG_SPACE(4) on a 64-bit kernel.
+        var control: Control = .{
+            .header = .{
+                .len = @sizeOf(linux.cmsghdr) + 4,
+                .level = linux.SOL.SOCKET,
+                .type = linux.SCM.RIGHTS,
+            },
+            .fd = @intCast(handle),
+        };
+        const message: linux.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &control,
+            .controllen = @sizeOf(Control),
+            .flags = 0,
+        };
+        const sent = linux.sendmsg(@intCast(channel_end), &message, linux.MSG.NOSIGNAL);
+        try check(sent);
+        assert(sent == 1);
+    }
+
+    fn is_unix_stream(context: *anyopaque, handle: host.Handle) bool {
+        _ = from_context(context);
+        if (handle > std.math.maxInt(i32)) return false;
+        const descriptor: i32 = @intCast(handle);
+        var domain: i32 = 0;
+        var length: linux.socklen_t = @sizeOf(i32);
+        const level = linux.SOL.SOCKET;
+        const option = linux.SO.DOMAIN;
+        const got_domain = linux.getsockopt(descriptor, level, option, @ptrCast(&domain), &length);
+        if (linux.errno(got_domain) != .SUCCESS) return false; // Closed, or no socket.
+        var kind: i32 = 0;
+        length = @sizeOf(i32);
+        const option_type = linux.SO.TYPE;
+        const got_kind = linux.getsockopt(descriptor, level, option_type, @ptrCast(&kind), &length);
+        if (linux.errno(got_kind) != .SUCCESS) return false;
+        return domain == linux.AF.UNIX and kind == linux.SOCK.STREAM;
+    }
+
+    fn receive_handle(context: *anyopaque, channel_end: host.Handle) host.Error!host.Handle {
+        const self = from_context(context);
+        var byte: [1]u8 = undefined;
+        var iov = [1]std.posix.iovec{.{ .base = &byte, .len = 1 }};
+        const Control = extern struct { header: linux.cmsghdr, fd: i32, pad: i32 = 0 };
+        var control: Control = undefined;
+        var message: linux.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &control,
+            .controllen = @sizeOf(Control),
+            .flags = 0,
+        };
+        const got = linux.recvmsg(@intCast(channel_end), &message, linux.MSG.CMSG_CLOEXEC);
+        try check(got);
+        const header_ok = message.controllen >= @sizeOf(linux.cmsghdr) + 4 and
+            control.header.level == linux.SOL.SOCKET and control.header.type == linux.SCM.RIGHTS;
+        if (got == 0 or !header_ok) {
+            // The peer closed without sending, or sent bytes with no descriptor.
+            errno_last = @backingInt(linux.E.PIPE);
+            return error.IoFailed;
+        }
+        assert(control.fd >= 0);
+        self.count_open(1);
+        return @intCast(control.fd);
+    }
+
+    fn symlink(context: *anyopaque, target: [:0]const u8, link: [:0]const u8) host.Error!void {
+        _ = from_context(context);
+        assert(target.len > 0);
+        assert(link.len > 0);
+        try check(linux.symlink(target.ptr, link.ptr));
+    }
+
+    fn set_hostname(context: *anyopaque, name: []const u8) host.Error!void {
+        _ = from_context(context);
+        assert(name.len > 0);
+        assert(name.len <= constants.container_name_bytes_max);
+        try check(linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len));
+    }
+
+    fn set_umask(context: *anyopaque, mask: u16) void {
+        _ = from_context(context);
+        assert(mask <= 0o777);
+        // umask(2) always succeeds and returns the previous mask, which nothing here needs.
+        const previous = linux.syscall1(.umask, mask);
+        assert(previous <= 0o777);
+    }
+
+    fn seal_descriptors(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        // Everything above stderr closes at exec; this keeps the failure pipe open until then,
+        // which a plain close would not.
+        const flags: linux.CLOSE_RANGE = .{ .UNSHARE = false, .CLOEXEC = true };
+        try check(linux.close_range(3, -1, flags));
+    }
+
+    fn pipe_capacity(context: *anyopaque, handle: host.Handle, bytes_min: u32) host.Error!void {
+        _ = from_context(context);
+        assert(bytes_min > 0);
+        assert(handle <= std.math.maxInt(i32));
+        const descriptor: i32 = @intCast(handle);
+        const set_size: i32 = 1031; // F_SETPIPE_SZ
+        const get_size: i32 = 1032; // F_GETPIPE_SZ
+        // A refusal (EPERM over the user's pipe limits) is not final: the pipe may already be big
+        // enough, which the read-back below decides.
+        _ = linux.fcntl(descriptor, set_size, bytes_min);
+        const size = linux.fcntl(descriptor, get_size, 0);
+        try check(size);
+        if (size < bytes_min) {
+            errno_last = 0;
+            return error.NoSpace;
+        }
+    }
+
+    fn pipe_has_reader(context: *anyopaque, handle: host.Handle) bool {
+        _ = from_context(context);
+        assert(handle <= std.math.maxInt(i32));
+        const descriptor: i32 = @intCast(handle);
+        const asked: linux.pollfd = .{ .fd = descriptor, .events = linux.POLL.OUT, .revents = 0 };
+        var poll_set = [1]linux.pollfd{asked};
+        const ready = linux.poll(&poll_set, 1, 0);
+        // A poll that fails says nothing: the reader is taken to be there (the death signal,
+        // armed just before, covers a parent that dies later).
+        if (linux.errno(ready) != .SUCCESS) return true;
+        return poll_set[0].revents & linux.POLL.ERR == 0;
+    }
+
+    fn die_with_parent(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        const kill: usize = @backingInt(linux.SIG.KILL);
+        try check(linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), kill, 0, 0, 0));
+    }
+
+    /// Capabilities are dropped from the bounding set one by one (`PR_CAPBSET_DROP`, which needs
+    /// CAP_SETPCAP, still held at this point), then the three sets are set to `keep` in one
+    /// `capset` (version 3 data: two words each).
+    fn restrict_capabilities(context: *anyopaque, keep: u64) host.Error!void {
+        _ = from_context(context);
+        assert(keep != 0);
+        assert(keep >> (capabilities.last_known + 1) == 0);
+        var capability: u32 = 0;
+        while (capability <= capabilities.last_known) : (capability += 1) {
+            if (keep & (@as(u64, 1) << @intCast(capability)) != 0) continue;
+            const result = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), capability, 0, 0, 0);
+            // A kernel older than this build knows has fewer capabilities: EINVAL, nothing to drop.
+            if (linux.errno(result) == .INVAL) continue;
+            try check(result);
+        }
+        const header: CapHeader = .{ .version = cap_version_3, .pid = 0 };
+        const low: u32 = @truncate(keep);
+        const high: u32 = @truncate(keep >> 32);
+        const data = [2]CapData{
+            .{ .effective = low, .permitted = low, .inheritable = low },
+            .{ .effective = high, .permitted = high, .inheritable = high },
+        };
+        try check(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&data)));
+    }
+
+    fn clear_ambient(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        assert(linux.PR.CAP_AMBIENT_CLEAR_ALL == 4);
+        const operation = linux.PR.CAP_AMBIENT_CLEAR_ALL;
+        try check(linux.prctl(@backingInt(linux.PR.CAP_AMBIENT), operation, 0, 0, 0));
+    }
+
+    fn no_new_privs(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        assert(@backingInt(linux.PR.SET_NO_NEW_PRIVS) == 38);
+        try check(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
+    }
+
+    fn set_user(
+        context: *anyopaque,
+        user_id: u32,
+        group_id: u32,
+        keep_groups: bool,
+    ) host.Error!void {
+        assert(user_id != std.math.maxInt(u32));
+        assert(group_id != std.math.maxInt(u32));
+        _ = from_context(context);
+        // No supplementary groups (a run with devices keeps them: they are what opens a node
+        // that is 0660 root:render), then the group before the user: a process that has become
+        // the user may no longer set its group.
+        if (!keep_groups) try check(linux.syscall2(.setgroups, 0, 0));
+        try check(linux.setresgid(group_id, group_id, group_id));
+        try check(linux.setresuid(user_id, user_id, user_id));
+    }
+
+    fn rlimit_resource(resource: knobs.Resource) linux.rlimit_resource {
+        const result: linux.rlimit_resource = switch (resource) {
+            .nofile => .NOFILE,
+            .nproc => .NPROC,
+            .memlock => .MEMLOCK,
+            .stack => .STACK,
+        };
+        assert(@backingInt(result) < 16);
+        return result;
+    }
+
+    fn get_rlimit(context: *anyopaque, resource: knobs.Resource) host.Error!knobs.Rlimit {
+        _ = from_context(context);
+        var limit: linux.rlimit = undefined;
+        try check(linux.prlimit(0, rlimit_resource(resource), null, &limit));
+        assert(limit.cur <= limit.max);
+        return .{ .soft = limit.cur, .hard = limit.max };
+    }
+
+    fn set_rlimit(
+        context: *anyopaque,
+        resource: knobs.Resource,
+        value: knobs.Rlimit,
+    ) host.Error!void {
+        _ = from_context(context);
+        assert(value.soft <= value.hard);
+        assert(linux.RLIM.INFINITY == knobs.unlimited);
+        const limit: linux.rlimit = .{ .cur = value.soft, .max = value.hard };
+        try check(linux.prlimit(0, rlimit_resource(resource), &limit, null));
+    }
+
+    /// One `write`: a sysctl reads its value from the first write at offset 0, so a short write
+    /// would set a cut value. A partial count is reported as EINVAL, as the kernel would for a
+    /// value it does not take whole.
+    fn write_sysctl(context: *anyopaque, path: [:0]const u8, value: []const u8) host.Error!void {
+        _ = from_context(context);
+        assert(value.len > 0);
+        assert(value.len <= constants.sysctl_value_bytes_max);
+        const flags: linux.O = .{ .ACCMODE = .WRONLY, .CLOEXEC = true, .NOFOLLOW = true };
+        const opened = linux.open(path.ptr, flags, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        defer _ = linux.close(descriptor);
+        const count = linux.write(descriptor, value.ptr, value.len);
+        try check(count);
+        if (count == value.len) return;
+        const invalid: isize = -@as(isize, @backingInt(linux.E.INVAL));
+        try check(@bitCast(invalid)); // A short write: the kernel took a cut value.
+        unreachable; // `check` fails on an errno.
+    }
+
+    fn unshare_cgroup(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        assert(linux.CLONE.NEWCGROUP != 0);
+        try check(linux.unshare(linux.CLONE.NEWCGROUP));
+    }
+
+    fn install_seccomp(context: *anyopaque, program: []const bpf.Insn) host.Error!void {
+        _ = from_context(context);
+        assert(program.len > 0);
+        assert(program.len <= bpf.insns_max);
+        const filter: SockFprog = .{ .len = @intCast(program.len), .filter = program.ptr };
+        const operation = linux.SECCOMP.SET_MODE_FILTER;
+        try check(linux.seccomp(operation, 0, &filter));
+    }
+
+    fn exec(context: *anyopaque, request: host.ExecRequest) host.Error!void {
+        _ = from_context(context);
+        assert(request.path.len > 0);
+        assert(request.argv[0] != null);
+        const result = linux.execve(request.path.ptr, request.argv, request.envp);
+        // execve returns only when it failed.
+        try check(result);
+        unreachable; // A success never returns, and check turns every failure into an error.
+    }
+
+    fn gid(context: *anyopaque) u32 {
+        _ = from_context(context);
+        return linux.getgid();
+    }
+
+    fn environment(context: *anyopaque, name: []const u8) ?[]const u8 {
+        const self = from_context(context);
+        assert(name.len > 0);
+        return self.environ.getPosix(name);
+    }
+
+    fn environment_at(context: *anyopaque, index: u32) ?host.EnvironmentEntry {
+        const self = from_context(context);
+        const entries = self.environ.block.slice;
+        assert(index <= constants.environment_entries_max);
+        if (index >= entries.len) return null;
+        const text = std.mem.span(entries[index].?);
+        // An entry without "=" has no value; it is listed with an empty one.
+        const equals = std.mem.indexOfScalar(u8, text, '=') orelse text.len;
+        if (equals == 0) return .{ .name = "?", .value = text };
+        const value = if (equals < text.len) text[equals + 1 ..] else text[0..0];
+        return .{ .name = text[0..equals], .value = value };
+    }
+
+    fn random_bytes(context: *anyopaque, buffer: []u8) host.Error!void {
+        _ = from_context(context);
+        assert(buffer.len > 0);
+        assert(buffer.len <= 256);
+        const result = linux.getrandom(buffer.ptr, buffer.len, 0);
+        try check(result);
+        if (result != buffer.len) return error.IoFailed; // Not short for 256 bytes or fewer.
+    }
+
+    // ---- Helpers, signals and files (slice 2) ----
+
+    fn run_helper(
+        context: *anyopaque,
+        request: host.ExecRequest,
+        output: []u8,
+    ) host.Error!host.HelperResult {
+        _ = from_context(context);
+        assert(request.path.len > 0);
+        assert(output.len > 0);
+        var ends: [2]i32 = undefined;
+        try check(linux.pipe2(&ends, .{ .CLOEXEC = true }));
+        const forked = linux.fork();
+        check(forked) catch |err| {
+            _ = linux.close(ends[0]);
+            _ = linux.close(ends[1]);
+            return err;
+        };
+        if (forked == 0) helper_child(request, ends[1]);
+        _ = linux.close(ends[1]);
+        const pid: i32 = @intCast(forked);
+        // One deadline covers the reads and the reap: the alarm inside the helper is its own
+        // program's to ignore, this is not.
+        const limit_ms = @as(u64, request.timeout_seconds) * 1000;
+        const deadline: u64 = if (limit_ms > 0) monotonic_now_ms() + limit_ms else 0;
+        const drained = drain_helper(ends[0], output, deadline);
+        _ = linux.close(ends[0]);
+        var expired = drained.timed_out;
+        var reaped: ?host.ExitStatus = null;
+        if (!expired) {
+            reaped = try reap_helper(pid, deadline);
+            expired = reaped == null;
+        }
+        if (expired) {
+            // The helper's own process group, and the helper itself in case it left the group.
+            _ = linux.kill(-pid, linux.SIG.KILL);
+            _ = linux.kill(pid, linux.SIG.KILL);
+        }
+        const status = reaped orelse try wait_child(pid);
+        assert(drained.length <= output.len);
+        if (expired) assert(deadline > 0);
+        return .{ .status = status, .output_len = drained.length, .timed_out = expired };
+    }
+
+    fn block_signals(context: *anyopaque, block: bool) host.Error!void {
+        _ = from_context(context);
+        const set = forwarded_set();
+        assert(constants.forwarded_signals_count == 4);
+        const how: u32 = if (block) linux.SIG.BLOCK else linux.SIG.UNBLOCK;
+        try check(linux.sigprocmask(how, &set, null));
+    }
+
+    fn wait_event(context: *anyopaque, pid: host.Pid, timeout_ms: u32) host.Error!host.Event {
+        _ = from_context(context);
+        assert(pid > 0);
+        const set = forwarded_set();
+        var info: linux.siginfo_t = undefined;
+        var early_status: i32 = 0;
+        // Zero waits for ever; a time is a limit on each wait for a signal, and a signal that is
+        // not the child's end (a stop, say) is not a reason to start the time again: the
+        // deadline is fixed once.
+        var limit = timespec_of(timeout_ms);
+        const started = monotonic_now_ms();
+        // A child that ended before the caller blocked the signals has had its SIGCHLD dropped
+        // (the default action ignores it, and a signal that is not blocked is not queued), so
+        // looking only at the queue would wait for ever for a child that is already a zombie. A
+        // child that ends after this look raises a SIGCHLD that waits in the queue: the caller
+        // has the signals blocked.
+        const early = linux.wait4(@intCast(pid), &early_status, linux.W.NOHANG, null);
+        try check(early);
+        if (early != 0) {
+            assert(early == pid);
+            return .{ .exited = try decode_status(early_status) };
+        }
+        // Each pass takes one signal off the queue, so the loop ends when the child does; a
+        // SIGCHLD for a child that is still running (a stop, say) is skipped.
+        for (0..constants.forwarded_signals_max + constants.wait_interrupts_max) |_| {
+            const size = linux.NSIG / 8;
+            if (timeout_ms > 0) {
+                const spent = monotonic_now_ms() -| started;
+                if (spent >= timeout_ms) return .timeout;
+                const left: u64 = timeout_ms - spent;
+                limit = timespec_of(left);
+            }
+            const wait_for: usize = if (timeout_ms > 0) @intFromPtr(&limit) else 0;
+            const taken = linux.syscall4(
+                .rt_sigtimedwait,
+                @intFromPtr(&set),
+                @intFromPtr(&info),
+                wait_for,
+                size,
+            );
+            if (timeout_ms > 0 and linux.errno(taken) == .AGAIN) return .timeout;
+            try check(taken);
+            assert(taken > 0);
+            assert(taken < constants.signal_number_max);
+            if (taken != @backingInt(linux.SIG.CHLD)) return .{ .signal = @intCast(taken) };
+            var status: i32 = 0;
+            const result = linux.wait4(@intCast(pid), &status, linux.W.NOHANG, null);
+            try check(result);
+            if (result == 0) continue;
+            assert(result == pid);
+            return .{ .exited = try decode_status(status) };
+        }
+        return error.Stalled;
+    }
+
+    /// Like `wait_event`, and returns `.output` when a watched descriptor can be read. A signalfd
+    /// for the forwarded signals lets one `ppoll` wait for both; the signals stay blocked and
+    /// queued, and are taken off the queue by `wait_event` when the signalfd says one is there.
+    fn wait_event_watching(
+        context: *anyopaque,
+        pid: host.Pid,
+        timeout_ms: u32,
+        watch: []const host.Handle,
+    ) host.Error!host.Event {
+        assert(pid > 0);
+        assert(watch.len > 0);
+        assert(watch.len <= 8);
+        var early_status: i32 = 0;
+        const early = linux.wait4(@intCast(pid), &early_status, linux.W.NOHANG, null);
+        try check(early);
+        if (early != 0) return .{ .exited = try decode_status(early_status) };
+        const started = monotonic_now_ms();
+        const set = forwarded_set();
+        const made = linux.signalfd(-1, &set, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+        try check(made);
+        const signal_fd: i32 = @intCast(made);
+        defer _ = linux.close(signal_fd);
+        for (0..constants.forwarded_signals_max + constants.wait_interrupts_max) |_| {
+            var polls: [9]linux.pollfd = undefined;
+            polls[0] = .{ .fd = signal_fd, .events = linux.POLL.IN, .revents = 0 };
+            for (watch, 1..) |handle, at| {
+                polls[at] = .{ .fd = @intCast(handle), .events = linux.POLL.IN, .revents = 0 };
+            }
+            var limit: linux.timespec = undefined;
+            var limit_ptr: ?*linux.timespec = null;
+            if (timeout_ms > 0) {
+                const spent = monotonic_now_ms() -| started;
+                if (spent >= timeout_ms) return .timeout;
+                limit = timespec_of(timeout_ms - spent);
+                limit_ptr = &limit;
+            }
+            const waited = linux.ppoll(&polls, @intCast(1 + watch.len), limit_ptr, null);
+            if (linux.errno(waited) == .INTR) continue;
+            try check(waited);
+            if (waited == 0) return .timeout;
+            if (polls[0].revents != 0) {
+                // A signal or a child's end: the queue's owner decides which.
+                const event = try wait_event(context, pid, 1);
+                if (event != .timeout) return event;
+            }
+            var mask: u32 = 0;
+            for (watch, 1..) |_, at| {
+                if (polls[at].revents != 0) mask |= @as(u32, 1) << @intCast(at - 1);
+            }
+            if (mask != 0) return .{ .output = mask };
+        }
+        return error.Stalled;
+    }
+
+    fn log_files(context: *anyopaque) store_fs.Fs {
+        return filesystem(context);
+    }
+
+    fn own_pid(context: *anyopaque) host.Pid {
+        _ = from_context(context);
+        return @intCast(linux.getpid());
+    }
+
+    fn working_directory(context: *anyopaque, buffer: []u8) host.Error![]const u8 {
+        _ = from_context(context);
+        assert(buffer.len > 1);
+        const result = linux.getcwd(buffer.ptr, buffer.len);
+        try check(result);
+        // The kernel writes the path and its NUL; the result is the length with the NUL.
+        const nul = std.mem.indexOfScalar(u8, buffer, 0);
+        const length = nul orelse return error.IoFailed;
+        // A directory that was removed under us has a path that does not start with a slash.
+        if (length == 0 or buffer[0] != '/') return error.NotFound;
+        return buffer[0..length];
+    }
+
+    fn sleep_ms(context: *anyopaque, ms: u32) void {
+        _ = from_context(context);
+        assert(ms > 0);
+        var left = timespec_of(ms);
+        // An interrupted sleep ends early: the callers poll, so a short sleep costs one more look.
+        _ = linux.nanosleep(&left, &left);
+    }
+
+    fn monotonic_ms(context: *anyopaque) u64 {
+        _ = from_context(context);
+        return monotonic_now_ms();
+    }
+
+    /// Forks. The supervisor leaves the caller's session and process group (so a hang-up of the
+    /// terminal does not reach it) and has /dev/null for its standard streams. Zbx has one thread
+    /// when this is called, so the child is a faithful copy.
+    fn fork_supervisor(context: *anyopaque) host.Error!host.Role {
+        _ = from_context(context);
+        const forked = linux.fork();
+        try check(forked);
+        if (forked != 0) return .parent;
+        try check(linux.setsid());
+        const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+        try check(opened);
+        const null_fd: i32 = @intCast(opened);
+        for ([_]i32{ 0, 1, 2 }) |target| try check(linux.dup2(null_fd, target));
+        if (null_fd > 2) _ = linux.close(null_fd);
+        return .supervisor;
+    }
+
+    /// One pidfd per child and one `ppoll`: the first that ends is reaped and returned.
+    fn wait_any(
+        context: *anyopaque,
+        pids: []const host.Pid,
+        timeout_ms: u32,
+    ) host.Error!?host.Reaped {
+        _ = from_context(context);
+        assert(pids.len > 0);
+        assert(pids.len <= 32);
+        var polls: [32]linux.pollfd = undefined;
+        var opened: usize = 0;
+        defer for (polls[0..opened]) |entry| {
+            _ = linux.close(entry.fd);
+        };
+        for (pids) |pid| {
+            assert(pid > 0);
+            const made = linux.pidfd_open(@intCast(pid), 0);
+            try check(made);
+            polls[opened] = .{ .fd = @intCast(made), .events = linux.POLL.IN, .revents = 0 };
+            opened += 1;
+        }
+        var limit: linux.timespec = undefined;
+        var limit_ptr: ?*linux.timespec = null;
+        if (timeout_ms > 0) {
+            limit = timespec_of(timeout_ms);
+            limit_ptr = &limit;
+        }
+        // While interrupts are caught, a signal between the caller's look at the value and the
+        // wait must still end the wait: the signals are blocked, the value read, and `ppoll`
+        // unblocks them only for as long as it waits, so one cannot slip in between.
+        var previous: linux.sigset_t = undefined;
+        const caught = interrupt_saved;
+        if (caught) block_interrupts(&previous);
+        defer if (caught) {
+            const restored = linux.sigprocmask(linux.SIG.SETMASK, &previous, null);
+            assert(linux.errno(restored) == .SUCCESS); // The mask the kernel gave us.
+        };
+        if (caught and interrupt_number.load(.acquire) != 0) return error.Interrupted;
+        const mask: ?*const linux.sigset_t = if (caught) &previous else null;
+        const waited = linux.ppoll(&polls, @intCast(opened), limit_ptr, mask);
+        try check(waited);
+        if (waited == 0) return null;
+        for (polls[0..opened], 0..) |entry, index| {
+            if (entry.revents == 0) continue;
+            var status: i32 = 0;
+            const result = linux.wait4(@intCast(pids[index]), &status, 0, null);
+            try check(result);
+            return .{ .index = @intCast(index), .status = try decode_status(status) };
+        }
+        return error.IoFailed;
+    }
+
+    fn exit_process(context: *anyopaque, code: u8) void {
+        _ = from_context(context);
+        linux.exit_group(code);
+    }
+
+    fn signal_state(context: *anyopaque, pid: host.Pid) host.Error!host.SignalState {
+        _ = from_context(context);
+        assert(pid > 0);
+        var path: [48:0]u8 = undefined;
+        // Cannot fail: "/proc/" and "/status" are 13 bytes and a pid at most ten digits.
+        const text = std.fmt.bufPrintSentinel(&path, "/proc/{d}/status", .{pid}, 0) catch
+            unreachable; // Same bound as above.
+        const opened = linux.open(text.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        var buffer: [constants.status_bytes_max]u8 = undefined;
+        const count = linux.read(descriptor, &buffer, buffer.len);
+        const result = check(count);
+        _ = linux.close(descriptor);
+        try result;
+        return parse_signal_masks(buffer[0..count]) orelse error.IoFailed;
+    }
+
+    fn time_now(context: *anyopaque) u64 {
+        _ = from_context(context);
+        var now: linux.timespec = undefined;
+        const result = linux.clock_gettime(.REALTIME, &now);
+        assert(linux.errno(result) == .SUCCESS); // A valid clock and a valid pointer.
+        assert(now.sec >= 0);
+        return @intCast(now.sec);
+    }
+
+    fn write_file(
+        context: *anyopaque,
+        path: [:0]const u8,
+        bytes: []const u8,
+        mode: u16,
+    ) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        assert(mode <= 0o777);
+        assert(bytes.len <= constants.write_bytes_max);
+        const flags: linux.O = .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        };
+        const opened = linux.open(path.ptr, flags, mode);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        // The process umask has cut the mode the file was made with, and a file that was there
+        // kept its own: the mode asked for is set on the descriptor.
+        check(linux.fchmod(descriptor, mode)) catch |err| {
+            _ = linux.close(descriptor);
+            return err;
+        };
+        var written: usize = 0;
+        var calls: u32 = 0;
+        const result: host.Error!void = while (written < bytes.len) {
+            calls += 1;
+            if (calls > constants.write_calls_max) break error.Stalled;
+            const count = linux.write(descriptor, bytes[written..].ptr, bytes.len - written);
+            check(count) catch |err| break err;
+            written += count;
+        } else {};
+        _ = linux.close(descriptor); // The data is in the page cache; rename publishes it.
+        try result;
+        assert(written == bytes.len);
+    }
+
+    fn rename(context: *anyopaque, from: [:0]const u8, to: [:0]const u8) host.Error!void {
+        _ = from_context(context);
+        assert(from.len > 0);
+        assert(to.len > 0);
+        try check(linux.rename(from.ptr, to.ptr));
+    }
+
+    fn remove_file(context: *anyopaque, path: [:0]const u8) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        try check(linux.unlink(path.ptr));
+    }
+
+    fn list_directory(
+        context: *anyopaque,
+        path: [:0]const u8,
+        listing: *host.DirListing,
+    ) host.Error!void {
+        _ = from_context(context);
+        assert(path.len > 0);
+        assert(listing.count == 0);
+        const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+        const opened = linux.open(path.ptr, flags, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        const result = read_entries(descriptor, listing);
+        _ = linux.close(descriptor);
+        try result;
+    }
+
+    /// The signal the handler below saw first (0: none yet); read by `interrupt_signal`. One
+    /// value for the process, as the signals are.
+    var interrupt_number: std.atomic.Value(u8) = .init(0);
+    /// What SIGINT and SIGTERM did before `catch_interrupts(true)`, put back by
+    /// `catch_interrupts(false)`; `interrupt_saved` says whether they were saved.
+    var interrupt_previous: [interrupt_signals.len]linux.Sigaction = undefined;
+    var interrupt_saved: bool = false;
+    const interrupt_signals = [_]linux.SIG{ .INT, .TERM };
+
+    fn on_interrupt(which: linux.SIG) callconv(.c) void {
+        const number = @backingInt(which);
+        assert(number != 0); // A real signal number, as the kernel delivers.
+        assert(number < 256);
+        // The first signal is the one reported; a second (a double Ctrl-C) changes nothing.
+        _ = interrupt_number.cmpxchgStrong(0, @intCast(number), .acq_rel, .acquire);
+        assert(interrupt_number.load(.acquire) != 0);
+    }
+
+    /// Catching starts a fresh window and saves what each signal did; a signal the process
+    /// inherited as ignored (a background job of a script) stays ignored. Releasing puts the
+    /// saved dispositions back. A signal may arrive at any moment in between: it only sets the
+    /// value, which the caller reads when it next looks.
+    fn catch_interrupts(context: *anyopaque, catch_it: bool) void {
+        _ = from_context(context);
+        if (!catch_it) {
+            if (!interrupt_saved) return; // Nothing was changed (a worker of a sim, a test).
+            for (interrupt_signals, &interrupt_previous) |which, *previous| {
+                const result = linux.sigaction(which, previous, null);
+                assert(linux.errno(result) == .SUCCESS); // A disposition the kernel gave us.
+            }
+            interrupt_saved = false;
+            return;
+        }
+        assert(!interrupt_saved); // Windows do not nest.
+        interrupt_number.store(0, .release);
+        const action: linux.Sigaction = .{
+            .handler = .{ .handler = on_interrupt },
+            .mask = linux.sigemptyset(),
+            .flags = 0, // No SA_RESTART: a blocked wait returns, so the caller sees the value.
+        };
+        for (interrupt_signals, &interrupt_previous) |which, *previous| {
+            const queried = linux.sigaction(which, null, previous);
+            assert(linux.errno(queried) == .SUCCESS); // A valid signal.
+            if (previous.handler.handler == linux.SIG.IGN) continue;
+            const result = linux.sigaction(which, &action, null);
+            assert(linux.errno(result) == .SUCCESS); // Valid signals and a valid handler.
+        }
+        interrupt_saved = true;
+    }
+
+    /// Blocks SIGINT and SIGTERM, and saves the mask they were blocked under in `previous`.
+    fn block_interrupts(previous: *linux.sigset_t) void {
+        var blocked = linux.sigemptyset();
+        for (interrupt_signals) |which| linux.sigaddset(&blocked, which);
+        const result = linux.sigprocmask(linux.SIG.BLOCK, &blocked, previous);
+        assert(linux.errno(result) == .SUCCESS); // A valid mask.
+    }
+
+    fn interrupt_signal(context: *anyopaque) u8 {
+        _ = from_context(context);
+        assert(@intFromPtr(context) != 0);
+        return interrupt_number.load(.acquire);
+    }
+
+    fn ignore_broken_pipe(context: *anyopaque, ignore: bool) void {
+        _ = from_context(context);
+        const handler = if (ignore) linux.SIG.IGN else linux.SIG.DFL;
+        const action: linux.Sigaction = .{
+            .handler = .{ .handler = handler },
+            .mask = linux.sigemptyset(),
+            .flags = 0,
+        };
+        const result = linux.sigaction(.PIPE, &action, null);
+        assert(linux.errno(result) == .SUCCESS); // A valid signal and a valid handler.
+    }
+
+    fn filesystem(context: *anyopaque) store_fs.Fs {
+        return host_real_fs.interface(from_context(context));
+    }
+
+    fn network(context: *anyopaque) registry_net.Net {
+        return host_real_net.interface(from_context(context));
+    }
+
+    fn begin_step(context: *anyopaque, index: u32) void {
+        _ = from_context(context);
+        _ = index; // The kernel needs no hint; see Host.begin_step.
+    }
+
+    // ---- Exec: namespaces and the terminal ----
+
+    fn open_namespace(
+        context: *anyopaque,
+        pid: host.Pid,
+        kind: host.NamespaceKind,
+    ) host.Error!?host.Handle {
+        const self = from_context(context);
+        assert(pid > 1);
+        var path: [48:0]u8 = undefined;
+        // Cannot fail: "/proc/", "/ns/", a name of at most six bytes and a pid of ten digits.
+        const target = std.fmt.bufPrintSentinel(&path, "/proc/{d}/ns/{s}", .{
+            pid, kind.file_name(),
+        }, 0) catch unreachable; // Same bound as above.
+        var own_path: [32:0]u8 = undefined;
+        // Cannot fail: as above, shorter.
+        const own = std.fmt.bufPrintSentinel(&own_path, "/proc/self/ns/{s}", .{
+            kind.file_name(),
+        }, 0) catch unreachable; // Same bound as above.
+        var theirs: linux.Statx = undefined;
+        var ours: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .INO = true };
+        try check(linux.statx(linux.AT.FDCWD, target.ptr, 0, mask, &theirs));
+        try check(linux.statx(linux.AT.FDCWD, own.ptr, 0, mask, &ours));
+        // One namespace file system holds them all: the inode alone tells one from another.
+        if (theirs.ino == ours.ino) return null;
+        const opened = linux.open(target.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        try check(opened);
+        self.count_open(1);
+        return @intCast(opened);
+    }
+
+    fn join_namespace(
+        context: *anyopaque,
+        handle: host.Handle,
+        kind: host.NamespaceKind,
+    ) host.Error!void {
+        _ = from_context(context);
+        assert(handle <= std.math.maxInt(i32));
+        const flag: u32 = switch (kind) {
+            .user => linux.CLONE.NEWUSER,
+            .ipc => linux.CLONE.NEWIPC,
+            .uts => linux.CLONE.NEWUTS,
+            .net => linux.CLONE.NEWNET,
+            .pid => linux.CLONE.NEWPID,
+            .cgroup => linux.CLONE.NEWCGROUP,
+            .mount => linux.CLONE.NEWNS,
+        };
+        // The type is given, so the kernel refuses a file of another kind of namespace.
+        try check(linux.setns(@intCast(handle), flag));
+    }
+
+    /// `ptmx`, unlocked, and the peer opened through the master (`TIOCGPTPEER`, Linux 4.13), so
+    /// that no path under /dev/pts is looked up: the peer belongs to the devpts of `ptmx`
+    /// whatever mount namespace the command is in.
+    fn open_terminal(context: *anyopaque, ptmx: [:0]const u8) host.Error!host.Terminal {
+        const self = from_context(context);
+        assert(ptmx.len > 0);
+        const flags: linux.O = .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true };
+        const opened = linux.open(ptmx.ptr, flags, 0);
+        try check(opened);
+        const master: i32 = @intCast(opened);
+        var unlock: i32 = 0;
+        const unlocked = linux.ioctl(master, linux.T.IOCSPTLCK, @intFromPtr(&unlock));
+        const peer_flags: usize = @as(u32, @bitCast(flags));
+        const peer = if (linux.errno(unlocked) == .SUCCESS)
+            linux.ioctl(master, linux.T.IOCGPTPEER, peer_flags)
+        else
+            unlocked;
+        check(peer) catch |err| {
+            const errno_peer = errno_last;
+            _ = linux.close(master);
+            errno_last = errno_peer; // The close must not hide why the peer could not be had.
+            return err;
+        };
+        self.count_open(2);
+        return .{ .master = @intCast(master), .peer = @intCast(peer) };
+    }
+
+    fn copy_window_size(context: *anyopaque, master: host.Handle) host.Error!void {
+        _ = from_context(context);
+        assert(master <= std.math.maxInt(i32));
+        var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        const asked = linux.ioctl(linux.STDIN_FILENO, linux.T.IOCGWINSZ, @intFromPtr(&size));
+        if (linux.errno(asked) != .SUCCESS) {
+            errno_last = 0; // No size to copy: the terminal keeps the kernel's default.
+            return;
+        }
+        try check(linux.ioctl(@intCast(master), linux.T.IOCSWINSZ, @intFromPtr(&size)));
+    }
+
+    /// Raw as `cfmakeraw` makes it: no input translation, no output processing, no echo, no
+    /// line editing, no signal keys, eight bits, one byte at a time.
+    fn input_raw(context: *anyopaque, raw: bool, saved: *host.TerminalSaved) host.Error!void {
+        _ = from_context(context);
+        comptime assert(@sizeOf(linux.termios) <= host.terminal_saved_bytes);
+        const size = @sizeOf(linux.termios);
+        if (!raw) {
+            var settings: linux.termios = undefined;
+            @memcpy(std.mem.asBytes(&settings), saved.bytes[0..size]);
+            try check(linux.tcsetattr(linux.STDIN_FILENO, .FLUSH, &settings));
+            saved.valid = false;
+            return;
+        }
+        var settings: linux.termios = undefined;
+        try check(linux.tcgetattr(linux.STDIN_FILENO, &settings));
+        @memcpy(saved.bytes[0..size], std.mem.asBytes(&settings));
+        saved.valid = true;
+        settings.iflag.IGNBRK = false;
+        settings.iflag.BRKINT = false;
+        settings.iflag.PARMRK = false;
+        settings.iflag.ISTRIP = false;
+        settings.iflag.INLCR = false;
+        settings.iflag.IGNCR = false;
+        settings.iflag.ICRNL = false;
+        settings.iflag.IXON = false;
+        settings.oflag.OPOST = false;
+        settings.lflag.ECHO = false;
+        settings.lflag.ECHONL = false;
+        settings.lflag.ICANON = false;
+        settings.lflag.ISIG = false;
+        settings.lflag.IEXTEN = false;
+        settings.cflag.CSIZE = .CS8;
+        settings.cflag.PARENB = false;
+        settings.cc[@backingInt(linux.V.MIN)] = 1;
+        settings.cc[@backingInt(linux.V.TIME)] = 0;
+        try check(linux.tcsetattr(linux.STDIN_FILENO, .FLUSH, &settings));
+    }
+
+    fn attach_terminal(context: *anyopaque, peer: host.Handle) host.Error!void {
+        _ = from_context(context);
+        assert(peer <= std.math.maxInt(i32));
+        const descriptor: i32 = @intCast(peer);
+        try check(linux.setsid());
+        try check(linux.ioctl(descriptor, linux.T.IOCSCTTY, 0));
+        for ([_]i32{ 0, 1, 2 }) |target| try check(linux.dup2(descriptor, target));
+    }
+
+    fn input_is_terminal(context: *anyopaque) bool {
+        _ = from_context(context);
+        var settings: linux.termios = undefined;
+        const asked = linux.tcgetattr(linux.STDIN_FILENO, &settings);
+        return linux.errno(asked) == .SUCCESS;
+    }
+
+    fn standard_input(context: *anyopaque) host.Handle {
+        _ = from_context(context);
+        return linux.STDIN_FILENO;
+    }
+
+    /// Converts a raw syscall return value into an error, or passes success through.
+    pub fn check(result: usize) host.Error!void {
+        const code = linux.errno(result);
+        errno_last = @backingInt(code);
+        if (code == .SUCCESS) return;
+        assert(@backingInt(code) != 0);
+        assert(errno_last < 4096);
+        return host.error_for_errno(@backingInt(code));
+    }
+};
+
+// ---- Container constants ----------------------------------------------------------------
+
+/// The arguments of `clone3` up to and including `tls`: `CLONE_ARGS_SIZE_VER0`, 64 bytes. The
+/// later fields (`set_tid`, `cgroup`) are not used, and the kernel accepts the short size.
+/// The keeper's whole life, in the forked child: raw system calls only, no allocation. It asks
+/// to be killed with its parent, checks the parent is still the one that forked it (it may have
+/// ended before the request took effect), leaves the terminal's process group so that a ^C meant
+/// for the container does not reach it, closes every descriptor but `hold`, and reads `hold`
+/// until the end of file. Any failure ends it, which at worst makes the scope empty early; that
+/// is the state before the keeper existed, and zbx copes with it.
+fn keeper_main(parent: i32, hold: i32) noreturn {
+    assert(parent > 1);
+    assert(hold >= 0);
+    const kill: usize = @backingInt(linux.SIG.KILL);
+    if (linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), kill, 0, 0, 0) != 0) linux.exit_group(1);
+    if (linux.getppid() != parent) linux.exit_group(1);
+    _ = linux.setpgid(0, 0); // Best effort: the keeper still ends with its parent without it.
+    const flags: linux.CLOSE_RANGE = .{ .UNSHARE = false, .CLOEXEC = false };
+    if (hold > 0) {
+        if (linux.close_range(0, hold - 1, flags) != 0) linux.exit_group(1);
+    }
+    if (linux.close_range(hold + 1, -1, flags) != 0) linux.exit_group(1);
+    var byte: [1]u8 = undefined;
+    for (0..constants.keeper_reads_max) |_| {
+        const result = linux.read(hold, &byte, byte.len);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result == 0) linux.exit_group(0), // The writers are gone.
+            .INTR => {},
+            else => linux.exit_group(1),
+        }
+    }
+    linux.exit_group(1);
+}
+
+const CloneArgs = extern struct {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+};
+
+comptime {
+    assert(@sizeOf(CloneArgs) == 64);
+}
+
+/// In the new child, before anything else: its standard output and error become the pipes'
+/// write ends. Raw system calls only. A child that cannot do it ends, and the parent sees its
+/// exit status, not a command that wrote to the wrong place.
+/// In the child: descriptor 0 becomes /dev/null. Only raw system calls, as in the child anywhere.
+fn redirect_stdin_null() void {
+    const opened = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(opened) != .SUCCESS) linux.exit_group(70);
+    const null_fd: i32 = @intCast(opened);
+    if (null_fd != 0) {
+        if (linux.errno(linux.dup2(null_fd, 0)) != .SUCCESS) linux.exit_group(70);
+        _ = linux.close(null_fd);
+    }
+}
+
+fn redirect_output(pipes: host.OutputPipes) void {
+    if (pipes.stdout) |handle| {
+        if (linux.errno(linux.dup2(@intCast(handle), 1)) != .SUCCESS) linux.exit_group(70);
+    }
+    if (pipes.stderr) |handle| {
+        if (linux.errno(linux.dup2(@intCast(handle), 2)) != .SUCCESS) linux.exit_group(70);
+    }
+}
+
+fn clone_flags(flags: host.SpawnFlags) u64 {
+    var bits: u64 = 0;
+    if (flags.user) bits |= linux.CLONE.NEWUSER;
+    if (flags.mount) bits |= linux.CLONE.NEWNS;
+    if (flags.pid) bits |= linux.CLONE.NEWPID;
+    if (flags.uts) bits |= linux.CLONE.NEWUTS;
+    if (flags.ipc) bits |= linux.CLONE.NEWIPC;
+    if (flags.net) bits |= linux.CLONE.NEWNET;
+    if (flags.sibling) {
+        assert(bits == 0); // A sibling is born in the namespaces its maker joined.
+        bits |= linux.CLONE.PARENT;
+    }
+    assert(bits & linux.CLONE.VM == 0); // The child gets its own memory, as after fork.
+    assert(bits & linux.CSIGNAL == 0); // The exit signal is its own field.
+    return bits;
+}
+
+/// The arguments of `mount` for a filesystem made new for the container. Fixed text, so the
+/// child formats nothing. `newinstance` gives the container its own devpts, so it cannot see the
+/// host's terminals.
+/// `struct __user_cap_header_struct` and `__user_cap_data_struct` of capset(2), version 3.
+const CapHeader = extern struct { version: u32, pid: i32 };
+const CapData = extern struct { effective: u32, permitted: u32, inheritable: u32 };
+const cap_version_3: u32 = 0x20080522;
+
+/// `struct sock_fprog`.
+const SockFprog = extern struct { len: u16, filter: [*]const bpf.Insn };
+
+/// The bytes an unprivileged writer can still use on the file system that holds `path`
+/// (`f_bavail` blocks of `f_bsize`): a lazy run's `lazy.FreeBytes` for its store. Null when
+/// `statfs` fails.
+pub fn free_bytes(path: [:0]const u8) ?u64 {
+    assert(path.len > 0);
+    var found: StatFs = undefined;
+    HostReal.check(linux.syscall2(.statfs, @intFromPtr(path.ptr), @intFromPtr(&found))) catch
+        return null;
+    if (found.f_bsize <= 0) return null;
+    return std.math.mul(u64, found.f_bavail, @intCast(found.f_bsize)) catch std.math.maxInt(u64);
+}
+
+/// `struct statfs` of the 64-bit architectures (x86_64 and aarch64 share it).
+const StatFs = extern struct {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [4]i64,
+};
+
+const Fresh = struct {
+    source: [:0]const u8,
+    type: [:0]const u8,
+    flags: u32,
+    data: [:0]const u8,
+};
+
+/// Adds `IFF_UP` to the flags of the interface `name` through the socket `descriptor`. The two
+/// ioctls are the whole of what `ip link set lo up` does for an interface that exists.
+fn set_interface_up(descriptor: i32, name: []const u8) host.Error!void {
+    assert(name.len > 0);
+    assert(name.len < linux.IFNAMESIZE);
+    var request: linux.ifreq = std.mem.zeroes(linux.ifreq);
+    @memcpy(request.ifrn.name[0..name.len], name);
+    const get = linux.ioctl(descriptor, linux.SIOCGIFFLAGS, @intFromPtr(&request));
+    try HostReal.check(get);
+    request.ifru.flags.UP = true;
+    const set = linux.ioctl(descriptor, linux.SIOCSIFFLAGS, @intFromPtr(&request));
+    try HostReal.check(set);
+    assert(request.ifru.flags.UP);
+}
+
+/// Makes a bind mount read-only. A bind remount that does not repeat the mount's own flags
+/// (nosuid, nodev, noexec, noatime, nodiratime, relatime) is refused in a user namespace, where
+/// those flags are locked: they are read from the mount first.
+fn remount_readonly(target: [:0]const u8) host.Error!void {
+    assert(target.len > 0);
+    var found: StatFs = undefined;
+    try HostReal.check(linux.syscall2(.statfs, @intFromPtr(target.ptr), @intFromPtr(&found)));
+    const ms = linux.MS;
+    const locked = ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NOATIME | ms.NODIRATIME | ms.RELATIME;
+    const current: u32 = @intCast(found.f_flags);
+    const flags = ms.REMOUNT | ms.BIND | ms.RDONLY | (current & locked);
+    try HostReal.check(linux.mount(null, target.ptr, null, flags, 0));
+}
+
+/// `mount_setattr` (kernel 5.12): the attributes of a whole mount tree at once.
+const MountAttr = extern struct {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+};
+
+/// Makes `target` and every mount below it read-only. Where the call is missing (an older
+/// kernel) only the mount itself is, which is all the kernel then offers.
+fn remount_readonly_tree(target: [:0]const u8) host.Error!void {
+    assert(target.len > 0);
+    const mount_setattr_number = 442; // The same on x86_64 and aarch64.
+    const attr_rdonly: u64 = 0x1; // MOUNT_ATTR_RDONLY
+    const at_recursive: usize = 0x8000; // AT_RECURSIVE
+    const attributes: MountAttr = .{
+        .attr_set = attr_rdonly,
+        .attr_clr = 0,
+        .propagation = 0,
+        .userns_fd = 0,
+    };
+    const result = linux.syscall5(
+        @fromBackingInt(@intCast(mount_setattr_number)),
+        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+        @intFromPtr(target.ptr),
+        at_recursive,
+        @intFromPtr(&attributes),
+        @sizeOf(MountAttr),
+    );
+    if (linux.errno(result) == .NOSYS) return remount_readonly(target);
+    try HostReal.check(result);
+}
+
+fn fresh_filesystem(kind: host.MountKind) Fresh {
+    const ms = linux.MS;
+    const fresh: Fresh = switch (kind) {
+        .proc => .{
+            .source = "proc",
+            .type = "proc",
+            .flags = ms.NOSUID | ms.NODEV | ms.NOEXEC,
+            .data = "",
+        },
+        .sysfs => .{
+            .source = "sysfs",
+            .type = "sysfs",
+            .flags = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC,
+            .data = "",
+        },
+        // Covers the host's cgroup2 below a bound /sys, so the view goes on a mount of another
+        // kind (`host.MountKind.cgroup_cover`); on a fresh sysfs it changes only the mount table.
+        .cgroup_cover => .{
+            .source = "tmpfs",
+            .type = "tmpfs",
+            .flags = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC,
+            .data = "mode=555,size=4k",
+        },
+        .cgroup2 => .{
+            .source = "cgroup2",
+            .type = "cgroup2",
+            .flags = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC,
+            .data = "",
+        },
+        .dev_tmpfs => .{
+            .source = "tmpfs",
+            .type = "tmpfs",
+            .flags = ms.NOSUID | ms.STRICTATIME,
+            .data = "mode=755,size=65536k",
+        },
+        .tmp_tmpfs => .{
+            .source = "tmpfs",
+            .type = "tmpfs",
+            .flags = ms.NOSUID | ms.NODEV,
+            .data = std.fmt.comptimePrint("mode=1777,size={d}", .{constants.tmpfs_bytes_max}),
+        },
+        .run_tmpfs => .{
+            .source = "tmpfs",
+            .type = "tmpfs",
+            .flags = ms.NOSUID | ms.NODEV,
+            .data = std.fmt.comptimePrint("mode=755,size={d}", .{constants.tmpfs_bytes_max}),
+        },
+        .devpts => .{
+            .source = "devpts",
+            .type = "devpts",
+            .flags = ms.NOSUID | ms.NOEXEC,
+            .data = "newinstance,ptmxmode=0666",
+        },
+        else => unreachable, // The other kinds mount nothing new.
+    };
+    assert(fresh.source.len > 0);
+    assert(fresh.flags & ms.BIND == 0);
+    // Pair with the simulator, which records a mount's read-only bit from the same function.
+    assert((fresh.flags & ms.RDONLY != 0) == host.mounted_read_only(kind));
+    return fresh;
+}
+
+test "the cgroup view and its cover are mounted read-only, nosuid, nodev and noexec" {
+    // Goal: the security point of the M2b view: a container under `--memory` must not be able to
+    // write its own scope's limits through /sys/fs/cgroup. No VM step writes to the view, so
+    // this is the gate that fails when `MS_RDONLY` is dropped. Method: the flags of every fresh
+    // kind against `host.mounted_read_only`, which the simulator follows, then the four flags of
+    // the view and the cover one by one.
+    const ms = linux.MS;
+    const fresh_kinds = [_]host.MountKind{
+        .proc,      .sysfs,  .cgroup_cover, .cgroup2,
+        .dev_tmpfs, .devpts, .tmp_tmpfs,    .run_tmpfs,
+    };
+    for (fresh_kinds) |kind| {
+        const read_only = fresh_filesystem(kind).flags & ms.RDONLY != 0;
+        try std.testing.expectEqual(host.mounted_read_only(kind), read_only);
+    }
+    for ([_]host.MountKind{ .cgroup_cover, .cgroup2 }) |kind| {
+        const flags = fresh_filesystem(kind).flags;
+        try std.testing.expect(flags & ms.RDONLY != 0);
+        try std.testing.expect(flags & ms.NOSUID != 0);
+        try std.testing.expect(flags & ms.NODEV != 0);
+        try std.testing.expect(flags & ms.NOEXEC != 0);
+    }
+    try std.testing.expectEqualStrings("cgroup2", fresh_filesystem(.cgroup2).type);
+    try std.testing.expectEqualStrings("tmpfs", fresh_filesystem(.cgroup_cover).type);
+}
+
+test "real host reads a file, reports a missing one, and closes every handle" {
+    // Goal: the production implementation honours the interface contract on the machine running
+    // the tests. Method: read /proc/self/stat (always present on Linux), then a path that cannot
+    // exist, and check that no handle leaked on either path.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    var buffer: [constants.file_bytes_max]u8 = undefined;
+
+    const content = try subject.read_file("/proc/self/stat", &buffer);
+    try std.testing.expect(content.len > 0);
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+
+    try std.testing.expectError(
+        error.NotFound,
+        subject.read_file("/proc/zigbox-does-not-exist", &buffer),
+    );
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+/// One thread of the shared-count test: reads a file through the shared host, many times.
+fn read_many(real: *HostReal, failed: *bool) void {
+    var buffer: [4096]u8 = undefined;
+    for (0..shared_count_rounds) |_| {
+        _ = real.interface().read_file("/proc/self/stat", &buffer) catch {
+            failed.* = true;
+            return;
+        };
+    }
+}
+
+const shared_count_rounds = 2000;
+
+test "the open count stays right when threads share one real host" {
+    // Goal: the contract's rule is one `HostReal` per thread, but a caller that breaks it must
+    // not corrupt the count (a lost update would trip an assertion later, or hide a leak).
+    // Method: four threads read a file through one shared host many times at once; each read
+    // opens and closes a descriptor, and the count is zero after all of them.
+    var real: HostReal = .{};
+    var failed: [4]bool = @splat(false);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &failed) |*thread, *flag| {
+        thread.* = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, read_many, .{ &real, flag });
+    }
+    for (threads) |thread| thread.join();
+    for (failed) |flag| try std.testing.expect(!flag);
+    try std.testing.expectEqual(@as(u32, 0), real.opened_now());
+}
+
+test "a caught SIGINT and SIGTERM set the flag instead of ending the process" {
+    // Goal: the signals a build catches (REVIEW.md: every exit path) reach the flag, named, and
+    // handlers are put back after. Method: catch, send each signal to this thread (so the
+    // handler has run when the call returns), read the signal, release; a second signal keeps
+    // the first one's name.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    for ([_]linux.SIG{ .INT, .TERM }) |which| {
+        subject.catch_interrupts(true);
+        try std.testing.expect(!subject.interrupt_pending());
+        const sent = linux.tgkill(linux.getpid(), linux.gettid(), which);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(sent));
+        try std.testing.expectEqual(number_of(which), subject.interrupt_signal());
+        const other: linux.SIG = if (which == .INT) .TERM else .INT;
+        _ = linux.tgkill(linux.getpid(), linux.gettid(), other);
+        try std.testing.expectEqual(number_of(which), subject.interrupt_signal());
+        subject.catch_interrupts(false);
+    }
+}
+
+fn sleeping_child(raw: *anyopaque) u8 {
+    _ = raw;
+    var rest: linux.timespec = .{ .sec = 30, .nsec = 0 };
+    _ = linux.nanosleep(&rest, null);
+    return 0;
+}
+
+test "a signal caught before the wait ends the wait at once, not when the child ends" {
+    // Goal: no lost wake-up: a SIGINT that lands after the caller looked at the value and
+    // before the wait blocks must still end the wait. Method: start a child that sleeps 30 s,
+    // catch, send SIGINT (the handler runs before the wait starts), wait with no time limit:
+    // the wait returns Interrupted at once. The child is then killed and reaped.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    var unused: u8 = 0;
+    const pid = try subject.fork_child(false, sleeping_child, &unused);
+    subject.catch_interrupts(true);
+    defer subject.catch_interrupts(false);
+    const sent = linux.tgkill(linux.getpid(), linux.gettid(), .INT);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(sent));
+    const started = subject.monotonic_ms();
+    try std.testing.expectError(error.Interrupted, subject.wait_any(&.{pid}, 0));
+    try std.testing.expect(subject.monotonic_ms() - started < 10_000);
+    try subject.signal(pid, constants.signal_kill);
+    _ = try subject.wait_for(pid);
+}
+
+test "an inherited ignored SIGTERM stays ignored while caught, and is ignored after" {
+    // Goal: a background job of a script (started with a signal ignored) is not stopped by a
+    // signal meant for the foreground, and release puts back what was there, not the default.
+    // Method: ignore SIGTERM, catch, send SIGTERM (nothing is recorded), release, read the
+    // disposition back (still ignored), then put the test process's own back.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    var original: linux.Sigaction = undefined;
+    _ = linux.sigaction(.TERM, null, &original);
+    defer _ = linux.sigaction(.TERM, &original, null);
+    const ignore: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    const ignored = linux.sigaction(.TERM, &ignore, null);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(ignored));
+    subject.catch_interrupts(true);
+    _ = linux.tgkill(linux.getpid(), linux.gettid(), .TERM);
+    try std.testing.expect(!subject.interrupt_pending());
+    subject.catch_interrupts(false);
+    var after: linux.Sigaction = undefined;
+    _ = linux.sigaction(.TERM, null, &after);
+    try std.testing.expect(after.handler.handler == linux.SIG.IGN);
+}
+
+test "real host refuses a file larger than the buffer instead of truncating" {
+    // Goal: FileTooLarge, not a short success. Method: /proc/self/stat is over 8 bytes.
+    var real: HostReal = .{};
+    var small: [8]u8 = undefined;
+    try std.testing.expectError(
+        error.FileTooLarge,
+        real.interface().read_file("/proc/self/stat", &small),
+    );
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+// ---- Helper programs, signals and directories ---------------------------------------------
+
+/// The signals zbx forwards to a container, SIGCHLD, which says the container ended, and
+/// SIGWINCH, which `exec` passes to its pseudo-terminal (a run's wait drops it).
+fn forwarded_set() linux.sigset_t {
+    var set = linux.sigemptyset();
+    const numbers = [_]linux.SIG{ .INT, .TERM, .HUP, .QUIT, .CHLD, .WINCH };
+    for (numbers) |number| linux.sigaddset(&set, number);
+    comptime assert(@backingInt(linux.SIG.WINCH) == constants.signal_winch);
+    return set;
+}
+
+fn decode_status(status: i32) host.Error!host.ExitStatus {
+    const bits: u32 = @bitCast(status);
+    if (linux.W.IFEXITED(bits)) return .{ .exited = linux.W.EXITSTATUS(bits) };
+    if (linux.W.IFSIGNALED(bits)) {
+        const number: u32 = @backingInt(linux.W.TERMSIG(bits));
+        assert(number > 0);
+        assert(number < constants.signal_number_max);
+        return .{ .signaled = @intCast(number) };
+    }
+    return error.IoFailed; // Stopped or continued: nothing here asks for those.
+}
+
+fn wait_child(pid: i32) host.Error!host.ExitStatus {
+    assert(pid > 0);
+    for (0..constants.wait_interrupts_max + 1) |_| {
+        var status: i32 = 0;
+        const result = linux.wait4(pid, &status, 0, null);
+        if (linux.errno(result) == .INTR) continue;
+        try HostReal.check(result);
+        assert(result == pid);
+        return decode_status(status);
+    }
+    return error.IoFailed;
+}
+
+/// The forked helper: its output goes to the pipe, then it becomes the program. It never
+/// returns; a failed exec ends it with the conventional "command not found" code.
+/// The child of `start_program`: its own session, killed with its parent, the signals zbx may
+/// have blocked unblocked, its three streams, then the program. Exit code 127 is "could not run
+/// it", as a shell says, and a parent that died before the death signal was set ends it too.
+fn program_child(
+    request: host.ExecRequest,
+    parent: i32,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+) noreturn {
+    _ = linux.setsid();
+    const kill: usize = @backingInt(linux.SIG.KILL);
+    const death = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), kill, 0, 0, 0);
+    if (death != 0) linux.exit_group(127);
+    if (linux.getppid() != parent) linux.exit_group(127);
+    const none: linux.sigset_t = linux.sigemptyset();
+    _ = linux.sigprocmask(linux.SIG.SETMASK, &none, null);
+    if (linux.errno(linux.dup2(stdin_fd, linux.STDIN_FILENO)) != .SUCCESS) linux.exit_group(127);
+    if (linux.errno(linux.dup2(stdout_fd, linux.STDOUT_FILENO)) != .SUCCESS) linux.exit_group(127);
+    if (linux.errno(linux.dup2(stderr_fd, linux.STDERR_FILENO)) != .SUCCESS) linux.exit_group(127);
+    _ = linux.execve(request.path.ptr, request.argv, request.envp);
+    linux.exit_group(127);
+}
+
+fn helper_child(request: host.ExecRequest, output: i32) noreturn {
+    if (request.timeout_seconds > 0) {
+        // Its own process group, so the waiter's kill reaches what the program started too.
+        _ = linux.setpgid(0, 0);
+        // The timer survives the exec; SIGALRM's default action ends the helper.
+        const limit: linux.itimerspec = .{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{ .sec = request.timeout_seconds, .nsec = 0 },
+        };
+        const set = linux.setitimer(@backingInt(linux.ITIMER.REAL), &limit, null);
+        if (linux.errno(set) != .SUCCESS) linux.exit_group(127);
+    }
+    // Its input is /dev/null: it is in a background group and must neither stop on the terminal
+    // nor take input meant for the command.
+    const input = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(input) != .SUCCESS) linux.exit_group(127);
+    _ = linux.dup2(@intCast(input), linux.STDIN_FILENO);
+    _ = linux.dup2(output, linux.STDOUT_FILENO);
+    _ = linux.dup2(output, linux.STDERR_FILENO);
+    _ = linux.execve(request.path.ptr, request.argv, request.envp);
+    linux.exit_group(127);
+}
+
+const Drained = struct { length: u32, timed_out: bool };
+
+/// Reads the helper's output to the end: the first bytes are kept, the rest dropped. A nonzero
+/// `deadline` (monotonic milliseconds) bounds the whole read: a program that never closes the
+/// pipe, leaves a process holding it, or writes past the read bound ends as `timed_out`.
+fn drain_helper(descriptor: i32, output: []u8, deadline: u64) Drained {
+    var kept: usize = 0;
+    var scratch: [512]u8 = undefined;
+    // With a deadline, the deadline is the bound (checked at the top of every pass); without
+    // one the read count is.
+    var passes: u32 = 0;
+    while (deadline > 0 or passes < constants.helper_read_calls_max) : (passes +%= 1) {
+        if (deadline > 0) {
+            const now = monotonic_now_ms();
+            if (now >= deadline) return .{ .length = @intCast(kept), .timed_out = true };
+            var poll_set = [1]linux.pollfd{.{ .fd = descriptor, .events = linux.POLL.IN }};
+            const left: i32 = @intCast(@min(deadline - now, 1000));
+            const waited = linux.poll(&poll_set, 1, left);
+            if (linux.errno(waited) == .INTR) continue;
+            if (linux.errno(waited) != .SUCCESS) break;
+            if (waited == 0) continue; // The deadline check at the top decides.
+        }
+        const room: []u8 = if (kept < output.len) output[kept..] else &scratch;
+        const count = linux.read(descriptor, room.ptr, room.len);
+        if (linux.errno(count) == .INTR) continue;
+        if (linux.errno(count) != .SUCCESS) break;
+        if (count == 0) return .{ .length = @intCast(kept), .timed_out = false };
+        if (kept < output.len) kept += count;
+    }
+    // Only reachable without a deadline (or on a poll/read error): the output is simply cut.
+    return .{ .length = @intCast(kept), .timed_out = false };
+}
+
+/// Waits for the helper to end. Without a deadline it blocks; with one it looks every few
+/// milliseconds and returns null once the deadline has passed with the helper still running.
+fn reap_helper(pid: i32, deadline: u64) host.Error!?host.ExitStatus {
+    assert(pid > 0);
+    if (deadline == 0) return try wait_child(pid);
+    for (0..helper_reap_polls_max) |_| {
+        var status: i32 = 0;
+        const result = linux.wait4(pid, &status, linux.W.NOHANG, null);
+        if (linux.errno(result) != .INTR) {
+            try HostReal.check(result);
+            if (result == pid) return try decode_status(status);
+            assert(result == 0); // Still running.
+            if (monotonic_now_ms() >= deadline) return null;
+            var none: [0]linux.pollfd = .{};
+            _ = linux.poll(&none, 0, helper_reap_poll_ms); // Only a pause.
+        }
+    }
+    return null; // A deadline further away than an hour is not one this wait honours.
+}
+
+const helper_reap_poll_ms: i32 = 10;
+/// An hour of waits at the pause above; a deadline past it counts as expired.
+const helper_reap_polls_max: u32 = 360_000;
+
+/// The `SigIgn:` and `SigCgt:` lines of /proc/<pid>/status, as masks.
+fn parse_signal_masks(status: []const u8) ?host.SignalState {
+    var caught: ?u64 = null;
+    var ignored: ?u64 = null;
+    var lines = std.mem.splitScalar(u8, status, '\n');
+    while (lines.next()) |line| {
+        const key_end = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = line[0..key_end];
+        const value = std.mem.trim(u8, line[key_end + 1 ..], " \t");
+        const mask = std.fmt.parseInt(u64, value, 16) catch continue;
+        if (std.mem.eql(u8, key, "SigCgt")) caught = mask;
+        if (std.mem.eql(u8, key, "SigIgn")) ignored = mask;
+    }
+    return .{ .caught = caught orelse return null, .ignored = ignored orelse return null };
+}
+
+/// Appends every regular-file name of an open directory.
+fn read_entries(descriptor: i32, listing: *host.DirListing) host.Error!void {
+    var buffer: [4096]u8 align(8) = undefined;
+    for (0..constants.dir_entries_max + constants.eintr_retries_max + 8) |_| {
+        const count = linux.getdents64(descriptor, &buffer, buffer.len);
+        try HostReal.check(count);
+        if (count == 0) return;
+        var at: usize = 0;
+        while (at < count) {
+            // linux_dirent64: ino u64, off i64, reclen u16, type u8, then the NUL-terminated name.
+            const reclen = std.mem.readInt(u16, buffer[at + 16 ..][0..2], .little);
+            assert(reclen >= 19);
+            assert(at + reclen <= count);
+            const kind = buffer[at + 18];
+            const name = std.mem.sliceTo(buffer[at + 19 .. at + reclen], 0);
+            const wanted = kind == dirent_regular or kind == dirent_unknown;
+            if (wanted and name.len > 0) listing.add(name);
+            at += reclen;
+        }
+    }
+    listing.truncated = true; // More batches than a bounded listing can use.
+}
+
+const dirent_unknown: u8 = 0;
+const dirent_regular: u8 = 8;
+
+test "signal masks are read from the status lines, and only when both are there" {
+    // Goal: SigCgt and SigIgn parse as hex masks; a status without either is not guessed at.
+    const text = "Name:\tsh\nSigIgn:\t0000000000000004\nSigCgt:\t0000000000004002\n";
+    const state = parse_signal_masks(text).?;
+    try std.testing.expect(host.SignalState.has(state.caught, 2)); // SIGINT.
+    try std.testing.expect(host.SignalState.has(state.caught, 15)); // SIGTERM.
+    try std.testing.expect(!host.SignalState.has(state.caught, 1));
+    try std.testing.expect(host.SignalState.has(state.ignored, 3)); // SIGQUIT.
+    try std.testing.expect(parse_signal_masks("SigCgt:\t0\n") == null);
+    try std.testing.expect(parse_signal_masks("SigIgn:\t0\nSigCgt:\tzz\n") == null);
+    try std.testing.expect(parse_signal_masks("") == null);
+}
+
+test "a helper that hangs in any of four ways is killed at the deadline, and says so" {
+    // Goal: every shape of hang returns within the deadline (one second here), the helper dead
+    // by SIGKILL, and `timed_out` set so that no caller counts it a success. Method: scripts
+    // that ignore the alarm with the pipe held open, closed or redirected, that write past the
+    // read bound with SIGPIPE ignored, and a holder of the pipe that outlives the helper.
+    var real: HostReal = .{};
+    const envp = [_:null]?[*:0]const u8{null};
+    const scripts = [_][:0]const u8{
+        "trap '' ALRM; sleep 1000", // Ignores the alarm; the pipe stays open.
+        "trap '' ALRM; exec >/dev/null 2>&1; sleep 1000", // Pipe at EOF at once; still running.
+        "trap '' ALRM PIPE; while :; do echo x; done", // More writes than the read bound.
+    };
+    for (scripts) |script| {
+        const argv = [_:null]?[*:0]const u8{ "sh", "-c", script, null };
+        var output: [8]u8 = undefined;
+        const begun = monotonic_now_ms();
+        const result = try real.interface().run_helper(
+            .{ .path = "/bin/sh", .argv = &argv, .envp = &envp, .timeout_seconds = 1 },
+            &output,
+        );
+        try std.testing.expect(monotonic_now_ms() - begun < 5000);
+        try std.testing.expect(result.timed_out);
+        try std.testing.expectEqual(host.ExitStatus{ .signaled = 9 }, result.status);
+    }
+    // The helper exits 0 but a grandchild holds the pipe: killed at the deadline, and a failure.
+    const holder = [_:null]?[*:0]const u8{ "sh", "-c", "(sleep 1000 &) ; exit 0", null };
+    var output: [8]u8 = undefined;
+    const begun = monotonic_now_ms();
+    const result = try real.interface().run_helper(
+        .{ .path = "/bin/sh", .argv = &holder, .envp = &envp, .timeout_seconds = 1 },
+        &output,
+    );
+    try std.testing.expect(monotonic_now_ms() - begun < 5000);
+    try std.testing.expect(result.timed_out);
+}
+
+test "a helper that prints many lines slowly and exits 0 is not timed out" {
+    // Goal: a chatty ldconfig is no hang. 150 lines with short pauses, far more than the read
+    // bound, finish well inside the deadline: not killed, exit 0, first bytes kept.
+    var real: HostReal = .{};
+    const envp = [_:null]?[*:0]const u8{null};
+    const script =
+        "i=0; while [ $i -lt 150 ]; do echo \"warning $i\"; i=$((i+1)); sleep 0.005; done";
+    const argv = [_:null]?[*:0]const u8{ "sh", "-c", script, null };
+    var output: [16]u8 = undefined;
+    const result = try real.interface().run_helper(
+        .{ .path = "/bin/sh", .argv = &argv, .envp = &envp, .timeout_seconds = 20 },
+        &output,
+    );
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expectEqual(host.ExitStatus{ .exited = 0 }, result.status);
+    try std.testing.expectEqualStrings("warning 0\nwarnin", output[0..result.output_len]);
+}
+
+test "a helper that ends in time is not timed out, and reads /dev/null for input" {
+    // Goal: the deadline is no cost to a helper that finishes; its stdin is /dev/null (cat sees
+    // the end at once instead of waiting for the terminal or the caller's input).
+    var real: HostReal = .{};
+    const envp = [_:null]?[*:0]const u8{null};
+    const argv = [_:null]?[*:0]const u8{ "sh", "-c", "cat; echo done", null };
+    var output: [16]u8 = undefined;
+    const result = try real.interface().run_helper(
+        .{ .path = "/bin/sh", .argv = &argv, .envp = &envp, .timeout_seconds = 5 },
+        &output,
+    );
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expectEqual(host.ExitStatus{ .exited = 0 }, result.status);
+    try std.testing.expectEqualStrings("done\n", output[0..result.output_len]);
+}
+
+test "a real helper's status and output are captured, and the rest dropped" {
+    // Goal: run_helper on this machine: /bin/sh -c prints more than the buffer and exits 3.
+    var real: HostReal = .{};
+    const argv = [_:null]?[*:0]const u8{ "sh", "-c", "echo hello; echo oops >&2; exit 3", null };
+    const envp = [_:null]?[*:0]const u8{null};
+    var output: [8]u8 = undefined;
+    const result = try real.interface().run_helper(
+        .{ .path = "/bin/sh", .argv = &argv, .envp = &envp },
+        &output,
+    );
+    try std.testing.expectEqual(host.ExitStatus{ .exited = 3 }, result.status);
+    try std.testing.expectEqualStrings("hello\noo", output[0..result.output_len]);
+    const missing = try real.interface().run_helper(
+        .{ .path = "/zigbox/nope", .argv = &argv, .envp = &envp },
+        &output,
+    );
+    try std.testing.expectEqual(host.ExitStatus{ .exited = 127 }, missing.status);
+}
+
+test "a directory listing keeps regular files and marks what does not fit" {
+    // Goal: the real listing of a scratch directory: files by name, subdirectories left out.
+    var name_buffer: [64]u8 = undefined;
+    const format = "/tmp/zbx-list-{d}";
+    const directory = try std.fmt.bufPrintSentinel(&name_buffer, format, .{linux.getpid()}, 0);
+    try HostReal.check(linux.mkdir(directory.ptr, 0o755));
+    defer _ = linux.rmdir(directory.ptr);
+    var real: HostReal = .{};
+    const subject = real.interface();
+    var one: [80:0]u8 = undefined;
+    const first = try std.fmt.bufPrintSentinel(&one, "{s}/a.zon", .{directory}, 0);
+    try subject.write_file(first, "x");
+    defer _ = linux.unlink(first.ptr);
+    var two: [80:0]u8 = undefined;
+    const sub = try std.fmt.bufPrintSentinel(&two, "{s}/subdir", .{directory}, 0);
+    try HostReal.check(linux.mkdir(sub.ptr, 0o755));
+    defer _ = linux.rmdir(sub.ptr);
+    var listing: host.DirListing = undefined;
+    try subject.list_directory(directory, &listing);
+    try std.testing.expectEqual(@as(u32, 1), listing.count);
+    try std.testing.expectEqualStrings("a.zon", listing.name(0));
+    try std.testing.expect(!listing.truncated);
+}
+
+// ---- Probes ----------------------------------------------------------------------------------
+//
+// A probe forks a child that tries the operation and reports through its exit code, so a crash,
+// hang or kernel oddity cannot touch the caller. The child never returns into the caller's
+// code: it ends with exit_group, so no deferred cleanup of the parent runs in it. The parent
+// bounds the wait, kills and reaps on timeout, and removes the scratch directory on every path.
+
+/// The unprivileged identity probes run as when the caller is root. Root can create user
+/// namespaces even where ordinary users cannot, so probing as root would wrongly pass.
+const nobody_id: u32 = 65534;
+
+const child_exit_ok: u8 = 0;
+const child_exit_refused_namespace: u8 = 10;
+const child_exit_refused_mount: u8 = 11;
+/// The namespace exists, but writing setgroups/uid_map/gid_map was refused.
+const child_exit_refused_map: u8 = 13;
+const child_exit_failed: u8 = 12;
+/// FUSE only: `/dev/fuse` is missing or could not be opened.
+const child_exit_no_device: u8 = 14;
+
+const scratch_names = [_][:0]const u8{ "work/work", "work", "upper", "lower", "merged" };
+
+/// A scratch directory for the overlay probe: `root` plus fixed subdirectories made by the child.
+const Scratch = struct {
+    root: [constants.probe_scratch_bytes_max + 1]u8,
+    root_len: u32,
+    created: bool,
+
+    /// `give_to` is set only when the caller is root: the unprivileged child then needs to own the
+    /// directory. An ordinary caller already owns what it creates (and may not chown to a group
+    /// it is not in).
+    fn create(scratch: *Scratch, parent: []const u8, give_to: ?u32) host.Error!void {
+        scratch.created = false;
+        scratch.root_len = 0;
+        if (parent.len == 0) return error.InvalidPath;
+        if (parent.len > constants.probe_scratch_parent_bytes_max) return error.PathTooLong;
+        const process: u32 = @intCast(linux.getpid());
+        for (0..constants.probe_dir_attempts_max) |attempt| {
+            const formatted = std.fmt.bufPrintSentinel(&scratch.root, "{s}/zbx-doctor-{d}-{d}", .{
+                parent, process, attempt,
+            }, 0) catch return error.PathTooLong;
+            const result = linux.mkdir(formatted.ptr, 0o700);
+            if (linux.errno(result) == .EXIST) continue;
+            try HostReal.check(result);
+            scratch.root_len = @intCast(formatted.len);
+            scratch.created = true;
+            if (give_to) |owner| try HostReal.check(linux.chown(formatted.ptr, owner, owner));
+            assert(scratch.root_len > parent.len);
+            assert(scratch.root[scratch.root_len] == 0);
+            return;
+        }
+        return error.IoFailed;
+    }
+
+    fn join(scratch: *const Scratch, buffer: []u8, name: []const u8) [:0]const u8 {
+        assert(scratch.created);
+        assert(name.len > 0);
+        const root = scratch.root[0..scratch.root_len];
+        // Cannot fail: root is at most probe_scratch_bytes_max and buffers are sized for it.
+        const joined = std.fmt.bufPrintSentinel(buffer, "{s}/{s}", .{ root, name }, 0);
+        // Cannot fail: same bound as above.
+        const result = joined catch unreachable;
+        assert(result.len > root.len);
+        return result;
+    }
+
+    /// Removes everything the child may have made, then the root. Missing entries are fine.
+    fn remove(scratch: *const Scratch) void {
+        if (!scratch.created) return;
+        assert(scratch.root_len > 0);
+        var buffer: [constants.probe_scratch_bytes_max + 16]u8 = undefined;
+        for (scratch_names) |name| {
+            _ = linux.rmdir(scratch.join(&buffer, name).ptr);
+        }
+        _ = linux.rmdir(scratch.root[0..scratch.root_len :0].ptr);
+    }
+};
+
+fn probe_run(
+    self: *HostReal,
+    kind: host.ProbeKind,
+    path: [:0]const u8,
+) host.Error!host.ProbeOutcome {
+    assert((path.len > 0) == (kind == .idmap));
+    const caller = linux.getuid();
+    const give_to: ?u32 = if (caller == 0) nobody_id else null;
+    var scratch: Scratch = undefined;
+    scratch.created = false;
+    // Registered before create(): a failure after the directory exists (chown) must still
+    // remove it.
+    defer scratch.remove();
+    if (needs_scratch(kind)) try scratch.create(self.scratch_parent, give_to);
+
+    var options: [3 * constants.probe_scratch_bytes_max + 64]u8 = undefined;
+    const options_text = if (kind == .overlay) overlay_options(&options, &scratch) else "";
+
+    const forked = linux.fork();
+    try HostReal.check(forked);
+    if (forked == 0) child_main(self, kind, &scratch, options_text, caller == 0, path);
+    const child: i32 = @intCast(forked);
+    assert(child > 0);
+    assert(scratch.created == needs_scratch(kind));
+    return wait_for_child(child, kind, self.probe_timeout_ms);
+}
+
+/// The overlay probe mounts on directories under the scratch root, the FUSE probe on the root.
+fn needs_scratch(kind: host.ProbeKind) bool {
+    return kind == .overlay or kind == .fuse;
+}
+
+/// The overlay mount data, built in the parent so the child allocates and formats nothing.
+fn overlay_options(buffer: []u8, scratch: *const Scratch) [:0]const u8 {
+    if (!scratch.created) return "";
+    const root = scratch.root[0..scratch.root_len];
+    // userxattr: a mount made from a user namespace must keep its metadata in user.* xattrs.
+    const format = "userxattr,lowerdir={s}/lower,upperdir={s}/upper,workdir={s}/work";
+    // Cannot fail: the buffer holds three roots plus the fixed text, by construction above.
+    const formatted = std.fmt.bufPrintSentinel(buffer, format, .{ root, root, root }, 0);
+    // Cannot fail: same bound as above.
+    const result = formatted catch unreachable;
+    assert(std.mem.startsWith(u8, result, "userxattr,"));
+    assert(result.len > 3 * root.len);
+    return result;
+}
+
+/// Runs in the forked child and never returns.
+fn child_main(
+    self: *const HostReal,
+    kind: host.ProbeKind,
+    scratch: *const Scratch,
+    options: [:0]const u8,
+    drop_privileges: bool,
+    path: [:0]const u8,
+) noreturn {
+    if (drop_privileges) {
+        if (!drop_to_nobody()) linux.exit_group(child_exit_failed);
+    }
+    if (self.child_hook) |hook| hook();
+    assert(scratch.created == needs_scratch(kind));
+    if (kind == .overlay) assert(options.len > 0);
+
+    // The ids to map are read here, before the namespace exists: inside an unmapped user
+    // namespace getuid() and getgid() return the overflow id (65534), not the caller's.
+    const uid = linux.getuid();
+    const gid = linux.getgid();
+    assert(uid != 0); // Root was dropped to an unprivileged id above, or never was root.
+    // A caller that changed its ids is not dumpable, which makes /proc/self/*_map root-owned.
+    const dumpable = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+    if (linux.errno(dumpable) != .SUCCESS) linux.exit_group(child_exit_failed);
+
+    const flags: usize = switch (kind) {
+        .userns => linux.CLONE.NEWUSER,
+        .overlay, .idmap, .fuse => linux.CLONE.NEWUSER | linux.CLONE.NEWNS,
+    };
+    const unshared = linux.errno(linux.unshare(flags));
+    if (unshared != .SUCCESS) {
+        linux.exit_group(refusal_exit(unshared, child_exit_refused_namespace));
+    }
+    // Map the caller's single id to root inside, as zbx itself will. A process with no mapping
+    // can create the namespace but not do anything useful in it (overlay mounts are refused).
+    if (!map_single_ids(uid, gid)) linux.exit_group(child_exit_refused_map);
+    if (kind == .userns) linux.exit_group(child_exit_ok);
+
+    // Keep the mount from propagating back to the caller's namespace.
+    const private = linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0);
+    if (linux.errno(private) != .SUCCESS) linux.exit_group(child_exit_refused_mount);
+    if (kind == .idmap) linux.exit_group(idmap_attempt(path));
+    if (kind == .fuse) linux.exit_group(fuse_attempt(scratch));
+    linux.exit_group(overlay_mount(scratch, options));
+}
+
+/// Makes the id-mapped mount the doctor asks about, and throws it away with the namespace: a
+/// detached clone of `path`'s mount (`open_tree`), then `mount_setattr` with `MOUNT_ATTR_IDMAP`
+/// and this scratch user namespace as the map. Nothing is attached anywhere. Returns the
+/// child's exit code: ok, a refusal (the kernel or the file system says no), or a failure.
+fn idmap_attempt(path: [:0]const u8) u8 {
+    assert(path.len > 0);
+    const open_tree_number = 428; // The same on x86_64 and aarch64.
+    const mount_setattr_number = 442;
+    const open_tree_clone: usize = 0x1; // OPEN_TREE_CLONE
+    const open_cloexec: usize = 0o2000000; // OPEN_TREE_CLOEXEC is O_CLOEXEC.
+    const at_empty_path: usize = 0x1000; // AT_EMPTY_PATH
+    const attr_idmap: u64 = 0x100000; // MOUNT_ATTR_IDMAP
+    const cwd: usize = @bitCast(@as(isize, linux.AT.FDCWD));
+    const cloned = linux.syscall3(
+        @fromBackingInt(@intCast(open_tree_number)),
+        cwd,
+        @intFromPtr(path.ptr),
+        open_tree_clone | open_cloexec,
+    );
+    if (linux.errno(cloned) != .SUCCESS) {
+        return refusal_exit(linux.errno(cloned), child_exit_refused_mount);
+    }
+    const tree: i32 = @intCast(cloned);
+    const own_namespace: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+    const user_namespace = linux.open("/proc/self/ns/user", own_namespace, 0);
+    if (linux.errno(user_namespace) != .SUCCESS) return child_exit_failed;
+    const attributes: MountAttr = .{
+        .attr_set = attr_idmap,
+        .attr_clr = 0,
+        .propagation = 0,
+        .userns_fd = @intCast(user_namespace),
+    };
+    const done = linux.syscall5(
+        @fromBackingInt(@intCast(mount_setattr_number)),
+        @intCast(tree),
+        @intFromPtr(@as([*:0]const u8, "")),
+        at_empty_path,
+        @intFromPtr(&attributes),
+        @sizeOf(MountAttr),
+    );
+    if (linux.errno(done) == .SUCCESS) return child_exit_ok;
+    return refusal_exit(linux.errno(done), child_exit_refused_mount);
+}
+
+/// Opens `/dev/fuse` and mounts it on the scratch root as `run --lazy` mounts it
+/// (`host_real_fuse.mount`). Nothing answers the kernel's `INIT`; the mount and the descriptor go
+/// with the namespace when the child exits. A missing or unopenable device is its own outcome
+/// (`no_device`), so the doctor can say which of the two the host lacks.
+fn fuse_attempt(scratch: *const Scratch) u8 {
+    assert(scratch.created);
+    const opened = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    switch (linux.errno(opened)) {
+        .SUCCESS => {},
+        .NOENT, .NXIO, .NODEV, .ACCES, .PERM => return child_exit_no_device,
+        else => return child_exit_failed,
+    }
+    const mounted = host_real_fuse.mount(@intCast(opened), scratch.root[0..scratch.root_len :0]);
+    if (mounted == .SUCCESS) return child_exit_ok;
+    return refusal_exit(mounted, child_exit_refused_mount);
+}
+
+/// Writes `/proc/self/{setgroups,gid_map,uid_map}` so that `uid` and `gid` (the ids the process
+/// had before it entered the namespace) map to 0 inside. A map may only name ids the caller owns.
+fn map_single_ids(uid: u32, gid: u32) bool {
+    var line: [32]u8 = undefined;
+    if (!write_proc("/proc/self/setgroups", "deny")) return false;
+    const gid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{gid}) catch return false;
+    if (!write_proc("/proc/self/gid_map", gid_line)) return false;
+    const uid_line = std.fmt.bufPrint(&line, "0 {d} 1\n", .{uid}) catch return false;
+    return write_proc("/proc/self/uid_map", uid_line);
+}
+
+fn write_proc(path: [:0]const u8, bytes: []const u8) bool {
+    assert(bytes.len > 0);
+    assert(std.mem.startsWith(u8, path, "/proc/self/")); // Only our own process's files.
+    const opened = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return false;
+    const descriptor: i32 = @intCast(opened);
+    const written = linux.write(descriptor, bytes.ptr, bytes.len);
+    _ = linux.close(descriptor);
+    return linux.errno(written) == .SUCCESS and written == bytes.len;
+}
+
+/// Creates the overlay directories and mounts. Returns the child's exit code.
+fn overlay_mount(scratch: *const Scratch, options: [:0]const u8) u8 {
+    assert(scratch.created);
+    assert(options.len > 0);
+    var buffer: [constants.probe_scratch_bytes_max + 16]u8 = undefined;
+    const directories = [_][:0]const u8{ "lower", "upper", "work", "merged" };
+    for (directories) |name| {
+        const made = linux.errno(linux.mkdir(scratch.join(&buffer, name).ptr, 0o700));
+        if (made != .SUCCESS) return child_exit_failed;
+    }
+    const target = scratch.join(&buffer, "merged");
+    const data = @intFromPtr(options.ptr);
+    const mounted = linux.errno(linux.mount("overlay", target.ptr, "overlay", 0, data));
+    if (mounted == .SUCCESS) return child_exit_ok;
+    return refusal_exit(mounted, child_exit_refused_mount);
+}
+
+/// Errors that mean "this system says no" map to `refusal`; anything else is a probe failure.
+fn refusal_exit(code: linux.E, refusal: u8) u8 {
+    assert(code != .SUCCESS);
+    const result: u8 = switch (code) {
+        .PERM, .ACCES, .NOSPC, .INVAL, .NODEV, .NOSYS, .OPNOTSUPP => refusal,
+        else => child_exit_failed,
+    };
+    assert(result != child_exit_ok); // A refusal is never reported as success.
+    return result;
+}
+
+/// Whether the process's effective group or one of its supplementary groups is `gid`.
+fn in_group(gid: u32) bool {
+    if (linux.getegid() == gid) return true;
+    var groups: [constants.groups_max]linux.gid_t = undefined;
+    const count = linux.getgroups(groups.len, &groups);
+    if (linux.errno(count) != .SUCCESS) return false;
+    assert(count <= groups.len);
+    return std.mem.indexOfScalar(linux.gid_t, groups[0..count], gid) != null;
+}
+
+fn drop_to_nobody() bool {
+    const no_groups = [_]linux.gid_t{};
+    if (linux.errno(linux.setgroups(0, &no_groups)) != .SUCCESS) return false;
+    if (linux.errno(linux.setresgid(nobody_id, nobody_id, nobody_id)) != .SUCCESS) return false;
+    if (linux.errno(linux.setresuid(nobody_id, nobody_id, nobody_id)) != .SUCCESS) return false;
+    // Changing ids made the process undumpable, which makes its /proc/self files root-owned
+    // and unwritable for the uid_map step; make it dumpable again.
+    const dumpable = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+    if (linux.errno(dumpable) != .SUCCESS) return false;
+    // Dropping the user id must also have dropped every capability; check, do not assume.
+    return linux.getuid() == nobody_id and linux.geteuid() == nobody_id;
+}
+
+fn sleep_poll_interval() void {
+    const interval: linux.timespec = .{
+        .sec = 0,
+        .nsec = @intCast(constants.probe_poll_ms * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&interval, null);
+}
+
+/// Polls for the child with a bounded number of steps; on timeout kills and reaps it.
+fn wait_for_child(child: i32, kind: host.ProbeKind, timeout_ms: u32) host.ProbeOutcome {
+    assert(child > 0);
+    assert(timeout_ms >= constants.probe_poll_ms);
+    const polls = @divExact(timeout_ms, constants.probe_poll_ms);
+    var status: i32 = 0;
+    for (0..polls + 1) |_| {
+        const result = linux.wait4(child, &status, linux.W.NOHANG, null);
+        if (result == child) return classify_status(@bitCast(status), kind);
+        if (linux.errno(result) == .CHILD) return .failed; // Reaped elsewhere: cannot happen.
+        sleep_poll_interval();
+    }
+    _ = linux.kill(child, .KILL);
+    for (0..constants.probe_reap_polls_max) |_| {
+        if (linux.wait4(child, &status, linux.W.NOHANG, null) == child) return .timed_out;
+        sleep_poll_interval();
+    }
+    return .timed_out; // Unreapable (uninterruptible sleep): reported, and the zombie is harmless.
+}
+
+fn classify_status(status: u32, kind: host.ProbeKind) host.ProbeOutcome {
+    if (linux.W.IFSIGNALED(status)) return .signaled;
+    if (!linux.W.IFEXITED(status)) return .failed;
+    return switch (linux.W.EXITSTATUS(status)) {
+        child_exit_ok => .ok,
+        child_exit_refused_namespace => if (kind == .userns) .denied else .setup_denied,
+        child_exit_refused_map => .map_denied,
+        child_exit_refused_mount => .denied,
+        child_exit_no_device => if (kind == .fuse) .no_device else .failed,
+        else => .failed,
+    };
+}
+
+// ---- Probe tests -----------------------------------------------------------------------------
+
+fn hook_sleep_forever() noreturn {
+    const interval: linux.timespec = .{ .sec = 1, .nsec = 0 };
+    while (true) _ = linux.nanosleep(&interval, null);
+}
+
+fn hook_kill_self() noreturn {
+    _ = linux.kill(linux.getpid(), .KILL);
+    linux.exit_group(0);
+}
+
+fn hook_exit_ok() noreturn {
+    linux.exit_group(child_exit_ok);
+}
+
+fn hook_exit_namespace() noreturn {
+    linux.exit_group(child_exit_refused_namespace);
+}
+
+fn hook_exit_map() noreturn {
+    linux.exit_group(child_exit_refused_map);
+}
+
+fn hook_exit_mount() noreturn {
+    linux.exit_group(child_exit_refused_mount);
+}
+
+/// Exits 0 only if the child is not root: proves privileges were dropped before the hook ran.
+fn hook_exit_ok_if_unprivileged() noreturn {
+    linux.exit_group(if (linux.getuid() == 0) 1 else child_exit_ok);
+}
+
+fn hook_exit_other() noreturn {
+    linux.exit_group(77);
+}
+
+/// True if no child of this process remains, reaped or not (wait4 says ECHILD).
+fn no_children_left() bool {
+    var status: i32 = 0;
+    const result = linux.wait4(-1, &status, linux.W.NOHANG, null);
+    return linux.errno(result) == .CHILD;
+}
+
+test "probe child outcomes map from exit status, signal and timeout, and are all reaped" {
+    // Goal: every way a probe child can end becomes the right outcome and leaves no zombie.
+    // Method: replace the child body with hooks (so the answer does not depend on this
+    // kernel), use a short timeout for the hanging child.
+    const Case = struct {
+        hook: *const fn () noreturn,
+        kind: host.ProbeKind,
+        expected: host.ProbeOutcome,
+    };
+    const cases = [_]Case{
+        .{ .hook = hook_exit_ok, .kind = .userns, .expected = .ok },
+        .{ .hook = hook_exit_namespace, .kind = .userns, .expected = .denied },
+        .{ .hook = hook_exit_namespace, .kind = .overlay, .expected = .setup_denied },
+        .{ .hook = hook_exit_mount, .kind = .overlay, .expected = .denied },
+        .{ .hook = hook_exit_map, .kind = .userns, .expected = .map_denied },
+        .{ .hook = hook_exit_map, .kind = .overlay, .expected = .map_denied },
+        .{ .hook = hook_exit_other, .kind = .userns, .expected = .failed },
+        .{ .hook = hook_kill_self, .kind = .userns, .expected = .signaled },
+        .{ .hook = hook_sleep_forever, .kind = .userns, .expected = .timed_out },
+    };
+    for (cases) |case| {
+        var real: HostReal = .{ .child_hook = case.hook, .probe_timeout_ms = 50 };
+        const outcome = try real.interface().probe(case.kind);
+        try std.testing.expectEqual(case.expected, outcome);
+        try std.testing.expect(no_children_left());
+    }
+}
+
+test "the id-mapped mount probe maps its child's exit to an outcome and reaps it" {
+    // Goal: M6b's probe ends as the others do: a mount refused is `denied`, namespaces refused
+    // is `setup_denied`, success is `ok`, and no child is left. Method: hooks stand in for the
+    // child's body; then the real probe on "/", whose answer depends on this kernel and user
+    // (an unprivileged user is normally refused) and must be one of the answers a run can give.
+    const Case = struct { hook: *const fn () noreturn, expected: host.ProbeOutcome };
+    const cases = [_]Case{
+        .{ .hook = hook_exit_ok, .expected = .ok },
+        .{ .hook = hook_exit_mount, .expected = .denied },
+        .{ .hook = hook_exit_namespace, .expected = .setup_denied },
+        .{ .hook = hook_exit_map, .expected = .map_denied },
+        .{ .hook = hook_exit_other, .expected = .failed },
+    };
+    for (cases) |case| {
+        var real: HostReal = .{ .child_hook = case.hook, .probe_timeout_ms = 50 };
+        const outcome = try real.interface().probe_idmap("/");
+        try std.testing.expectEqual(case.expected, outcome);
+        try std.testing.expect(no_children_left());
+    }
+    var real: HostReal = .{ .probe_timeout_ms = 2000 };
+    const answer = try real.interface().probe_idmap("/");
+    try std.testing.expect(answer != .signaled);
+    try std.testing.expect(answer != .timed_out);
+    try std.testing.expect(no_children_left());
+}
+
+test "the probe child runs unprivileged even when the caller is root" {
+    // Goal: root can create user namespaces where ordinary users cannot, so a probe run as root
+    // would pass wrongly. Method: the hook runs after the privilege drop and reports whether the
+    // child is still uid 0. When this test runs as an ordinary user the child never was root.
+    var real: HostReal = .{ .child_hook = hook_exit_ok_if_unprivileged, .probe_timeout_ms = 1000 };
+    try std.testing.expectEqual(host.ProbeOutcome.ok, try real.interface().probe(.userns));
+    try std.testing.expect(no_children_left());
+}
+
+/// Forks a process that becomes `uid`:`gid` (dumpable, as a normal login is), runs the real
+/// probe there, and returns its outcome. Null if it could not be run. Needs root to drop ids.
+fn probe_as(uid: u32, gid: u32, kind: host.ProbeKind) ?host.ProbeOutcome {
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return null;
+    if (forked == 0) {
+        const no_groups = [_]linux.gid_t{};
+        var ok = linux.errno(linux.setgroups(0, &no_groups)) == .SUCCESS;
+        ok = ok and linux.errno(linux.setresgid(gid, gid, gid)) == .SUCCESS;
+        ok = ok and linux.errno(linux.setresuid(uid, uid, uid)) == .SUCCESS;
+        const dumpable = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+        if (!ok or linux.errno(dumpable) != .SUCCESS) linux.exit_group(99);
+        var real: HostReal = .{ .probe_timeout_ms = 2000 };
+        const outcome = real.interface().probe(kind) catch linux.exit_group(98);
+        linux.exit_group(@intCast(@backingInt(outcome)));
+    }
+    var status: i32 = 0;
+    if (linux.wait4(@intCast(forked), &status, 0, null) != forked) return null;
+    const bits: u32 = @bitCast(status);
+    if (!linux.W.IFEXITED(bits)) return null;
+    const code = linux.W.EXITSTATUS(bits);
+    if (code >= std.meta.fieldNames(host.ProbeOutcome).len) return null;
+    return @fromBackingInt(@intCast(code));
+}
+
+test "the real probe works for an ordinary user whose ids are neither root nor 65534" {
+    // Goal: regression for reading getuid()/getgid() after unshare, which returns the overflow
+    // id 65534 and maps an id the caller does not own (EPERM). The old tests ran as root, which
+    // is dropped to 65534, the one id for which that bug is invisible. Method: run the real
+    // probe as uid 4242 and gid 4343 (different from each other, root and 65534). It must agree
+    // with the probe run as nobody; if this kernel refuses the probe for nobody too, skip.
+    if (linux.getuid() != 0) return error.SkipZigTest; // Dropping ids needs root.
+    const kinds = [_]host.ProbeKind{ .userns, .overlay };
+    for (kinds) |kind| {
+        const baseline = probe_as(65534, 65534, kind) orelse return error.SkipZigTest;
+        if (baseline != .ok) return error.SkipZigTest;
+        const other = probe_as(4242, 4343, kind) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(host.ProbeOutcome.ok, other);
+    }
+    try std.testing.expect(no_children_left());
+}
+
+test "the overlay probe leaves its scratch directory empty and removable" {
+    // Goal: cleanup on every path. Method: point the scratch parent at a fresh directory, run
+    // the overlay probe for real (whatever this kernel answers) and with each hook, then rmdir
+    // the parent: it only succeeds if nothing was left behind.
+    var name_buffer: [64]u8 = undefined;
+    const format = "/tmp/zbx-test-{d}";
+    const parent = try std.fmt.bufPrintSentinel(&name_buffer, format, .{linux.getpid()}, 0);
+    try HostReal.check(linux.mkdir(parent.ptr, 0o755));
+    defer _ = linux.rmdir(parent.ptr);
+
+    var real: HostReal = .{ .scratch_parent = parent, .probe_timeout_ms = 2000 };
+    _ = try real.interface().probe(.overlay);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir(parent.ptr)));
+    try HostReal.check(linux.mkdir(parent.ptr, 0o755));
+
+    const hooks = [_]*const fn () noreturn{ hook_exit_ok, hook_kill_self, hook_sleep_forever };
+    for (hooks) |hook| {
+        real = .{ .scratch_parent = parent, .probe_timeout_ms = 50, .child_hook = hook };
+        _ = try real.interface().probe(.overlay);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir(parent.ptr)));
+        try HostReal.check(linux.mkdir(parent.ptr, 0o755));
+    }
+    try std.testing.expect(no_children_left());
+}
+
+test "the real userns probe answers with a defined outcome" {
+    // Goal: the unhooked probe runs end to end on this machine. The answer depends on the
+    // kernel, so only its shape is asserted: not a hang, not a leak.
+    var real: HostReal = .{ .probe_timeout_ms = 2000 };
+    const outcome = try real.interface().probe(.userns);
+    try std.testing.expect(outcome != .timed_out);
+    try std.testing.expect(no_children_left());
+}
+
+test "real stat reports owner and type, capability read reports absence" {
+    // Goal: stat returns the mode and owner of a root-owned directory; a file without the
+    // xattr gives NoData rather than success; seccomp and uid answer.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    const result = try subject.stat("/proc");
+    try std.testing.expectEqual(@as(u32, std.posix.S.IFDIR), result.mode & std.posix.S.IFMT);
+    try std.testing.expectEqual(@as(u32, 0), result.uid);
+    try std.testing.expectError(error.NotFound, subject.stat("/zigbox-does-not-exist"));
+
+    var buffer: [constants.capability_bytes_max]u8 = undefined;
+    try std.testing.expectError(error.NoData, subject.read_capability("/proc/self/stat", &buffer));
+    try std.testing.expectError(error.NotFound, subject.read_capability("/zigbox-nope", &buffer));
+    try std.testing.expectEqual(linux.getuid(), subject.uid());
+    const mode = try subject.seccomp_mode();
+    try std.testing.expect(mode <= 2);
+}
+
+const repeat = @import("test_util.zig").repeat;
+
+test "real read_timeout waits for bytes, times out when there are none, and sees the end" {
+    // Goal: the poll-then-read that the D-Bus client's waits are built on. Method: a real pipe
+    // with nothing in it times out (the call returns after about the time asked, not a hang);
+    // with a byte in it the read returns it; with the writer closed the read returns 0.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    const pipe = try subject.pipe();
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectError(error.TimedOut, subject.read_timeout(pipe.read, &buffer, 10));
+    try std.testing.expectEqual(@as(u16, 0), subject.last_errno());
+    try subject.write_handle_all(pipe.write, "x");
+    try std.testing.expectEqual(@as(u32, 1), try subject.read_timeout(pipe.read, &buffer, 10));
+    try std.testing.expectEqual(@as(u8, 'x'), buffer[0]);
+    subject.close(pipe.write);
+    try std.testing.expectEqual(@as(u32, 0), try subject.read_timeout(pipe.read, &buffer, 10));
+    subject.close(pipe.read);
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+test "real socket_connect names why a bus cannot be reached" {
+    // Goal: a path that does not exist is NotFound (ENOENT), and one that is not a socket is
+    // refused with the errno the diagnostic names (ECONNREFUSED); neither leaves a descriptor.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    try std.testing.expectError(error.NotFound, subject.socket_connect("/zigbox-no-such-bus"));
+    try std.testing.expectEqual(@as(u16, 2), subject.last_errno());
+    try std.testing.expectError(error.IoFailed, subject.socket_connect("/dev/null"));
+    try std.testing.expectEqual(@as(u16, 111), subject.last_errno());
+    try std.testing.expectError(error.PathTooLong, subject.socket_connect(repeat('/', 108)));
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+/// The number of open descriptors of a process, from `/proc/<pid>/fd`; null if it cannot be read.
+fn descriptor_count(pid: host.Pid) ?u32 {
+    var path: [32:0]u8 = undefined;
+    // Cannot fail: "/proc/4294967295/fd" is 19 bytes.
+    const text = std.fmt.bufPrintSentinel(&path, "/proc/{d}/fd", .{pid}, 0) catch unreachable;
+    const opened = linux.open(text.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const directory: i32 = @intCast(opened);
+    defer _ = linux.close(directory);
+    var buffer: [4096]u8 align(8) = undefined;
+    var count: u32 = 0;
+    while (true) {
+        const read = linux.getdents64(directory, &buffer, buffer.len);
+        if (linux.errno(read) != .SUCCESS) return null;
+        if (read == 0) return count;
+        var at: usize = 0;
+        while (at < read) {
+            const length = std.mem.readInt(u16, buffer[at + 16 ..][0..2], .little);
+            const name = std.mem.sliceTo(buffer[at + 19 ..], 0);
+            if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) count += 1;
+            at += length;
+        }
+    }
+}
+
+test "real wait_event sees a child that ended before the signals were blocked" {
+    // Goal: the hang of `zbx run ... -- true` that showed once in a few dozen runs in the VM: the
+    // container ended between the start of its command and the block of SIGCHLD, so the signal
+    // was dropped and the wait looked at an empty queue for ever. Method: a child that exits at
+    // once, a pause long enough for it to be a zombie and its SIGCHLD to be gone, then the
+    // block and the wait, which must answer with the child's status and not run out its time.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    const forked = linux.fork();
+    try std.testing.expect(linux.errno(forked) == .SUCCESS);
+    if (forked == 0) linux.exit_group(7);
+    const pid: host.Pid = @intCast(forked);
+    subject.sleep_ms(200);
+    try subject.block_signals(true);
+    defer subject.block_signals(false) catch {};
+    const event = try subject.wait_event(pid, 5000);
+    try std.testing.expectEqual(host.Event{ .exited = .{ .exited = 7 } }, event);
+}
+
+test "real keeper holds one descriptor, lives until its pipe's writers are gone, and ends 0" {
+    // Goal: Host.start_keeper on a real kernel. Method: open a second pipe first so there is
+    // something to inherit, start the keeper on the first pipe's read end, and wait until it has
+    // closed everything else (it holds exactly one descriptor, the pipe). It is alive while the
+    // write end is open and, with that closed, ends with status 0 and is reaped. The death
+    // signal and the parent check are the kernel's; the VM demo kills a zbx and looks.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    const hold = try subject.pipe();
+    const other = try subject.pipe();
+    const pid = try subject.start_keeper(hold.read);
+    subject.close(hold.read);
+    subject.close(other.read);
+    subject.close(other.write);
+    var settled = false;
+    for (0..400) |_| {
+        if (descriptor_count(pid) == 1) {
+            settled = true;
+            break;
+        }
+        subject.sleep_ms(5);
+    }
+    try std.testing.expect(settled);
+    try subject.signal(pid, 0); // Alive: it is blocked reading.
+    subject.close(hold.write);
+    const status = try subject.wait_for(pid);
+    try std.testing.expectEqual(host.ExitStatus{ .exited = 0 }, status);
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+/// The signal's number, as `interrupt_signal` returns it.
+fn number_of(signal: linux.SIG) u8 {
+    return @intCast(@backingInt(signal));
+}

@@ -1,0 +1,15 @@
+.{
+    .name = .zigbox,
+    .version = "0.5.3",
+    // Pinned: Zig is pre-1.0 and std changes between releases. Upgrade only between milestones.
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "LICENSE",
+        "vm",
+    },
+    .fingerprint = 0xde40c4aa10161344,
+}
