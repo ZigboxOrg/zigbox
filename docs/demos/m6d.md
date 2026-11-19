@@ -144,7 +144,7 @@ Nothing here is a secret. zbx never asks for or handles a key.
 
 ## Running it
 
-- **CI.** The `demo-m6d` job in `ci.yml` runs when `.github/ci-changes.sh` selects it: the
+- **CI.** The `demo-m6d` job in `ci.yml` runs when `src/ci/changes.zig` selects it: the
   harness files, `.github/actions/m6d-setup`, and, through `want_from m4`, the registry, pull, Google
   and cloud code.
 - **Scratch branch.** `git push origin HEAD:vm/m6d-<slug>` runs it in `vm.yml`. `vm/all-*` does

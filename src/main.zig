@@ -277,8 +277,6 @@ test {
     _ = @import("runtime/knobs_tests.zig");
     _ = @import("runtime/listen_tests.zig");
     _ = @import("runtime/hosts_file_tests.zig");
-    // CI path selection (`.github/ci-changes.sh`).
-    _ = @import("ci_changes_tests.zig");
 }
 
 test {

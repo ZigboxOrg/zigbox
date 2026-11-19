@@ -33,4 +33,4 @@ The supervisor reviews every slice against this list, so run it yourself first, 
 - **`zig build check` on the exact commit you report**, with its last line pasted. It runs every fuzzer with a fresh seed; when one fails, its seed is the last `fuzz:` line above, and the replay is `zig build fuzz -- <fuzzer> <seed> 2000`.
 - **A test reachable from no test root never runs.** A new file of tests is imported from a root in `build.zig`'s test list, and you have seen it run (`zig build test --summary all`).
 - **A fixture parsed from text is checked against real output**, captured from a real run, not written from what the code is believed to print.
-- **Every new fuzzer, teeth test or gate runs somewhere**: in `zig build check` or in CI, with a `.github/ci-changes.sh` rule where it is path-gated, and it is listed in AGENTS.md's commands.
+- **Every new fuzzer, teeth test or gate runs somewhere**: in `zig build check` or in CI, with a `src/ci/changes.zig` rule where it is path-gated, and it is listed in AGENTS.md's commands.

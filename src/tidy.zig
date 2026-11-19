@@ -29,8 +29,10 @@ const files_max: u32 = 10_000;
 /// Shell scripts are banned (build tooling is Zig). A path listed here is allowed, and each
 /// entry needs a written reason next to it.
 const shell_allowlist = [_][]const u8{
-    // CI's path classification runs in the `changes` job, before Zig is installed.
-    ".github/ci-changes.sh",
+    // The one-time setup of the CI box (a root shell on a bare Ubuntu host: Docker, the Woodpecker
+    // containers, the secrets). It runs before any Zig exists there and touches the machine, not
+    // the repository; ops/ci/README.md.
+    "ops/ci/bootstrap.sh",
     // The release workflow's signing glue around `gpg` and `rpm`, which no Zig code can replace
     // (docs/STYLE.md, "The Linux package release"); its test script runs the same file.
     ".github/release-sign.sh",
