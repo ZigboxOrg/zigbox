@@ -1,0 +1,71 @@
+# The code gates of .github/workflows/ci.yml (build, tidy, test, errors-site, fuzz, fuzz-provenance,
+# dbus-live) on the fleet box's Woodpecker (ops/ci/README.md). Each runs as `tester`, an ordinary
+# user, and is skipped, with a line saying so, when the change touches no code
+# (.github/ci-changes.sh decides, as on GitHub). The logic is in ops/ci/step.sh.
+when:
+  - event: pull_request
+  - event: push
+    branch: main
+  - event: manual
+
+steps:
+  - name: changes
+    image: zigbox-ci:0.17.0
+    commands:
+      - bash ops/ci/step.sh changes
+
+  - name: build
+    image: zigbox-ci:0.17.0
+    depends_on: [changes]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate build
+
+  - name: tidy
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate tidy
+
+  - name: test
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate test
+
+  - name: errors-site
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate errors-site
+
+  - name: fuzz
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate fuzz
+
+  - name: fuzz-provenance
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate fuzz-provenance
+
+  - name: dbus-live
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh gate dbus-live
