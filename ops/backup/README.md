@@ -48,8 +48,9 @@ It clones this repository into `/opt/zigbox-backup/src` (`ZIGBOX_BACKUP_REF=<bra
 picks another branch than `main`) and runs the copy there. On the first run it asks for the DNS
 name, the Forgejo admin's login and e-mail (the e-mail also goes to Let's Encrypt), and the token
 from step 2 (read without echo, stored in `/etc/zigbox-backup/github-token`, mode 0400). Then it
-installs Forgejo (signature checked), starts it, creates the admin with a random password (printed
-once: keep it in your password manager), the organisation `ZigboxOrg` and its two private
+installs Forgejo (signature checked), starts it, creates the admin with a random first password
+(kept in `/etc/zigbox-backup/admin-password`, root only; Forgejo asks for a new one at the first
+login, then delete the file), the organisation `ZigboxOrg` and its two private
 repositories, and the timer, and runs the first copy. The last line must be
 `backup-bootstrap: OK https://git.zigbox.org (...)`; a `FAIL` line says what to fix.
 
@@ -68,6 +69,9 @@ Each run ends in `backup: OK 2 repositories at <time>`; `/var/lib/zigbox-backup/
 Unix time of the last good run.
 
 ## Running it
+
+- **Lost the admin password:** rerun step 3 with `ZIGBOX_BACKUP_RESET_ADMIN=1` before `bash`; it
+  writes a new first-login password to `/etc/zigbox-backup/admin-password`.
 
 - **Renew the GitHub token** before it expires: `rm /etc/zigbox-backup/github-token` and rerun the
   bootstrap (step 3), which asks for a new one. A run with an expired token logs
