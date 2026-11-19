@@ -33,6 +33,10 @@ const shell_allowlist = [_][]const u8{
     // containers, the secrets). It runs before any Zig exists there and touches the machine, not
     // the repository; ops/ci/README.md.
     "ops/ci/bootstrap.sh",
+    // The git backup box (Forgejo on a small VPS): its one-time setup, and the timer's copy job,
+    // glue around `git fetch` and `git push`, with no Zig on that box; ops/backup/README.md.
+    "ops/backup/bootstrap.sh",
+    "ops/backup/sync.sh",
     // The release workflow's signing glue around `gpg` and `rpm`, which no Zig code can replace
     // (docs/STYLE.md, "The Linux package release"); its test script runs the same file.
     ".github/release-sign.sh",
