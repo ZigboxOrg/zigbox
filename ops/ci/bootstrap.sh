@@ -125,7 +125,7 @@ free_gb=$(df -BG --output=avail /var/lib | tail -1 | tr -dc 0-9)
 [ "$free_gb" -ge 100 ] || fail "/var/lib has ${free_gb} GiB free; the VM images and caches need 100"
 
 # --- Packages ------------------------------------------------------------------------------------
-pkgs=(docker.io docker-compose-v2 ca-certificates curl git qemu-system-x86 qemu-utils)
+pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl git qemu-system-x86 qemu-utils)
 missing=()
 for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
 if [ "${#missing[@]}" -gt 0 ]; then
