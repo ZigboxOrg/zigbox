@@ -117,4 +117,4 @@ Linux only, by design. Running containers will need unprivileged user namespaces
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

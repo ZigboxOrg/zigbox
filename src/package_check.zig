@@ -485,7 +485,7 @@ pub const TreeSource = struct {
 const test_inputs: release.Inputs = .{
     .version = "1.2.3",
     .zbx = .{ "x86 binary", "arm binary" },
-    .license = "MIT licence\n",
+    .license = "Apache-2.0 licence\n",
 };
 
 test "a built tree passes, and flipping one byte of a placed rpm fails" {

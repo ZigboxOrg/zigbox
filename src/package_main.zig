@@ -209,7 +209,7 @@ fn run_build(io: Io, memory: Allocator, arguments: *const Arguments, log: *Io.Wr
         memory,
         log,
         arguments.license,
-        constants.package_description_bytes_max,
+        constants.package_license_bytes_max,
     );
     var options: release.Options = .{
         .test_key = arguments.test_key,

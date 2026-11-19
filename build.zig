@@ -212,7 +212,7 @@ fn add_release_assets_step(
     b.step("release-sums", sums_help).dependOn(&sums.step);
 }
 
-const license_id = "MIT";
+const license_id = "Apache-2.0";
 
 fn package_tool(b: *std.Build) *std.Build.Step.Compile {
     return b.addExecutable(.{

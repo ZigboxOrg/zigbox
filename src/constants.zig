@@ -1889,8 +1889,11 @@ pub const package_recommends_max: u32 = 8;
 /// A package's name, version and architecture strings, a dependency name, and its one-line text.
 pub const package_name_bytes_max: u32 = 64;
 pub const package_summary_bytes_max: u32 = 200;
-/// The long description and the licence text.
+/// The long description.
 pub const package_description_bytes_max: u32 = 4096;
+/// The licence text a package carries. Its own bound: Apache-2.0 is about 11.3 KB, which the
+/// description bound refuses.
+pub const package_license_bytes_max: u32 = 32 * 1024;
 /// The most packages one repository holds (two architectures of a few packages).
 pub const repo_packages_max: u32 = 32;
 /// The most files `zig build packages` writes under `zig-out/packages/`.

@@ -11,9 +11,9 @@ class Zigbox < Formula
   url "@URL@"
   version "@VERSION@"
   sha256 "@SHA256@"
-  # zbx is MIT; the binary carries a Linux kernel and VM tools under the GPL (sources on the
+  # zbx is Apache-2.0; the binary carries a Linux kernel and VM tools under the GPL (sources on the
   # vm-kernel-6.18.59 and vm-deps-alpine-3.20 releases of Zigbox/zigbox).
-  license all_of: ["MIT", "GPL-2.0-only"]
+  license all_of: ["Apache-2.0", "GPL-2.0-only"]
 
   # The universal zip carries an x86_64 slice for the CLI, but the virtual machine needs Apple
   # silicon: an Intel Mac is refused here, with brew's own one-line message.

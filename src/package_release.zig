@@ -91,7 +91,7 @@ fn describe(
             "keeps an image store and a builder beside the runtime.\n\n" ++
             "The package holds the static zbx binary. It does not touch /etc/subuid or\n" ++
             "/etc/subgid, and removing it leaves the image store alone.",
-        .license = "MIT",
+        .license = "Apache-2.0",
         .homepage = "https://zigbox.org",
         .maintainer = constants.package_maintainer,
         .recommends_deb = &.{ "uidmap", "passt" },
@@ -267,7 +267,7 @@ test "build gives the same bytes twice and names the files of both architectures
     const inputs: Inputs = .{
         .version = "1.2.3",
         .zbx = .{ "x86 binary", "arm binary" },
-        .license = "MIT licence\n",
+        .license = "Apache-2.0 licence\n",
     };
     const first = try build(memory, &inputs, .{ .test_key = true });
     const second = try build(memory, &inputs, .{ .test_key = true });
@@ -285,4 +285,21 @@ test "build gives the same bytes twice and names the files of both architectures
     const unsigned = try build(memory, &inputs, .{});
     try std.testing.expectEqual(Round.trees, round_of(unsigned));
     try std.testing.expect(find(unsigned, apt_in_release_path) == null);
+}
+
+test "a licence over the description bound and within its own bound packages" {
+    // Goal: Apache-2.0 (about 11.3 KB) is more than a description may hold and must still pack.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    const text = try memory.alloc(u8, constants.package_license_bytes_max);
+    @memset(text, 'a');
+    comptime assert(constants.package_license_bytes_max > constants.package_description_bytes_max);
+    const inputs: Inputs = .{
+        .version = "1.2.3",
+        .zbx = .{ "x86 binary", "arm binary" },
+        .license = text,
+    };
+    const tree = try build(memory, &inputs, .{});
+    try std.testing.expectEqual(Round.trees, round_of(tree));
 }

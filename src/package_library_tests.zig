@@ -28,7 +28,7 @@ fn tiny(architecture: pkg.Architecture, files: []const pkg.File) pkg.Package {
         .architecture = architecture,
         .summary = "A tiny package built through the exported writer",
         .description = "Built by a second caller to prove the writer needs no build system.",
-        .license = "MIT",
+        .license = "Apache-2.0",
         .homepage = "https://example.org",
         .maintainer = "Second Caller <caller@example.org>",
         .files = files,
