@@ -348,11 +348,13 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 EOF
 systemctl daemon-reload
-systemctl enable -q --now zigbox-backup-sync.timer
 
+# The first sync runs before the timer starts: a timer started after OnBootSec has passed fires
+# at once. sync.sh also holds a lock, for a rerun while the timer is already active.
 step "running the first sync"
 out=$(runuser -u zigbox-backup -- env HOME="$home" "$lib/sync.sh" 2>&1) || {
     echo "$out"; fail "the first sync failed (its lines are above)"; }
 echo "$out"
+systemctl enable -q --now zigbox-backup-sync.timer
 echo "backup-bootstrap: OK https://$BACKUP_HOST (Forgejo $forgejo_version, $BACKUP_REPOS, \
 every 5 minutes)"
