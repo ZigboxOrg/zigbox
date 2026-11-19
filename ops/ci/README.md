@@ -32,22 +32,12 @@ Not ported yet (they stay in `.github/workflows/` until they are): `release.yml`
 
 ## Set it up
 
-You need: root on the box (Ubuntu 24.04), a DNS name for it (below, `ci.zigbox.org`), owner rights
-on the GitHub organisation `ZigboxOrg`, and `ssh`, `rsync`, `curl`, `jq` and `dig` on your laptop.
-Every step can be run again safely.
+You need: a bare-metal server with Ubuntu 24.04 and root on it (a cloud VM has no `/dev/kvm`; the
+bootstrap refuses one), a DNS name for it (below, `ci.zigbox.org`), and owner rights on the GitHub
+organisation `ZigboxOrg`. Every step can be run again safely.
 
-**1. DNS.** Point the name at the box. With Cloudflare DNS, for example (any provider works):
-
-```bash
-BOX_IP=203.0.113.10   # the box's public IPv4: run `curl -4 ifconfig.me` on the box
-```
-
-Add an `A` record `ci.zigbox.org -> $BOX_IP`, unproxied, in your DNS provider. Check it from the
-laptop before going on:
-
-```bash
-dig +short ci.zigbox.org
-```
+**1. DNS.** Add an `A` record from the name to the box's public IPv4 (unproxied, if your DNS
+provider is Cloudflare). The bootstrap checks that the name resolves to an address of the box.
 
 **2. The GitHub OAuth app.** GitHub has no API or CLI for creating OAuth apps, so this one step is in
 the browser: open <https://github.com/organizations/ZigboxOrg/settings/applications/new> and fill
@@ -60,49 +50,23 @@ in
 Register it, copy the **Client ID**, then **Generate a new client secret** and copy it (GitHub shows
 it once).
 
-**3. Copy the files to the box and fill in the settings.** From a checkout of this repository on
-your laptop (`BOX` is how you reach the box over SSH, e.g. `root@203.0.113.10`):
+**3. Run the bootstrap on the box,** as root, in an SSH session (it asks questions, so it needs a
+terminal):
 
 ```bash
-BOX=root@203.0.113.10
+bash <(curl -fsSL https://raw.githubusercontent.com/ZigboxOrg/zigbox/main/ops/ci/bootstrap.sh)
 ```
 
-```bash
-rsync -a --delete ops/ci/ "$BOX:/root/zigbox-ci-src/"
-```
+It clones this repository into `/opt/zigbox-ci/src` (`ZIGBOX_CI_REF=<branch>` before `bash` picks
+another branch than `main`) and runs the copy there. On the first run it asks for the DNS name,
+your GitHub login (the Woodpecker admin), and the OAuth app's Client ID and secret (read without
+echo; it lands in `/etc/zigbox-ci/github-client-secret`, mode 0640). Then it installs Docker,
+Compose and QEMU, builds the step image, starts Woodpecker and Caddy, and waits for the certificate
+and the agent. The last line must be `ci-bootstrap: OK https://ci.zigbox.org (...)`. A `FAIL` line
+says what to fix; fix it and run the same command again. To change a setting later, edit
+`/etc/zigbox-ci/ci.env` (or delete a secret file to be asked again) and rerun.
 
-```bash
-ssh "$BOX" 'install -d -m 0700 /etc/zigbox-ci && test -f /etc/zigbox-ci/ci.env || cp /root/zigbox-ci-src/ci.env.example /etc/zigbox-ci/ci.env'
-```
-
-Set `CI_HOST` and `CI_ADMINS` (your GitHub login) in `/etc/zigbox-ci/ci.env`:
-
-```bash
-ssh -t "$BOX" 'nano /etc/zigbox-ci/ci.env'
-```
-
-Put the OAuth app's ID and secret in their files. The secret goes through stdin, never onto a
-command line:
-
-```bash
-read -r CLIENT_ID && printf '%s' "$CLIENT_ID" | ssh "$BOX" 'umask 077; cat > /etc/zigbox-ci/github-client-id'
-```
-
-```bash
-read -rs CLIENT_SECRET && printf '%s' "$CLIENT_SECRET" | ssh "$BOX" 'umask 077; cat > /etc/zigbox-ci/github-client-secret'; unset CLIENT_SECRET
-```
-
-**4. Run the bootstrap.** It installs Docker, QEMU and Compose, builds the step image, starts
-Woodpecker and Caddy, waits for the certificate and the agent, and ends in one line:
-
-```bash
-ssh "$BOX" 'bash /root/zigbox-ci-src/bootstrap.sh'
-```
-
-The last line must be `ci-bootstrap: OK https://ci.zigbox.org (...)`. A `FAIL` line says what to fix;
-fix it and run the same command again.
-
-**5. Log in and turn the repositories on.** Logging in is GitHub's OAuth consent, a browser step:
+**4. Log in and turn the repositories on.** Logging in is GitHub's OAuth consent, a browser step:
 open <https://ci.zigbox.org>, log in with GitHub and grant access to `ZigboxOrg`. Then, in
 Woodpecker:
 
@@ -114,10 +78,10 @@ Woodpecker:
 
 Then copy your personal token from **User settings → CLI & API** for the next steps.
 
-**6. The token that deletes `vm/*` branches.** A fine-grained token, `ZigboxOrg/zigbox` only,
+**5. The token that deletes `vm/*` branches.** A fine-grained token, `ZigboxOrg/zigbox` only,
 **Contents: Read and write**, made at <https://github.com/settings/personal-access-tokens/new>
 (GitHub has no CLI for fine-grained tokens). Store it as the Woodpecker secret `github_token`, with
-the token from step 5:
+the token from step 4:
 
 ```bash
 export WOODPECKER_SERVER=https://ci.zigbox.org
@@ -131,7 +95,7 @@ read -rs WOODPECKER_TOKEN && export WOODPECKER_TOKEN
 read -rs GH_PAT && REPO_ID=$(curl -fsS "$WOODPECKER_SERVER/api/repos/lookup/ZigboxOrg/zigbox" -H "Authorization: Bearer $WOODPECKER_TOKEN" | jq -r .id) && jq -n --arg v "$GH_PAT" '{name:"github_token", value:$v, events:["push"]}' | curl -fsS -X POST "$WOODPECKER_SERVER/api/repos/$REPO_ID/secrets" -H "Authorization: Bearer $WOODPECKER_TOKEN" -H 'Content-Type: application/json' -d @- >/dev/null && echo "secret github_token: stored"; unset GH_PAT
 ```
 
-**7. Check that it works.** Push a scratch branch that runs the first demo:
+**6. Check that it works.** Push a scratch branch that runs the first demo:
 
 ```bash
 git push origin HEAD:vm/m0-ci-check
@@ -156,9 +120,9 @@ it never goes in chat or the repository).
 
 ## Running it
 
-- **Restart or upgrade:** change the tags in `compose.yaml`, copy `ops/ci` again (step 3's `rsync`)
-  and run `bootstrap.sh`. Zig upgrades change `image/Dockerfile` and every pipeline's `image:` line
-  together.
+- **Restart or upgrade:** change the tags in `compose.yaml` on `main`, then rerun the bootstrap
+  command (step 3); it fetches the new files. Zig upgrades change `image/Dockerfile` and every
+  pipeline's `image:` line together.
 - **Logs:** `docker compose -f /opt/zigbox-ci/compose.yaml logs -f woodpecker-agent`.
 - **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, each a VM guest or a set of builds; the
   simulation fleet shares the box. Lower it if the fleet's rounds slow down.
