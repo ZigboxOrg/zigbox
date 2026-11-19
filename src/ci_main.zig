@@ -431,12 +431,18 @@ fn delete_branch(ctx: *Ctx, branch: []const u8) void {
         ctx.say("could not delete {s}: {s}", .{ branch, @errorName(err) });
         return;
     };
-    if (status == .no_content) {
-        ctx.say("deleted the scratch branch {s}", .{branch});
-    } else {
-        ctx.say("could not delete {s}: GitHub answered {d} (the token needs contents: write)", .{
+    switch (status) {
+        .no_content => ctx.say("deleted the scratch branch {s}", .{branch}),
+        // GitHub answers 422 "Reference does not exist" when the branch is already gone (another
+        // runner deleted it first, or a newer push's run did).
+        .unprocessable_entity => ctx.say("{s} was already deleted", .{branch}),
+        .unauthorized, .forbidden, .not_found => ctx.say(
+            "could not delete {s}: GitHub answered {d} (the token needs contents: write)",
+            .{ branch, @backingInt(status) },
+        ),
+        else => ctx.say("could not delete {s}: GitHub answered {d}", .{
             branch, @backingInt(status),
-        });
+        }),
     }
 }
 
