@@ -26,7 +26,7 @@ const Io = std.Io;
 
 pub const default_identity = "Developer ID Application: Alex Zuzin (56A872L679)";
 pub const default_profile = "zbx-notary";
-const release_url = "https://github.com/Zigbox/zigbox/releases/download";
+const release_url = "https://github.com/ZigboxOrg/zigbox/releases/download";
 
 /// The two architectures of the universal binary, in the order `lipo -archs` prints them for the
 /// file this tool makes (it sorts them, so the tests compare sets, not order).

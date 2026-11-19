@@ -32,7 +32,7 @@ approval of the `release` environment. Nobody tags by hand. After the approval:
   `SHA256SUMS.asc` is by a subkey of the pinned release key, and the tap diff; `publish` publishes the draft, which
   creates the tag at the release commit;
 - `tap` and `site` (environment `release-publish`, `main` only, no reviewers) commit the formula
-  to `Zigbox/homebrew-tap` and run the zigbox.org deploy, waiting for it;
+  to `ZigboxOrg/homebrew-tap` and run the zigbox.org deploy, waiting for it;
 - `verify`, on `macos-15` and `macos-15-intel`, checks the public zip and runs
   `brew install zigbox/tap/zigbox`, `zbx --version` and `brew test zigbox`.
 
@@ -92,8 +92,8 @@ only, with the primary stubbed, and stays protected by its passphrase:
 
 ```sh
 gpg --armor --export-secret-subkeys "$SUBKEY"'!' |
-  gh secret set ZIGBOX_SIGNING_KEY --env release --repo Zigbox/zigbox
-gh secret set ZIGBOX_SIGNING_PASSPHRASE --env release --repo Zigbox/zigbox
+  gh secret set ZIGBOX_SIGNING_KEY --env release --repo ZigboxOrg/zigbox
+gh secret set ZIGBOX_SIGNING_PASSPHRASE --env release --repo ZigboxOrg/zigbox
 ```
 
 The primary key's fingerprint is not a setting: it is written in `release.yml` (the `Sign` step),
@@ -110,7 +110,7 @@ The subkey expires after one year, and a signature made after that is refused by
 ```sh
 gpg --quick-set-expire "$KEY" 1y "$SUBKEY"     # extend, or add a new subkey as above
 gpg --armor --export-secret-subkeys "${NEWSUBKEY:-$SUBKEY}"'!' |
-  gh secret set ZIGBOX_SIGNING_KEY --env release --repo Zigbox/zigbox
+  gh secret set ZIGBOX_SIGNING_KEY --env release --repo ZigboxOrg/zigbox
 ```
 
 Renewal does **not** reach existing installs by itself. Users fetched the keyring once
@@ -186,7 +186,7 @@ first, so the files of an earlier run never stay beside this one's.
 
 ### The site deploy
 
-The site's deploy (`.github/workflows/deploy.yml` in `Zigbox/website`) copies the newest
+The site's deploy (`.github/workflows/deploy.yml` in `ZigboxOrg/website`) copies the newest
 release's asset to `https://zigbox.org/apt`, `/rpm` and the two keyring files byte for byte
 ([decision](../decisions/2026-11-10-packages-on-zigbox-org.md)). It refuses an asset that holds
 anything else (links, dot files, `.html`, `to-sign/`, the test key) or lacks `InRelease`,
@@ -277,9 +277,9 @@ build a different tarball. Download the artifact `package-refresh-<tag>` of the 
 upload its three files again:
 
 ```sh
-gh run download RUN_ID --repo Zigbox/zigbox -n package-refresh-vX.Y.Z --dir saved
+gh run download RUN_ID --repo ZigboxOrg/zigbox -n package-refresh-vX.Y.Z --dir saved
 gh release upload vX.Y.Z saved/zigbox-repos.tar.gz saved/SHA256SUMS saved/SHA256SUMS.asc \
-  --clobber --repo Zigbox/zigbox
+  --clobber --repo ZigboxOrg/zigbox
 ```
 
 Then dispatch the workflow: the next refresh accepts the restored set (`package-refresh-test.sh`
@@ -290,20 +290,20 @@ GitHub disables a scheduled workflow after 60 days without repository activity, 
 project must check the Actions tab at least every 50 days and re-enable `package-refresh`; no run
 means no alarm, and apt fails with "Release file is expired" 21 days after the last signing.
 
-Owner setup, once: create the environment `package-refresh` on `Zigbox/zigbox` with no required
+Owner setup, once: create the environment `package-refresh` on `ZigboxOrg/zigbox` with no required
 reviewer, a deployment branch policy of `main` only, and the secrets `ZIGBOX_SIGNING_KEY`,
 `ZIGBOX_SIGNING_PASSPHRASE` and `RELEASE_APP_PRIVATE_KEY` plus the variable `RELEASE_APP_ID` (the
 same subkey export and App as `release`):
 
 ```sh
-gh api -X PUT repos/Zigbox/zigbox/environments/package-refresh \
+gh api -X PUT repos/ZigboxOrg/zigbox/environments/package-refresh \
   -F deployment_branch_policy[protected_branches]=false -F deployment_branch_policy[custom_branch_policies]=true
-gh api -X POST repos/Zigbox/zigbox/environments/package-refresh/deployment-branch-policies -f name=main
+gh api -X POST repos/ZigboxOrg/zigbox/environments/package-refresh/deployment-branch-policies -f name=main
 gpg --armor --export-secret-subkeys "$SUBKEY"'!' |
-  gh secret set ZIGBOX_SIGNING_KEY --env package-refresh --repo Zigbox/zigbox
-gh secret set ZIGBOX_SIGNING_PASSPHRASE --env package-refresh --repo Zigbox/zigbox
-gh secret set RELEASE_APP_PRIVATE_KEY --env package-refresh --repo Zigbox/zigbox
-gh variable set RELEASE_APP_ID --env package-refresh --repo Zigbox/zigbox
+  gh secret set ZIGBOX_SIGNING_KEY --env package-refresh --repo ZigboxOrg/zigbox
+gh secret set ZIGBOX_SIGNING_PASSPHRASE --env package-refresh --repo ZigboxOrg/zigbox
+gh secret set RELEASE_APP_PRIVATE_KEY --env package-refresh --repo ZigboxOrg/zigbox
+gh variable set RELEASE_APP_ID --env package-refresh --repo ZigboxOrg/zigbox
 ```
 
 Renew the subkey in this environment too (the yearly renewal section): an expired subkey makes the
@@ -318,7 +318,7 @@ will not overwrite a file, so use an empty signatures directory every time. The 
 publishing the draft release in `release.yml`, never by hand; only with the owner's written
 go-ahead in `docs/decisions/` create the tag and release with `gh release create` from the gated
 commit, run `release.yml` by `workflow_dispatch`, and start the site deploy with `gh workflow run deploy.yml --repo
-Zigbox/website`.
+ZigboxOrg/website`.
 
 For the Mac zip, on a Mac with the Developer ID certificate in the login keychain and a notary
 profile there (`xcrun notarytool store-credentials zbx-notary`), from a logged-in graphical
@@ -327,7 +327,7 @@ session: `SDK="$(xcrun --show-sdk-path)"; zig build mac-release --sysroot "$SDK"
 finds no SDK by itself; no `-Dkeychain`: it uses the login keychain; it builds both architectures and joins
 them with `lipo`). Attach
 `zig-out/mac-release/zbx-<v>-macos-universal.zip` to the release and commit `zig-out/mac-release/zigbox.rb`
-to `Formula/zigbox.rb` of `Zigbox/homebrew-tap` by hand. `-Dkeychain=FILE` points `codesign` and
+to `Formula/zigbox.rb` of `ZigboxOrg/homebrew-tap` by hand. `-Dkeychain=FILE` points `codesign` and
 `notarytool` at another keychain file, as the workflow does with its temporary one.
 
 ## Testing the automation

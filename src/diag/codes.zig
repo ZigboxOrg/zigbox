@@ -5235,7 +5235,7 @@ pub const registry = [_]Entry{
         \\something you did, and it always exits with code 70.
         \\
         \\Rerun with --verbose to see the internal message, and report it at
-        \\https://github.com/Zigbox/zigbox/issues/new with the command you ran. A
+        \\https://github.com/ZigboxOrg/zigbox/issues/new with the command you ran. A
         \\stack trace is not printed.
         ,
     },

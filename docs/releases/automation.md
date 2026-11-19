@@ -46,8 +46,8 @@ release PR merged to main (supervisor; version in build.zig.zon, notes in docs/r
        │              both sums files match, SHA256SUMS.asc is by a subkey of the pinned key;
        │              the tap's formula differs only in url, version, sha256 (and the one-off lines)
        ├─ publish     the draft becomes the release; THIS creates the tag, at the release commit
-       ├─ tap         env release-publish: commit Formula/zigbox.rb to Zigbox/homebrew-tap main
-       ├─ site        repository_dispatch to Zigbox/website, wait for the deploy
+       ├─ tap         env release-publish: commit Formula/zigbox.rb to ZigboxOrg/homebrew-tap main
+       ├─ site        repository_dispatch to ZigboxOrg/website, wait for the deploy
        └─ verify      macos-15 and macos-15-intel: the public zip (signature, Gatekeeper,
                       both architectures, zbx --version), then brew install, zbx --version, brew test
 ```
@@ -175,10 +175,10 @@ the environment; it is never printed and never on a command line.
   needs it there to resolve the chain; the `always()` step restores the list the job found. Both
   steps are the same in `mac-test`.
 - The App can write the contents of two repositories, `homebrew-tap` and `website`, and
-  read Actions on the site; it is not installed on `Zigbox/zigbox`. Its key is a secret of
+  read Actions on the site; it is not installed on `ZigboxOrg/zigbox`. Its key is a secret of
   `release-publish` alone (no reviewers, `main` only): `preflight`, `prepare`, `tap` and `site`
   can read it. Tokens are minted per job for the repositories that job needs.
-- `publish` and the draft use `GITHUB_TOKEN` with `contents: write` on `Zigbox/zigbox`, in jobs that
+- `publish` and the draft use `GITHUB_TOKEN` with `contents: write` on `ZigboxOrg/zigbox`, in jobs that
   hold no signing secret. A tag made with `GITHUB_TOKEN` starts no workflow, and none is meant to.
 - Nothing prints a secret, and no secret is a command-line argument: secrets enter through `env:`
   and files with mode 600. The only passwords on argv (`security create-keychain -p`,
@@ -199,8 +199,8 @@ the environment; it is never printed and never on a command line.
 | 1 | GitHub App "Zigbox Release": Contents read and write, Metadata read, Actions read | GitHub App | Zigbox org, installed on `homebrew-tap` and `website` only | owner | new (uninstall from `zigbox` if installed) |
 | 2 | `RELEASE_APP_ID` | variable | env `release-publish` | owner | new |
 | 3 | `RELEASE_APP_PRIVATE_KEY` (the App's `.pem`) | secret | env `release-publish` | owner | new |
-| 4 | Environment `release-publish`: deployments from `main` only, no reviewers | environment | Zigbox/zigbox | owner | new |
-| 5 | Environment `release`: owner approval, deployments from `main` only | environment | Zigbox/zigbox | owner | exists (policy changes from tags `v*`) |
+| 4 | Environment `release-publish`: deployments from `main` only, no reviewers | environment | ZigboxOrg/zigbox | owner | new |
+| 5 | Environment `release`: owner approval, deployments from `main` only | environment | ZigboxOrg/zigbox | owner | exists (policy changes from tags `v*`) |
 | 6 | `ZIGBOX_SIGNING_KEY`, `ZIGBOX_SIGNING_PASSPHRASE` | secrets | env `release` | owner | exist |
 | 7 | `MAC_CERT_P12`: Developer ID Application certificate and key, `.p12`, base64 | secret | env `release` | owner | new |
 | 8 | `MAC_CERT_PASSWORD`: the `.p12` export password | secret | env `release` | owner | new |
@@ -208,11 +208,11 @@ the environment; it is never printed and never on a command line.
 | 10 | `MAC_NOTARY_KEY_ID`, `MAC_NOTARY_ISSUER_ID` | variables | env `release` | owner | new |
 | 11 | GitHub-hosted runners `ubuntu-24.04`, `macos-15`, `macos-15-intel` | runners | GitHub | GitHub | exist |
 | 12 | Zig 0.17.0, `gh` 2.74.0 (SHA-256 pinned), `actions/*` (full SHA) | tools | `.github/actions/`, `release.yml` | implementer | changed |
-| 13 | `release.yml`: `plan`, `mac-check`, `preflight`, `draft`, `linux`, `mac`, `prepare`, `publish`, `tap`, `site`, `verify`, `test`, `mac-test`, `draft-test` | workflow | Zigbox/zigbox | implementer | changed |
-| 14 | `.github/actions/`: `setup-gh`, `find-draft`, `tap-formula`, `mac-check-zip` | actions | Zigbox/zigbox | implementer | new |
-| 15 | `zig build mac-release` builds and joins both architectures; tests | code | Zigbox/zigbox | implementer | changed |
-| 16 | `packaging.md`, this file, AGENTS.md line, STYLE.md (`lipo`), decision | docs | Zigbox/zigbox | implementer, supervisor | changed |
-| 17 | Site `deploy.yml` accepting `repository_dispatch` type `site` | workflow | Zigbox/website | — | exists |
+| 13 | `release.yml`: `plan`, `mac-check`, `preflight`, `draft`, `linux`, `mac`, `prepare`, `publish`, `tap`, `site`, `verify`, `test`, `mac-test`, `draft-test` | workflow | ZigboxOrg/zigbox | implementer | changed |
+| 14 | `.github/actions/`: `setup-gh`, `find-draft`, `tap-formula`, `mac-check-zip` | actions | ZigboxOrg/zigbox | implementer | new |
+| 15 | `zig build mac-release` builds and joins both architectures; tests | code | ZigboxOrg/zigbox | implementer | changed |
+| 16 | `packaging.md`, this file, AGENTS.md line, STYLE.md (`lipo`), decision | docs | ZigboxOrg/zigbox | implementer, supervisor | changed |
+| 17 | Site `deploy.yml` accepting `repository_dispatch` type `site` | workflow | ZigboxOrg/website | — | exists |
 
 No longer needed: the `release-tag` environment, the `MAC_RELEASE_RUNNER_LABEL` variable, the
 self-hosted release runner and its separate macOS user, the runner group. (`MAC_RUNNER_LABEL` and
@@ -242,34 +242,34 @@ account". Create it, note the App ID, and **Generate a private key** (a `.pem` d
 **2. The environment `release-publish`, and the `release` policy.**
 
 ```bash
-gh api -X PUT repos/Zigbox/zigbox/environments/release-publish -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X PUT repos/ZigboxOrg/zigbox/environments/release-publish -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true'
 ```
 
 ```bash
-gh api -X POST repos/Zigbox/zigbox/environments/release-publish/deployment-branch-policies -f name=main -f type=branch
+gh api -X POST repos/ZigboxOrg/zigbox/environments/release-publish/deployment-branch-policies -f name=main -f type=branch
 ```
 
 `release` used to deploy from tags `v*`; the release now runs from `main`. Add the branch and
 delete the tag policy (list them first with
-`gh api repos/Zigbox/zigbox/environments/release/deployment-branch-policies`, then
+`gh api repos/ZigboxOrg/zigbox/environments/release/deployment-branch-policies`, then
 `gh api -X DELETE .../deployment-branch-policies/<id>` for the `v*` one):
 
 ```bash
-gh api -X POST repos/Zigbox/zigbox/environments/release/deployment-branch-policies -f name=main -f type=branch
+gh api -X POST repos/ZigboxOrg/zigbox/environments/release/deployment-branch-policies -f name=main -f type=branch
 ```
 
 If you made `release-tag` for an earlier version of this guide, delete it:
-`gh api -X DELETE repos/Zigbox/zigbox/environments/release-tag`.
+`gh api -X DELETE repos/ZigboxOrg/zigbox/environments/release-tag`.
 
 **3. The App's id and key.** Replace `123456` with the App ID and the path with the downloaded
 `.pem`.
 
 ```bash
-gh variable set RELEASE_APP_ID --env release-publish --repo Zigbox/zigbox --body 123456
+gh variable set RELEASE_APP_ID --env release-publish --repo ZigboxOrg/zigbox --body 123456
 ```
 
 ```bash
-gh secret set RELEASE_APP_PRIVATE_KEY --env release-publish --repo Zigbox/zigbox < ~/Downloads/zigbox-release.private-key.pem
+gh secret set RELEASE_APP_PRIVATE_KEY --env release-publish --repo ZigboxOrg/zigbox < ~/Downloads/zigbox-release.private-key.pem
 ```
 
 Then delete the `.pem` from Downloads (the App can issue a new one).
@@ -278,11 +278,11 @@ Then delete the `.pem` from Downloads (the App can issue a new one).
 Application: …" → right-click → Export → `.p12`, with an export password.
 
 ```bash
-base64 -i ~/Desktop/DeveloperID.p12 | gh secret set MAC_CERT_P12 --env release --repo Zigbox/zigbox
+base64 -i ~/Desktop/DeveloperID.p12 | gh secret set MAC_CERT_P12 --env release --repo ZigboxOrg/zigbox
 ```
 
 ```bash
-gh secret set MAC_CERT_PASSWORD --env release --repo Zigbox/zigbox
+gh secret set MAC_CERT_PASSWORD --env release --repo ZigboxOrg/zigbox
 ```
 
 (`gh` prompts for the value.) Delete the `.p12` afterwards.
@@ -292,29 +292,29 @@ API → Team Keys → generate a key with role **Developer**. Note the Key ID an
 download `AuthKey_<KEYID>.p8` (it downloads once).
 
 ```bash
-gh secret set MAC_NOTARY_KEY --env release --repo Zigbox/zigbox < ~/Downloads/AuthKey_KEYID.p8
+gh secret set MAC_NOTARY_KEY --env release --repo ZigboxOrg/zigbox < ~/Downloads/AuthKey_KEYID.p8
 ```
 
 ```bash
-gh variable set MAC_NOTARY_KEY_ID --env release --repo Zigbox/zigbox --body KEYID
+gh variable set MAC_NOTARY_KEY_ID --env release --repo ZigboxOrg/zigbox --body KEYID
 ```
 
 ```bash
-gh variable set MAC_NOTARY_ISSUER_ID --env release --repo Zigbox/zigbox --body ISSUER-UUID
+gh variable set MAC_NOTARY_ISSUER_ID --env release --repo ZigboxOrg/zigbox --body ISSUER-UUID
 ```
 
 **6. Check.**
 
 ```bash
-gh secret list --env release --repo Zigbox/zigbox
+gh secret list --env release --repo ZigboxOrg/zigbox
 ```
 
 ```bash
-gh variable list --env release --repo Zigbox/zigbox
+gh variable list --env release --repo ZigboxOrg/zigbox
 ```
 
 ```bash
-gh secret list --env release-publish --repo Zigbox/zigbox
+gh secret list --env release-publish --repo ZigboxOrg/zigbox
 ```
 
 Expect `ZIGBOX_SIGNING_KEY`, `ZIGBOX_SIGNING_PASSPHRASE`, `MAC_CERT_P12`, `MAC_CERT_PASSWORD`,

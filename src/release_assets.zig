@@ -252,7 +252,7 @@ fn sbom_head(writer: *std.Io.Writer, inputs: *const Inputs) std.Io.Writer.Error!
         \\      "purl": "pkg:github/zigbox/zigbox@v{s}",
         \\      "externalReferences": [
         \\        {{ "type": "website", "url": "https://zigbox.org" }},
-        \\        {{ "type": "vcs", "url": "https://github.com/Zigbox/zigbox" }}
+        \\        {{ "type": "vcs", "url": "https://github.com/ZigboxOrg/zigbox" }}
         \\      ]
         \\    }},
         \\    "properties": [

@@ -28,7 +28,7 @@ pub const Product = struct {
         .prefix = "ZBX-",
         .command = "zbx",
         .bundle_hint = "zbx bundle --last",
-        .report_url = "https://github.com/Zigbox/zigbox/issues/new",
+        .report_url = "https://github.com/ZigboxOrg/zigbox/issues/new",
         .docs_url_base = constants.docs_url_base,
     };
 
@@ -108,7 +108,7 @@ test "Product.zbx carries the strings the renderer used before products existed"
     // Goal: moving the strings here changed none of them.
     Product.zbx.validate();
     try testing.expectEqualStrings("ZBX-", Product.zbx.prefix);
-    const report = "https://github.com/Zigbox/zigbox/issues/new";
+    const report = "https://github.com/ZigboxOrg/zigbox/issues/new";
     try testing.expectEqualStrings(report, Product.zbx.report_url);
     var command: [constants.product_explain_bytes_max]u8 = undefined;
     try testing.expectEqualStrings(

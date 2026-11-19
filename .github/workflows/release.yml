@@ -271,8 +271,8 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
-          gh api "repos/Zigbox/homebrew-tap/contents/Formula/zigbox.rb?ref=main" --jq .path
-          gh api "repos/Zigbox/website/actions/workflows/deploy.yml" --jq .state
+          gh api "repos/ZigboxOrg/homebrew-tap/contents/Formula/zigbox.rb?ref=main" --jq .path
+          gh api "repos/ZigboxOrg/website/actions/workflows/deploy.yml" --jq .state
 
   # The draft: notes from docs/releases/<version>.md, then the CI evidence table, targeting the
   # release commit. A draft makes no tag. An existing draft is reused (its notes refreshed), so a
@@ -873,7 +873,7 @@ jobs:
         run: |
           set -euo pipefail
           content=$(base64 -w 0 "$RUNNER_TEMP/assets/zigbox.rb")
-          gh api -X PUT "repos/Zigbox/homebrew-tap/contents/Formula/zigbox.rb" \
+          gh api -X PUT "repos/ZigboxOrg/homebrew-tap/contents/Formula/zigbox.rb" \
             -f message="zigbox $VERSION" -f content="$content" -f sha="$BLOB" -f branch=main > /dev/null
           echo "tap: committed Formula/zigbox.rb for $VERSION"
 
@@ -920,7 +920,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
-          site=Zigbox/website
+          site=ZigboxOrg/website
           since=$(date -u -d '30 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
           gh api -X POST "repos/$site/dispatches" -f event_type=site
           run_id=""

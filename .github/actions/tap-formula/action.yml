@@ -1,6 +1,6 @@
 name: Check the formula against the tap
 description: >
-  Fetches Formula/zigbox.rb from Zigbox/homebrew-tap main and compares it with the generated
+  Fetches Formula/zigbox.rb from ZigboxOrg/homebrew-tap main and compares it with the generated
   formula. Refuses unless the difference is only the url, version and sha256 lines (plus the
   lines listed below, which the move to a universal binary changes once). Writes nothing to the
   tap. The caller sets GH_TOKEN to a token that can read the tap and runs the pinned gh.
@@ -23,7 +23,7 @@ runs:
       shell: bash --noprofile --norc -euo pipefail {0}
       env:
         FORMULA: ${{ inputs.formula }}
-        TAP: Zigbox/homebrew-tap
+        TAP: ZigboxOrg/homebrew-tap
       run: |
         current="${RUNNER_TEMP}/tap-current.rb"
         info=$(gh api "repos/$TAP/contents/Formula/zigbox.rb?ref=main" --jq '.sha')
