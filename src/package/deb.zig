@@ -121,7 +121,7 @@ pub const sample: model.Package = .{
     .recommends_rpm = &.{ "shadow-utils", "passt" },
     .files = &.{
         .{ .path = "/usr/bin/sample", .mode = 0o755, .bytes = "#!/bin/sh\necho sample\n" },
-        .{ .path = "/usr/share/doc/sample/copyright", .mode = 0o644, .bytes = "Apache-2.0 licence\n" },
+        .{ .path = "/usr/share/doc/sample/copyright", .mode = 0o644, .bytes = "Apache-2.0\n" },
     },
 };
 

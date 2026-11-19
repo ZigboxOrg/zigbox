@@ -425,7 +425,7 @@ test "a bad version, toolchain, licence id or date is refused" {
 }
 
 test "a licence of the full bound is packed and one byte more is refused" {
-    // Goal: the licence has its own bound (Apache-2.0 is about 11.3 KB), refused with the usual error.
+    // Goal: the licence has its own bound (Apache-2.0 is about 11.3 KB); over it, the usual error.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const memory = arena.allocator();
