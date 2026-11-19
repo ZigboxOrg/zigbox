@@ -175,14 +175,21 @@ version=$(curl -fsS "https://$CI_HOST/version" | sed -n 's/.*"version":"\([^"]*\
 
 # The agent registers on first contact. It must still be running 30 s later, and its log must hold
 # no refusal (a wrong secret) or unreachable server.
+agent_log() { # The agent's state and last lines, so a FAIL shows why without another command.
+    docker compose -f "$opt/compose.yaml" ps -a woodpecker-agent >&2 || true
+    docker compose -f "$opt/compose.yaml" logs --no-log-prefix --tail 20 woodpecker-agent >&2 \
+        || true
+}
 sleep 30
 running=$(docker compose -f "$opt/compose.yaml" ps --status running --services)
-grep -qx woodpecker-agent <<<"$running" || fail "the agent is not running \
-(docker compose -f $opt/compose.yaml logs woodpecker-agent)"
+if ! grep -qx woodpecker-agent <<<"$running"; then
+    agent_log
+    fail "the agent is not running (its state and last log lines are above)"
+fi
 if docker compose -f "$opt/compose.yaml" logs --since 30s woodpecker-agent 2>&1 |
     grep -qiE 'unauthenticated|permission denied|connection refused|no such host'; then
-    fail "the agent cannot reach or log in to the server \
-(docker compose -f $opt/compose.yaml logs woodpecker-agent)"
+    agent_log
+    fail "the agent cannot reach or log in to the server (its last log lines are above)"
 fi
 
 echo "ci-bootstrap: OK https://$CI_HOST (woodpecker ${version:-?}, agent $CI_AGENT_NAME, \
