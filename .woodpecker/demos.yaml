@@ -13,25 +13,27 @@ when:
   - event: manual
 
 matrix:
-  DEMO:
-    - m0
-    - m1
-    - m2
-    - m2b
-    - m3
-    - m4
-    - m5
-    - m6
-    - m6b
-    - m6d
-    - m7
-    - m8
-    - m8_packages
-    - m8b
-    - m9
-    - m10
-    - c4
-    - s2_lazy
+  # The include form: Woodpecker 3 refuses more than 10 values in a plain axis, but takes up to 64
+  # entries here.
+  include:
+    - DEMO: m0
+    - DEMO: m1
+    - DEMO: m2
+    - DEMO: m2b
+    - DEMO: m3
+    - DEMO: m4
+    - DEMO: m5
+    - DEMO: m6
+    - DEMO: m6b
+    - DEMO: m6d
+    - DEMO: m7
+    - DEMO: m8
+    - DEMO: m8_packages
+    - DEMO: m8b
+    - DEMO: m9
+    - DEMO: m10
+    - DEMO: c4
+    - DEMO: s2_lazy
 
 clone:
   - name: clone
