@@ -104,9 +104,15 @@ if [ ! -s "$etc/agent-secret" ]; then
     step "making $etc/agent-secret"
     (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$etc/agent-secret")
 fi
-# The containers run as their own users and read the secrets through bind mounts.
-chmod 0644 "$etc/github-client-id" "$etc/ci.env"
-chmod 0640 "$etc/github-client-secret" "$etc/agent-secret"
+# The containers read the secrets through bind mounts. woodpecker-server runs as uid and gid 1000
+# (its image's USER) and skips a _FILE it cannot read without a word, so the secrets it reads are
+# group 1000. A change here restarts the services below: a running server read the old files.
+woodpecker_gid=1000
+secrets_changed=$(
+    chmod -c 0644 "$etc/github-client-id" "$etc/ci.env"
+    chown -c "root:$woodpecker_gid" "$etc/github-client-secret" "$etc/agent-secret"
+    chmod -c 0640 "$etc/github-client-secret" "$etc/agent-secret"
+)
 
 # --- DNS and disk --------------------------------------------------------------------------------
 # Caddy's certificate and GitHub's webhooks need CI_HOST to point here.
@@ -162,6 +168,10 @@ fi
 # --- Woodpecker ----------------------------------------------------------------------------------
 step "starting Woodpecker and Caddy"
 docker compose -f "$opt/compose.yaml" --env-file "$opt/.env" up -d --remove-orphans >/dev/null
+if [ -n "$secrets_changed" ]; then
+    step "secret files changed; restarting the server and the agent"
+    docker compose -f "$opt/compose.yaml" restart woodpecker-server woodpecker-agent >/dev/null
+fi
 
 # The server answers on the public name once Caddy has its certificate (a minute on the first run).
 ok=""

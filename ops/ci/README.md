@@ -58,13 +58,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ZigboxOrg/zigbox/main/ops/ci
 ```
 
 It clones this repository into `/opt/zigbox-ci/src` (`ZIGBOX_CI_REF=<branch>` before `bash` picks
-another branch than `main`) and runs the copy there. On the first run it asks for the DNS name,
-your GitHub login (the Woodpecker admin), and the OAuth app's Client ID and secret (read without
-echo; it lands in `/etc/zigbox-ci/github-client-secret`, mode 0640). Then it installs Docker,
-Compose and QEMU, builds the step image, starts Woodpecker and Caddy, and waits for the certificate
-and the agent. The last line must be `ci-bootstrap: OK https://ci.zigbox.org (...)`. A `FAIL` line
-says what to fix; fix it and run the same command again. To change a setting later, edit
-`/etc/zigbox-ci/ci.env` (or delete a secret file to be asked again) and rerun.
+another branch than `main`) and runs the copy there. On the first run it asks for the DNS name, your
+GitHub login (the Woodpecker admin), and the OAuth app's Client ID and secret (read without echo; it
+lands in `/etc/zigbox-ci/github-client-secret`, mode 0640, group 1000: the server image runs as uid
+1000). Then it installs Docker, Compose and QEMU, builds the step image, starts Woodpecker and
+Caddy, and waits for the certificate and the agent. The last line must be `ci-bootstrap: OK
+https://ci.zigbox.org (...)`. A `FAIL` line says what to fix; fix it and run the same command again.
+To change a setting later, edit `/etc/zigbox-ci/ci.env` (or delete a secret file to be asked again)
+and rerun.
 
 **4. Log in and turn the repositories on.** Logging in is GitHub's OAuth consent, a browser step:
 open <https://ci.zigbox.org>, log in with GitHub and grant access to `ZigboxOrg`. Then, in
