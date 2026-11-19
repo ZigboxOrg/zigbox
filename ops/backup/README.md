@@ -49,8 +49,8 @@ picks another branch than `main`) and runs the copy there. On the first run it a
 name, the Forgejo admin's login and e-mail (the e-mail also goes to Let's Encrypt), and the token
 from step 2 (read without echo, stored in `/etc/zigbox-backup/github-token`, mode 0400). Then it
 installs Forgejo (signature checked), starts it, creates the admin with a random first password
-(kept in `/etc/zigbox-backup/admin-password`, root only; Forgejo asks for a new one at the first
-login, then delete the file), the organisation `ZigboxOrg` and its two private
+(kept in `/etc/zigbox-backup/admin-password`, root only; change it at the first login under
+Settings, Account, then delete the file), the organisation `ZigboxOrg` and its two private
 repositories, and the timer, and runs the first copy. The last line must be
 `backup-bootstrap: OK https://git.zigbox.org (...)`; a `FAIL` line says what to fix.
 

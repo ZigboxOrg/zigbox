@@ -269,14 +269,15 @@ fja() { # fja ARGS: forgejo admin ARGS, as the user git.
     runuser -u git -- env HOME=/home/git "$fj" --config "$fj_etc/app.ini" --work-path "$fj_data" \
         admin "$@"
 }
-# The admin's first password is kept in admin-password (root only, 0400) until it is changed at
-# the first login, and the last line names the file. ZIGBOX_BACKUP_RESET_ADMIN=1 on a rerun sets
+# The admin's first password is kept in admin-password (root only, 0400), and the last lines name
+# the file. Never --must-change-password: the backup's API token is the admin's, and Forgejo
+# answers 403 to every API call of a user who must change their password. ZIGBOX_BACKUP_RESET_ADMIN=1 on a rerun sets
 # a new one there (Forgejo's change-password takes it in argv: a moment, on a box with no users).
 admin_pw="$etc/admin-password"
 if ! fja user list --admin | awk 'NR > 1 {print $2}' | grep -qx "$BACKUP_ADMIN"; then
     step "creating the Forgejo admin $BACKUP_ADMIN"
     created=$(fja user create --username "$BACKUP_ADMIN" --email "$BACKUP_EMAIL" --admin \
-        --random-password --must-change-password 2>&1) ||
+        --random-password 2>&1) ||
         fail "Forgejo refused the admin: $(tail -1 <<<"$created")"
     pw=$(sed -n "s/.*generated random password is '\(.*\)'.*/\1/p" <<<"$created")
     [ -n "$pw" ] || fail "Forgejo created $BACKUP_ADMIN but printed no password: $created"
@@ -285,7 +286,7 @@ elif [ "${ZIGBOX_BACKUP_RESET_ADMIN:-}" = 1 ]; then
     step "setting a new first-login password for $BACKUP_ADMIN"
     pw=$(head -c 18 /dev/urandom | base64)
     fja user change-password --username "$BACKUP_ADMIN" --password "$pw" \
-        --must-change-password >/dev/null || fail "Forgejo refused the new password"
+        --must-change-password=false >/dev/null || fail "Forgejo refused the new password"
     rm -f "$admin_pw"; (umask 077; printf '%s\n' "$pw" > "$admin_pw"); chmod 0400 "$admin_pw"
 fi
 if ! id zigbox-backup >/dev/null 2>&1; then
@@ -310,7 +311,10 @@ api() { # api METHOD PATH [JSON]: prints the HTTP status.
 }
 for repo in $BACKUP_REPOS; do
     owner=${repo%/*} name=${repo#*/}
-    if [ "$(api GET "/orgs/$owner")" != 200 ]; then
+    status=$(api GET "/orgs/$owner")
+    [ "$status" = 200 ] || [ "$status" = 404 ] ||
+        fail "Forgejo answered $status reading the organisation $owner (is $BACKUP_ADMIN locked?)"
+    if [ "$status" = 404 ]; then
         step "creating the organisation $owner"
         status=$(api POST /orgs "{\"username\":\"$owner\",\"visibility\":\"private\"}")
         [ "$status" = 201 ] || fail "Forgejo answered $status creating the organisation $owner"
@@ -371,7 +375,7 @@ echo "$out"
 systemctl enable -q --now zigbox-backup-sync.timer
 if [ -s "$admin_pw" ]; then
     echo "Log in at https://$BACKUP_HOST as $BACKUP_ADMIN with the password in $admin_pw"
-    echo "(cat it as root); Forgejo asks for a new one, then delete the file."
+    echo "(cat it as root); change it under Settings, Account, then delete the file."
 fi
 echo "backup-bootstrap: OK https://$BACKUP_HOST (Forgejo $forgejo_version, $BACKUP_REPOS, \
 every 5 minutes)"
