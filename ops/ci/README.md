@@ -11,8 +11,20 @@ request. Decision: `docs/decisions/2026-11-19-ci-on-woodpecker.md`.
 | Settings, secrets | `/etc/zigbox-ci/` (`ci.env`, `github-client-id`, `github-client-secret`, `agent-secret`) |
 | The image every step runs in | `image/Dockerfile`, built on the box as `zigbox-ci:0.17.0` |
 | Pipelines | `.woodpecker/check.yaml` (code gates), `demos.yaml` (VM demos), `vm.yaml` (`vm/*` branches) |
-| Step logic | `step.sh` (`changes`, `gate`, `demo`, `vm`), `cache.sh` (the VM image caches) |
+| Step logic | `zig build ci-*` and `vm-branch` (`src/ci_main.zig`, `src/ci/`); the VM image caches are `src/testing/vm/cache.zig` |
 | Caches | `/var/lib/zigbox-ci/zig` (Zig's global cache), `/var/lib/zigbox-ci/vm-entries` (VM images) |
+
+The YAML holds only what the build cannot: triggers, the demo matrix, `privileged`, volumes, the
+`github_token` secret and these environment values. Each step is one `zig build ...` line.
+
+- `ZBX_CI_USER=tester`, `ZBX_CI_USER_ZIG_CACHE=/cache/zig`: the workspace is cloned as root. The
+  driver, run as root with these set, hands the workspace to `tester` (`chown -R`) and runs every
+  nested `zig build` through `runuser` as that user (uid 1001), so the tests see an ordinary user.
+- `ZIG_GLOBAL_CACHE_DIR=/cache/zig-root`, `ZIG_LOCAL_CACHE_DIR=/cache/zig-root/local`: the outer
+  root `zig build` keeps its caches outside the workspace, so nothing root-owned is left in
+  `.zig-cache` for `tester` to trip on. `tester` uses `/cache/zig`.
+- `ZBX_VM_CACHE=/cache/vm-entries`: switches on the VM image cache for `ci-demos`.
+- `dbus-run-session` for the dbus-live gate is started by the driver, not by YAML.
 
 Not ported yet (they stay in `.github/workflows/` until they are): `release.yml`, `top20.yml`,
 `package-refresh.yml`, `pages.yml`, `mac.yml` (needs a Mac), and `vm/m8-push-ghcr` and `demo-m6d`
@@ -151,6 +163,6 @@ it never goes in chat or the repository).
 - **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, each a VM guest or a set of builds; the
   simulation fleet shares the box. Lower it if the fleet's rounds slow down.
 - **Disk:** VM images are stored once per pinned version under `/var/lib/zigbox-ci/vm-entries`
-  (`cache.sh`); an old pin's directory is never read again and can be deleted. Zig's cache
+  (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`); an old pin's directory is never read again and can be deleted. Zig's cache
   (`/var/lib/zigbox-ci/zig`) can be emptied when no pipeline runs. Docker's own:
   `docker system prune -f`.

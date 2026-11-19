@@ -70,7 +70,7 @@ install -d -m 0755 "$opt"
 install -m 0644 "$here/compose.yaml" "$here/Caddyfile" "$opt/"
 install -m 0644 "$etc/ci.env" "$opt/.env"
 
-# Caches the pipelines mount at /cache (ops/ci/cache.sh). tester is uid 1001 in the image.
+# Caches the pipelines mount at /cache (src/testing/vm/cache.zig). tester is uid 1001 in the image.
 install -d -m 0755 -o 1001 -g 1001 "$cache" "$cache/zig" "$cache/vm-entries"
 
 # --- The step image ------------------------------------------------------------------------------

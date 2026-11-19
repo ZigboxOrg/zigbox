@@ -1,15 +1,14 @@
-//! Tests of .github/ci-changes.sh, which decides what ci.yml runs. Each row names changed paths
-//! and the outputs that must come out true; the script runs under bash, on those paths on its
-//! stdin, as CI runs it, and every output line it writes is checked: true exactly for the named
-//! outputs, false for the rest. Run from the repository root, as `zig build test` does.
+//! Tests of ci/changes.zig, which decides what CI runs (it replaced .github/ci-changes.sh, and
+//! these rows are that script's table test, unchanged). Each row names changed paths and the
+//! outputs that must come out true; `decide` runs on those paths as a pull request with no label,
+//! `write_outputs` renders the result, and every output line is checked: true exactly for the
+//! named outputs, false for the rest.
 
 const std = @import("std");
 const testing = std.testing;
+const changes = @import("changes.zig");
 
-const script = ".github/ci-changes.sh";
-const max_paths = 8;
-
-/// Every output the script writes: `code`, the sixteen demos and the packages demo.
+/// Every output the decision writes: `code`, the seventeen demos and the packages demo.
 const all_outputs = [_][]const u8{
     "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b",         "demo_m3", "demo_m4",
     "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",          "demo_m8", "demo_m8b",
@@ -300,59 +299,35 @@ const rows = [_]Row{
 };
 
 test "ci-changes: each row selects exactly its outputs" {
+    // Goal: the path rules select what the shell's did. Method: one decision per row.
     for (rows) |row| {
-        const stdout = try run_script(testing.allocator, row.paths);
-        defer testing.allocator.free(stdout);
-        try check_row(row, stdout);
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        const decision = changes.decide(.{ .paths = row.paths });
+        try changes.write_outputs(&writer, &decision);
+        try check_row(row, writer.buffered());
     }
 }
 
-/// Runs the script with `paths`, one per line, on its stdin, and returns its standard output.
-/// `std.process.run` takes no stdin, so the paths reach the script through a shell pipe. The
-/// environment is cleared but for PATH, as on a pull request with no label: a GITHUB_OUTPUT or
-/// HEAD_REF of the CI running this test cannot leak in. The caller frees the result.
-fn run_script(gpa: std.mem.Allocator, paths: []const []const u8) ![]u8 {
-    std.debug.assert(paths.len <= max_paths);
-    var argv: [max_paths + 4][]const u8 = undefined;
-    argv[0] = "sh";
-    argv[1] = "-c";
-    argv[2] = "printf '%s\\n' \"$@\" | env -i PATH=\"$PATH\" EVENT=pull_request bash " ++ script;
-    argv[3] = "sh";
-    @memcpy(argv[4 .. 4 + paths.len], paths);
-    const result = try std.process.run(gpa, testing.io, .{
-        .argv = argv[0 .. 4 + paths.len],
-    });
-    defer gpa.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
-    }
-    std.debug.print("{s}", .{result.stderr});
-    gpa.free(result.stdout);
-    return error.ScriptFailed;
-}
-
-/// Checks every output line of one run: its value is true exactly when the row names it, and
-/// every named output appears.
-fn check_row(row: Row, stdout: []const u8) !void {
+/// Checks every output line of one decision: its value is true exactly when the row names it,
+/// and every named output appears.
+fn check_row(row: Row, text: []const u8) !void {
     var lines: usize = 0;
     var trues: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, stdout, '\n');
+    var it = std.mem.tokenizeScalar(u8, text, '\n');
     while (it.next()) |line| {
         lines += 1;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse
-            return fail(row, stdout, "an output line without '='");
+            return fail(row, text, "an output line without '='");
         const name = line[0..eq];
         const value = line[eq + 1 ..];
         const named = contains(row.true_outputs, name);
         if (named) trues += 1;
         const want: []const u8 = if (named) "true" else "false";
-        if (!std.mem.eql(u8, value, want)) {
-            return fail(row, stdout, "an output has the wrong value");
-        }
+        if (!std.mem.eql(u8, value, want)) return fail(row, text, "an output has the wrong value");
     }
-    if (lines != all_outputs.len) return fail(row, stdout, "the wrong number of output lines");
-    if (trues != row.true_outputs.len) return fail(row, stdout, "a named output was not written");
+    if (lines != all_outputs.len) return fail(row, text, "the wrong number of output lines");
+    if (trues != row.true_outputs.len) return fail(row, text, "a named output was not written");
 }
 
 fn contains(names: []const []const u8, name: []const u8) bool {
@@ -362,9 +337,9 @@ fn contains(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-fn fail(row: Row, stdout: []const u8, what: []const u8) error{WrongOutputs} {
+fn fail(row: Row, text: []const u8, what: []const u8) error{WrongOutputs} {
     std.debug.print("ci-changes: {s} for the paths:\n", .{what});
     for (row.paths) |path| std.debug.print("  {s}\n", .{path});
-    std.debug.print("script output:\n{s}", .{stdout});
+    std.debug.print("output:\n{s}", .{text});
     return error.WrongOutputs;
 }

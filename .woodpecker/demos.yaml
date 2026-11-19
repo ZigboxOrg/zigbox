@@ -1,9 +1,11 @@
 # The VM demos of .github/workflows/ci.yml, in KVM guests on the fleet box (ops/ci/README.md). One
-# workflow per demo, so each is its own check on the pull request. A demo the change cannot affect
-# passes at once with a line saying so (.github/ci-changes.sh); a push to main, a claude/release-*
-# pull request and one labelled full-ci run every demo. demo-m6d says NOT RUN until the owner's
-# Google setup is here. Needs the repository marked Trusted (privileged for /dev/kvm, the /cache
-# mount). The logic is in ops/ci/step.sh.
+# workflow per demo, so each is its own check on the pull request. The step is
+# `zig build ci-demos -- --demo ID`: the build decides whether the change can affect that demo
+# (src/ci/changes.zig; a push to main, a claude/release-* pull request and one labelled full-ci run
+# every demo), prints one line and passes if it cannot, and otherwise runs it as `tester` with the
+# VM downloads restored from and saved to /cache (src/testing/vm/cache.zig). demo-m6d says NOT RUN
+# until the owner's Google setup is here. Needs the repository marked Trusted (privileged for
+# /dev/kvm, the /cache mount).
 when:
   - event: pull_request
   - event: push
@@ -45,5 +47,12 @@ steps:
     privileged: true
     volumes:
       - /var/lib/zigbox-ci:/cache
+    environment:
+      # As check.yaml: the work runs as tester; the root build keeps its own caches.
+      ZBX_CI_USER: tester
+      ZBX_CI_USER_ZIG_CACHE: /cache/zig
+      ZIG_GLOBAL_CACHE_DIR: /cache/zig-root
+      ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
+      ZBX_VM_CACHE: /cache/vm-entries
     commands:
-      - bash ops/ci/step.sh demo ${DEMO}
+      - zig build ci-demos -- --demo ${DEMO}
