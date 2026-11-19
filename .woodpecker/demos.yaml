@@ -1,0 +1,49 @@
+# The VM demos of .github/workflows/ci.yml, in KVM guests on the fleet box (ops/ci/README.md). One
+# workflow per demo, so each is its own check on the pull request. A demo the change cannot affect
+# passes at once with a line saying so (.github/ci-changes.sh); a push to main, a claude/release-*
+# pull request and one labelled full-ci run every demo. demo-m6d says NOT RUN until the owner's
+# Google setup is here. Needs the repository marked Trusted (privileged for /dev/kvm, the /cache
+# mount). The logic is in ops/ci/step.sh.
+when:
+  - event: pull_request
+  - event: push
+    branch: main
+  - event: manual
+
+matrix:
+  DEMO:
+    - m0
+    - m1
+    - m2
+    - m2b
+    - m3
+    - m4
+    - m5
+    - m6
+    - m6b
+    - m6d
+    - m7
+    - m8
+    - m8_packages
+    - m8b
+    - m9
+    - m10
+    - c4
+    - s2_lazy
+
+clone:
+  - name: clone
+    image: woodpeckerci/plugin-git
+    settings:
+      # The whole history: demo-m3 and later build an older release for the upgrade test.
+      depth: 0
+      partial: false
+
+steps:
+  - name: demo-${DEMO}
+    image: zigbox-ci:0.17.0
+    privileged: true
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    commands:
+      - bash ops/ci/step.sh demo ${DEMO}

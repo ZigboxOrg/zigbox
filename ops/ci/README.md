@@ -1,0 +1,156 @@
+# CI on the fleet box (Woodpecker)
+
+Zigbox's CI runs on the fleet box (AMD Ryzen 7 1700X, 8 cores and 16 threads, 64 GiB, two 512 GB
+SATA SSDs) under [Woodpecker](https://woodpecker-ci.org) 3.20.1. Code and pull requests stay on
+GitHub (`ZigboxOrg`); Woodpecker logs in with GitHub and posts each workflow as a check on the pull
+request. Decision: `docs/decisions/2026-11-19-ci-on-woodpecker.md`.
+
+| What | Where |
+|------|-------|
+| Woodpecker server, one agent, Caddy (TLS) | `compose.yaml`, `Caddyfile`, run by `bootstrap.sh` from `/opt/zigbox-ci` |
+| Settings, secrets | `/etc/zigbox-ci/` (`ci.env`, `github-client-id`, `github-client-secret`, `agent-secret`) |
+| The image every step runs in | `image/Dockerfile`, built on the box as `zigbox-ci:0.17.0` |
+| Pipelines | `.woodpecker/check.yaml` (code gates), `demos.yaml` (VM demos), `vm.yaml` (`vm/*` branches) |
+| Step logic | `step.sh` (`changes`, `gate`, `demo`, `vm`), `cache.sh` (the VM image caches) |
+| Caches | `/var/lib/zigbox-ci/zig` (Zig's global cache), `/var/lib/zigbox-ci/vm-entries` (VM images) |
+
+Not ported yet (they stay in `.github/workflows/` until they are): `release.yml`, `top20.yml`,
+`package-refresh.yml`, `pages.yml`, `mac.yml` (needs a Mac), and `vm/m8-push-ghcr` and `demo-m6d`
+(they need tokens GitHub gave Actions; each says NOT RUN).
+
+## Set it up
+
+You need: root on the box (Ubuntu 24.04), a DNS name for it (below, `ci.zigbox.org`), owner rights
+on the GitHub organisation `ZigboxOrg`, and `ssh`, `rsync`, `curl`, `jq` and `dig` on your laptop.
+Every step can be run again safely.
+
+**1. DNS.** Point the name at the box. With Cloudflare DNS, for example (any provider works):
+
+```bash
+BOX_IP=203.0.113.10   # the box's public IPv4: run `curl -4 ifconfig.me` on the box
+```
+
+Add an `A` record `ci.zigbox.org -> $BOX_IP`, unproxied, in your DNS provider. Check it from the
+laptop before going on:
+
+```bash
+dig +short ci.zigbox.org
+```
+
+**2. The GitHub OAuth app.** GitHub has no API or CLI for creating OAuth apps, so this one step is in
+the browser: open <https://github.com/organizations/ZigboxOrg/settings/applications/new> and fill
+in
+
+- Application name: `Zigbox CI`
+- Homepage URL: `https://ci.zigbox.org`
+- Authorization callback URL: `https://ci.zigbox.org/authorize`
+
+Register it, copy the **Client ID**, then **Generate a new client secret** and copy it (GitHub shows
+it once).
+
+**3. Copy the files to the box and fill in the settings.** From a checkout of this repository on
+your laptop (`BOX` is how you reach the box over SSH, e.g. `root@203.0.113.10`):
+
+```bash
+BOX=root@203.0.113.10
+```
+
+```bash
+rsync -a --delete ops/ci/ "$BOX:/root/zigbox-ci-src/"
+```
+
+```bash
+ssh "$BOX" 'install -d -m 0700 /etc/zigbox-ci && test -f /etc/zigbox-ci/ci.env || cp /root/zigbox-ci-src/ci.env.example /etc/zigbox-ci/ci.env'
+```
+
+Set `CI_HOST` and `CI_ADMINS` (your GitHub login) in `/etc/zigbox-ci/ci.env`:
+
+```bash
+ssh -t "$BOX" 'nano /etc/zigbox-ci/ci.env'
+```
+
+Put the OAuth app's ID and secret in their files. The secret goes through stdin, never onto a
+command line:
+
+```bash
+read -r CLIENT_ID && printf '%s' "$CLIENT_ID" | ssh "$BOX" 'umask 077; cat > /etc/zigbox-ci/github-client-id'
+```
+
+```bash
+read -rs CLIENT_SECRET && printf '%s' "$CLIENT_SECRET" | ssh "$BOX" 'umask 077; cat > /etc/zigbox-ci/github-client-secret'; unset CLIENT_SECRET
+```
+
+**4. Run the bootstrap.** It installs Docker, QEMU and Compose, builds the step image, starts
+Woodpecker and Caddy, waits for the certificate and the agent, and ends in one line:
+
+```bash
+ssh "$BOX" 'bash /root/zigbox-ci-src/bootstrap.sh'
+```
+
+The last line must be `ci-bootstrap: OK https://ci.zigbox.org (...)`. A `FAIL` line says what to fix;
+fix it and run the same command again.
+
+**5. Log in and turn the repositories on.** Logging in is GitHub's OAuth consent, a browser step:
+open <https://ci.zigbox.org>, log in with GitHub and grant access to `ZigboxOrg`. Then, in
+Woodpecker:
+
+1. **Add repository** → `ZigboxOrg/zigbox` → enable. (Woodpecker adds the webhook on GitHub.)
+2. Repository **Settings → Project**: turn on **Trusted** (every box it offers: security, volumes),
+   **Cancel previous pipelines** for push and pull request, and set **Timeout** to `180` minutes.
+   Trusted is what gives the demo steps `/dev/kvm` and the `/var/lib/zigbox-ci` mount; only an admin
+   (`CI_ADMINS`) sees it.
+
+Then copy your personal token from **User settings → CLI & API** for the next steps.
+
+**6. The token that deletes `vm/*` branches.** A fine-grained token, `ZigboxOrg/zigbox` only,
+**Contents: Read and write**, made at <https://github.com/settings/personal-access-tokens/new>
+(GitHub has no CLI for fine-grained tokens). Store it as the Woodpecker secret `github_token`, with
+the token from step 5:
+
+```bash
+export WOODPECKER_SERVER=https://ci.zigbox.org
+```
+
+```bash
+read -rs WOODPECKER_TOKEN && export WOODPECKER_TOKEN
+```
+
+```bash
+read -rs GH_PAT && REPO_ID=$(curl -fsS "$WOODPECKER_SERVER/api/repos/lookup/ZigboxOrg/zigbox" -H "Authorization: Bearer $WOODPECKER_TOKEN" | jq -r .id) && jq -n --arg v "$GH_PAT" '{name:"github_token", value:$v, events:["push"]}' | curl -fsS -X POST "$WOODPECKER_SERVER/api/repos/$REPO_ID/secrets" -H "Authorization: Bearer $WOODPECKER_TOKEN" -H 'Content-Type: application/json' -d @- >/dev/null && echo "secret github_token: stored"; unset GH_PAT
+```
+
+**7. Check that it works.** Push a scratch branch that runs the first demo:
+
+```bash
+git push origin HEAD:vm/m0-ci-check
+```
+
+Open <https://ci.zigbox.org/repos> → `ZigboxOrg/zigbox`: the run of `vm/m0-ci-check` must end green
+within about ten minutes, its log must end with `demo-m0` passing and `deleted the scratch branch`,
+and the branch must be gone:
+
+```bash
+git ls-remote origin vm/m0-ci-check
+```
+
+prints nothing. Then open a pull request: `check` and the `demos` workflows appear as checks on it.
+
+## Sessions reading results
+
+A cloud session reads runs through Woodpecker's API, `https://ci.zigbox.org/api/repos/<id>/pipelines`,
+with a read token. To allow it, the session's environment needs `ci.zigbox.org` in its allowed hosts
+and the token as a network secret for that host (the session asks for it with its credential form;
+it never goes in chat or the repository).
+
+## Running it
+
+- **Restart or upgrade:** change the tags in `compose.yaml`, copy `ops/ci` again (step 3's `rsync`)
+  and run `bootstrap.sh`. Zig upgrades change `image/Dockerfile` and every pipeline's `image:` line
+  together.
+- **Logs:** `docker compose -f /opt/zigbox-ci/compose.yaml logs -f woodpecker-agent`.
+- **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, each a VM guest or a set of builds; the
+  simulation fleet shares the box. Lower it if the fleet's rounds slow down.
+- **Disk:** VM images are stored once per pinned version under `/var/lib/zigbox-ci/vm-entries`
+  (`cache.sh`); an old pin's directory is never read again and can be deleted. Zig's cache
+  (`/var/lib/zigbox-ci/zig`) can be emptied when no pipeline runs. Docker's own:
+  `docker system prune -f`.

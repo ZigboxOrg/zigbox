@@ -1,0 +1,29 @@
+# VM runs on demand, as .github/workflows/vm.yml: a push to vm/<demo>-<anything> runs that demo in a
+# KVM guest on the fleet box (ops/ci/README.md), then deletes the scratch branch (the github_token
+# secret; without it the branch stays). <demo> is any name vm.yml takes, or all. vm/top20-* is not
+# run here. A newer push to the same branch cancels the older run when the repository's "Cancel
+# previous pipelines" setting is on. The logic is in ops/ci/step.sh.
+when:
+  - event: push
+    branch:
+      include: vm/**
+      exclude: vm/top20-**
+
+clone:
+  - name: clone
+    image: woodpeckerci/plugin-git
+    settings:
+      depth: 0
+      partial: false
+
+steps:
+  - name: demo
+    image: zigbox-ci:0.17.0
+    privileged: true
+    volumes:
+      - /var/lib/zigbox-ci:/cache
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - bash ops/ci/step.sh vm
