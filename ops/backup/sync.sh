@@ -29,6 +29,11 @@ export GIT_TERMINAL_PROMPT=0
 
 say() { echo "backup: $*"; }
 
+# One run at a time: the timer and a bootstrap's first sync can start together, and two runs
+# that both see a ref as new collide on Forgejo ("reference already exists").
+exec 9>/var/lib/zigbox-backup/sync.lock
+flock -w 900 9 || { say "FAIL another sync has held the lock for 15 minutes"; exit 1; }
+
 skipped() { # skipped BRANCH: whether BRANCH starts with a BACKUP_SKIP prefix.
     local prefix
     for prefix in ${BACKUP_SKIP:-}; do
