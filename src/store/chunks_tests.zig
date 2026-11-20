@@ -314,7 +314,7 @@ fn outside_the_namespace(context: *anyopaque) bool {
     return false;
 }
 
-test "outside the namespace an object of a container id but root is held, not made, until finished inside" {
+test "outside the namespace an object owned by a container id is held until finished inside" {
     // Goal: pin the gap in docs/decisions/2026-11-18-s2-lazy-owner-outside.md. The lazy
     // resolver's threads put chunks outside the store's namespace, where a user without
     // `CAP_CHOWN` cannot give a file any owner but their own. Rootless, so an object of 0:42
