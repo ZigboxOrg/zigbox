@@ -52,16 +52,21 @@ Users verify the keyring against the primary key's fingerprint (RSA 4096, certif
 the signing subkey expires after a year and is renewed):
 
 ```
-09991DC39816D3C914E2A22C5AB00BC328B7DBB7
+1207CB8600CE25FFDD3CC87ECCBEC141C3348787
 ```
 
 The public key itself is checked in as `docs/releases/zigbox-release-key.asc` (the owner commits
-`gpg --export -a 09991DC39816D3C914E2A22C5AB00BC328B7DBB7`, and commits a new export after every
+`gpg --export -a 1207CB8600CE25FFDD3CC87ECCBEC141C3348787`, and commits a new export after every
 renewal or revocation). The `prepare` job (`.github/release-prepare-check.sh`) verifies
 `SHA256SUMS.asc` against that file, never against the keyring inside the draft's archive, so a
 revoked subkey stays refused. `prepare` also refuses a draft whose apt `Release` has fewer than 14
 days of `Valid-Until` left; after a late re-run of `mac`, re-run `linux` too.
 `.github/release-prepare-test.sh` runs the check with tampered drafts in the `test` job.
+
+The key was replaced on 2026-11-20 (the previous primary's secret half was lost in the move to
+`ZigboxOrg`): [decision](../decisions/2026-11-20-release-key-rotated.md) has the old and new
+fingerprints and the user steps. A new primary is always a reviewed change to `release.yml`,
+`package-refresh.yml`, this file and `zigbox-release-key.asc` together.
 
 ## One-off key setup
 
