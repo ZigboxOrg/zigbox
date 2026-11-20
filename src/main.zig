@@ -462,6 +462,7 @@ test {
     _ = @import("build/glob.zig");
     _ = @import("fuzz_dockerignore.zig");
     _ = @import("fuzz_dockerfile.zig");
+    _ = @import("fuzz_vm.zig");
 }
 
 test {
