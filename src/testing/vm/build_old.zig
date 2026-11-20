@@ -1,10 +1,15 @@
 //! `build_old <zig> <commit> <output>`: builds the x86_64 release `zbx` of an older commit, for
 //! the upgrade test of `zig build demo-m3`. A git worktree of <commit> under `.zig-cache`,
 //! `zig build release` in it (the same pinned Zig), and the stripped binary copied to <output>.
+//! A commit missing from the clone is fetched from origin's old/* branches and tags first.
 //! Build-host tool, run by build.zig from the repository root.
 
 const std = @import("std");
 const Io = std.Io;
+
+/// Where the pinned commits of `old_release.zon` live on origin: the old/* branches and the tags.
+const fetch_branches = "+refs/heads/old/*:refs/remotes/origin/old/*";
+const fetch_tags = "+refs/tags/*:refs/tags/*";
 
 /// One worktree for each commit, so that two demos can build their older releases at once.
 fn tree_path(arena: std.mem.Allocator, commit: []const u8) ![]const u8 {
@@ -43,12 +48,25 @@ pub fn main(init: std.process.Init) !u8 {
         "{s}^{{commit}}",
         .{commit},
     ) };
-    run(io, &exists, null, true) catch {
-        try err.print("build_old: commit {s} is not in this clone (CI needs fetch-depth: 0)\n", .{
-            commit,
+    if (run(io, &exists, null, true)) |_| {} else |_| {
+        // A clone of one ref (Woodpecker's clone, a shallow checkout) lacks the pinned commits:
+        // they live on origin's old/* branches and release tags, not on main.
+        try err.print("build_old: {s} is not in this clone; fetching {s} and {s}\n", .{
+            commit, fetch_branches, fetch_tags,
         });
-        return 1;
-    };
+        try err.flush();
+        const fetch = [_][]const u8{
+            "git", "fetch", "--quiet", "origin", fetch_branches, fetch_tags,
+        };
+        run(io, &fetch, null, false) catch {};
+        run(io, &exists, null, true) catch {
+            try err.print("build_old: {s} is neither in this clone nor on origin's old/* " ++
+                "branches or tags, so the older release cannot be built; push it to origin " ++
+                "(a tag: git push origin {s}) or pin a commit that is there in " ++
+                "src/testing/vm/old_release.zon\n", .{ commit, commit });
+            return 1;
+        };
+    }
     try run(io, &.{ "git", "worktree", "prune" }, null, false);
     if (Io.Dir.cwd().access(io, tree, .{})) |_| {} else |_| {
         const add = [_][]const u8{
