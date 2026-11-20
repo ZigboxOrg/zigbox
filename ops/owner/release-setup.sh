@@ -187,29 +187,51 @@ fi
 
 # --- mac -----------------------------------------------------------------------------------------
 if want mac && confirm mac "store the Developer ID certificate and the notary key"; then
-    if has_secret "$box" release MAC_CERT_P12 && has_secret "$box" release MAC_NOTARY_KEY; then
-        say "the Mac secrets are set; skipped"
-    else
-        cat <<EOF
+    # Each item is checked on its own, so a rerun after a failure asks only for what is missing.
+    gh api "repos/$box/environments/release" >/dev/null 2>&1 ||
+        fail "$box has no release environment: run --only envs first"
+    cat <<EOF
 The Developer ID Application certificate as a .p12: Keychain Access -> login -> My Certificates
 -> "Developer ID Application: ..." -> right-click -> Export (an export password; keep it). The
 notary key is the App Store Connect API key (.p8, role Developer) with its Key ID and Issuer ID.
 EOF
+    if has_secret "$box" release MAC_CERT_P12; then say "MAC_CERT_P12 is set; skipped"; else
         ask p12 "Path to the .p12"
         [ -s "$p12" ] || fail "$p12 is not a file"
         base64 < "$p12" | tr -d '\n' | gh secret set MAC_CERT_P12 --repo "$box" --env release
+        say "MAC_CERT_P12 stored"
+    fi
+    if has_secret "$box" release MAC_CERT_PASSWORD; then
+        say "MAC_CERT_PASSWORD is set; skipped"
+    else
         echo "Type the .p12's export password (gh hides it):"
         gh secret set MAC_CERT_PASSWORD --repo "$box" --env release
+        say "MAC_CERT_PASSWORD stored"
+    fi
+    kid_default=""
+    if has_secret "$box" release MAC_NOTARY_KEY; then say "MAC_NOTARY_KEY is set; skipped"; else
         ask p8 "Path to AuthKey_<KEYID>.p8"
         [ -s "$p8" ] || fail "$p8 is not a file"
         gh secret set MAC_NOTARY_KEY --repo "$box" --env release < "$p8"
-        kid_default=$(basename "$p8" .p8); kid_default=${kid_default#AuthKey_}
-        ask kid "Key ID" "$kid_default"
-        ask iss "Issuer ID (a UUID, App Store Connect -> Integrations)"
-        gh variable set MAC_NOTARY_KEY_ID --repo "$box" --env release --body "$kid"
-        gh variable set MAC_NOTARY_ISSUER_ID --repo "$box" --env release --body "$iss"
-        say "Mac secrets stored in release"
+        kid_default=$(basename "$p8" .p8)
+        kid_default=${kid_default#AuthKey_}
+        say "MAC_NOTARY_KEY stored"
     fi
+    if has_var "$box" release MAC_NOTARY_KEY_ID; then
+        say "MAC_NOTARY_KEY_ID is set; skipped"
+    else
+        ask kid "Key ID (the 10 characters in AuthKey_<KEYID>.p8)" "$kid_default"
+        [ -n "$kid" ] || fail "the Key ID is empty"
+        gh variable set MAC_NOTARY_KEY_ID --repo "$box" --env release --body "$kid"
+    fi
+    if has_var "$box" release MAC_NOTARY_ISSUER_ID; then
+        say "MAC_NOTARY_ISSUER_ID is set; skipped"
+    else
+        ask iss "Issuer ID (a UUID: App Store Connect -> Users and Access -> Integrations)"
+        [ -n "$iss" ] || fail "the Issuer ID is empty"
+        gh variable set MAC_NOTARY_ISSUER_ID --repo "$box" --env release --body "$iss"
+    fi
+    say "the Mac secrets and variables are in $box release"
 fi
 
 # --- check ---------------------------------------------------------------------------------------
