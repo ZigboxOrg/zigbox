@@ -9,7 +9,12 @@ const Io = std.Io;
 
 /// Where the pinned commits of `old_release.zon` live on origin: the old/* branches and the tags.
 const fetch_branches = "+refs/heads/old/*:refs/remotes/origin/old/*";
-const fetch_tags = "+refs/tags/*:refs/tags/*";
+/// Tags go to a private namespace, not refs/tags/*: a developer's own tag of the same name is
+/// never overwritten, and `git cat-file` finds the commit through the fetched objects either way.
+const fetch_tags = "refs/tags/*:refs/zbx-old/tags/*";
+
+/// A stalled connection gives up after a minute below 1 KB/s, and the whole fetch after 20.
+const fetch_timeout_seconds = "1200";
 
 /// One worktree for each commit, so that two demos can build their older releases at once.
 fn tree_path(arena: std.mem.Allocator, commit: []const u8) ![]const u8 {
@@ -31,6 +36,48 @@ fn run(io: Io, argv: []const []const u8, cwd: ?[]const u8, quiet: bool) !void {
     return error.CommandFailed;
 }
 
+fn succeeds(io: Io, argv: []const []const u8) bool {
+    run(io, argv, null, true) catch return false;
+    return true;
+}
+
+/// The name git can check out for `commit`: the pin itself, or after a fetch from origin its tag in
+/// the private namespace. Null (after saying why on `err`) when it is not there to be had.
+fn find_commit(init: std.process.Init, err: *Io.Writer, commit: []const u8) !?[]const u8 {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const pin = try std.fmt.allocPrint(arena, "{s}^{{commit}}", .{commit});
+    if (succeeds(io, &.{ "git", "cat-file", "-e", pin })) return commit;
+    // A clone of one ref (Woodpecker's clone, a shallow checkout) lacks the pinned commits:
+    // they live on origin's old/* branches and release tags, not on main.
+    try err.print("build_old: {s} is not in this clone; fetching {s} and {s}\n", .{
+        commit, fetch_branches, fetch_tags,
+    });
+    try err.flush();
+    const fetch = [_][]const u8{
+        "timeout",                 fetch_timeout_seconds,
+        "git",                     "-c",
+        "http.lowSpeedLimit=1000", "-c",
+        "http.lowSpeedTime=60",    "fetch",
+        "--quiet",                 "origin",
+        fetch_branches,            fetch_tags,
+    };
+    run(io, &fetch, null, false) catch {
+        try err.print("build_old: fetching origin's old/* branches and tags failed (network, " ++
+            "or git is missing); {s} may well be there, so try again\n", .{commit});
+        return null;
+    };
+    if (succeeds(io, &.{ "git", "cat-file", "-e", pin })) return commit;
+    const private = try std.fmt.allocPrint(arena, "refs/zbx-old/tags/{s}", .{commit});
+    const private_pin = try std.fmt.allocPrint(arena, "{s}^{{commit}}", .{private});
+    if (succeeds(io, &.{ "git", "cat-file", "-e", private_pin })) return private;
+    try err.print("build_old: {s} is neither in this clone nor on origin's old/* " ++
+        "branches or tags, so the older release cannot be built; push it to origin " ++
+        "(a tag: git push origin {s}) or pin a commit that is there in " ++
+        "src/testing/vm/old_release.zon\n", .{ commit, commit });
+    return null;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     var buffer: [512]u8 = undefined;
     var file_writer: Io.File.Writer = .init(.stderr(), init.io, &buffer);
@@ -43,39 +90,16 @@ pub fn main(init: std.process.Init) !u8 {
     const output = arguments.next() orelse return usage(err);
     const io = init.io;
     const tree = try tree_path(init.arena.allocator(), commit);
-    const exists = [_][]const u8{ "git", "cat-file", "-e", try std.fmt.allocPrint(
-        init.arena.allocator(),
-        "{s}^{{commit}}",
-        .{commit},
-    ) };
-    if (run(io, &exists, null, true)) |_| {} else |_| {
-        // A clone of one ref (Woodpecker's clone, a shallow checkout) lacks the pinned commits:
-        // they live on origin's old/* branches and release tags, not on main.
-        try err.print("build_old: {s} is not in this clone; fetching {s} and {s}\n", .{
-            commit, fetch_branches, fetch_tags,
-        });
-        try err.flush();
-        const fetch = [_][]const u8{
-            "git", "fetch", "--quiet", "origin", fetch_branches, fetch_tags,
-        };
-        run(io, &fetch, null, false) catch {};
-        run(io, &exists, null, true) catch {
-            try err.print("build_old: {s} is neither in this clone nor on origin's old/* " ++
-                "branches or tags, so the older release cannot be built; push it to origin " ++
-                "(a tag: git push origin {s}) or pin a commit that is there in " ++
-                "src/testing/vm/old_release.zon\n", .{ commit, commit });
-            return 1;
-        };
-    }
+    const rev = try find_commit(init, err, commit) orelse return 1;
     try run(io, &.{ "git", "worktree", "prune" }, null, false);
     if (Io.Dir.cwd().access(io, tree, .{})) |_| {} else |_| {
         const add = [_][]const u8{
-            "git",      "worktree", "add",  "--quiet", "--force",
-            "--detach", tree,       commit,
+            "git",      "worktree", "add", "--quiet", "--force",
+            "--detach", tree,       rev,
         };
         try run(io, &add, null, false);
     }
-    try run(io, &.{ "git", "-C", tree, "checkout", "--quiet", "--detach", commit }, null, false);
+    try run(io, &.{ "git", "-C", tree, "checkout", "--quiet", "--detach", rev }, null, false);
     try run(io, &.{ zig, "build", "release" }, tree, false);
     const built = try std.fmt.allocPrint(
         init.arena.allocator(),

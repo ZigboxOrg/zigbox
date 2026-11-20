@@ -116,17 +116,77 @@ press Enter at the second to keep the stored one), and through Woodpecker's API 
   pull-request-metadata events, and a 180-minute timeout;
 - creates the secret `github_token` (push events only), or updates it if it exists.
 
-The risk this token carries: a pipeline's YAML comes from the pushed branch, so anyone who can push
-a branch to this repository can write a pipeline that prints `github_token` (Woodpecker masks the
-exact string in logs, not a transformed copy). Woodpecker 3 cannot hold a secret back for one
-branch or one pipeline file (a secret's image filter applies only to plugin steps, and every step
-here is the same image), so the scope of the token is the control: contents:write on this
-repository only, from an account that cannot push past `main`'s protection, so a leaked token can
-delete or push scratch branches and nothing more. The same was true of `vm.yml`'s
-`GITHUB_TOKEN` on Actions. Rotate it by running the script again.
+**What a writer can reach.** A pipeline's YAML comes from the pushed branch, and anyone with write
+access can run a pipeline here without approval: a push to `vmw/*`, or a pull request from a branch
+of this repository. The repository is Trusted, so that YAML can ask for `privileged: true` and any
+host mount, and a privileged step is **root on the host**. The host also holds, and a writer can
+therefore read:
+
+- Woodpecker's database (`woodpecker-data`), with the GitHub OAuth token of the admin who activated
+  the repository (scope `repo`: write access to everything that account can write);
+- the Docker socket, the fleet's token and `/etc/zigbox-ci/*` (the OAuth secret, the agent secret);
+- the `github_token` secret (a pipeline can print it; Woodpecker masks the exact string, not a
+  transformed copy), and every cache scope.
+
+Woodpecker 3 cannot hold a secret back from one branch or file, and the token's scope limits only
+that one secret. The control that limits the rest is **`main`'s protection, which nobody can
+bypass**: pull requests required, no bypass allowances, `enforce_admins` on, no force pushes or
+deletion. Then even the OAuth token of the activating admin cannot change `main`. (It can still
+write other branches and read the repository; this is not a sandbox against a writer.) On Actions a writer
+reaches only that run's `GITHUB_TOKEN`, not a host. `woodpecker-setup.sh` reads the protection with `gh api` and refuses to finish unless it is
+so. To make it so (as an admin, `gh auth login` first; this replaces `main`'s protection, so add
+any status checks the repository requires to `required_status_checks`, or leave it `null`):
+
+```bash
+gh api -X PUT repos/ZigboxOrg/zigbox/branches/main/protection --input - <<'JSON'
+{
+  "required_status_checks": null,
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 0,
+    "bypass_pull_request_allowances": {"users": [], "teams": [], "apps": []}
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+gh api repos/ZigboxOrg/zigbox/branches/main/protection |
+    jq '{enforce_admins: .enforce_admins.enabled, bypass: .required_pull_request_reviews.bypass_pull_request_allowances}'
+```
+
+Activate the repository (the first run of the setup script) from an account that has no bypass of
+`main`'s protection. Woodpecker needs repository admin to activate, so that account is an admin;
+with `enforce_admins` on, an admin has no bypass, which the check above proves. Check the account
+itself: `gh api repos/ZigboxOrg/zigbox/collaborators/<login>/permission --jq .permission` (`admin`
+or `write`), and that it is in no bypass list (`bypass_pull_request_allowances` above is empty, and
+`gh api repos/ZigboxOrg/zigbox/rulesets --jq '.[].name'` lists no ruleset that names it as a bypass
+actor; rulesets are not read by the script, so keep protection classic). Prefer a dedicated
+machine-user account, so that the token the box stores is not a person's.
+
+**Approval.** Woodpecker 3.20.1 (`server/pipeline/gated.go`) offers `require_approval` =
+`none`, `forks` (default; set explicitly), `pull_requests` (every pull request, same-repository
+ones too) or `all_events` (every push and pull request; cron and manual runs excepted), and
+`approval_allowed_users`, logins whose pipelines never wait. The only way to hold a writer's
+`vmw/*` push or same-repo pull request is therefore `all_events`, with the allowed logins listed:
+
+```bash
+ZBX_CI_APPROVAL=all_events ZBX_CI_APPROVED_USERS=login1,login2 \
+    bash /opt/zigbox-ci/src/ops/ci/woodpecker-setup.sh
+```
+
+The trade-off: the check is the pipeline's author (the pusher's GitHub login). The sessions push
+as the owner's account, so listing it lets them through, and approval then stops nobody who holds
+that account's credentials (a prompt-injected session included); it stops only other writers. Every
+other push, and every `vmw/*` push by someone not listed, waits for a click in the UI, which
+defeats `vmw/*` for them. The script does not set it by default, because that changes who can run
+what on the box (an owner's call; the decision doc records it as off). The default stays `forks`,
+and `main`'s protection above is the control.
 
 It reads the settings back; the last line must be `ci-setup: OK ZigboxOrg/zigbox (id N): ...`
-with `"require_approval":"forks"` and `github_token secret: yes`. Run it again at any time: it only
+with `"require_approval":"forks"` (or what you set) and `github_token secret: yes`. It needs `gh`
+logged in on the box (`gh auth login`) for the protection check, and fails with one line naming what
+to fix if `main` can be bypassed. Run it again at any time: it only
 sets what is not already so.
 
 **5. Before approving a fork's pull request.** The repository is Trusted, so a pipeline that runs
@@ -146,7 +206,8 @@ pull request's code as root on the box, so before approving read every change to
 If any of it is unclear, do not approve; ask for the change to be split out. An approved run can
 also write to the pull-request cache scope (`/var/lib/zigbox-ci/pull_request`), which only other
 pull requests read; `main` uses its own. Pull requests from branches of this repository, and pushes
-to `vmw/*`, need no approval: only people with write access can make them.
+to `vmw/*`, need no approval: only people with write access can make them, and what such a
+writer can reach is listed under "What a writer can reach" above.
 
 **6. Check that it works.** Push a scratch branch that runs the first demo:
 
@@ -200,8 +261,19 @@ Each log line comes back base64-encoded in `.data`. The run's page is
   command (step 3); it fetches the new files. Zig upgrades change `image/Dockerfile` and every
   pipeline's `image:` line together.
 - **Logs:** `docker compose -f /opt/zigbox-ci/compose.yaml logs -f woodpecker-agent`.
-- **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, each a VM guest or a set of builds; the
-  simulation fleet shares the box. Lower it if the fleet's rounds slow down.
+- **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, box-wide: the agent starts no fourth, so at
+  most three VM demos run together (a pipeline's 18 demo workflows queue behind them; Woodpecker
+  has no per-file limit, and a YAML-side cap would only restate this one). Why 3: the box has 8
+  cores (16 threads), 64 GiB and a network link shared with the simulation fleet; a demo boots a
+  guest of about 2 vCPUs and 4 GiB, so three guests are 6 vCPUs and 12 GiB, leaving the rest for
+  the builds and the fleet, and three at once share the link for their image downloads. This is
+  sized from those figures, not measured under load: lower it if the fleet's rounds slow down,
+  raise it only after watching a run with the box's load.
+- **Warm the caches once** before judging a run's time or its demos: a scope's first demo-m4 builds
+  `m4-blobs.img` and pulls the registry images (minutes), and every later one restores them. After
+  a bootstrap, or when a scope under `/var/lib/zigbox-ci` is new or emptied, run each scope's m4
+  once, alone: push `vmw/m4-warm` for the `vm` scope and open a pull request for `pull_request`
+  (`push` fills on the first push to `main`), wait for it to finish, then run the rest.
 - **Disk:** VM images are stored per pinned version under `/var/lib/zigbox-ci/<scope>/vm-entries`
   (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`). Each stored entry
   carries the SHA-256 of its files and is checked on every restore: a file that does not match is

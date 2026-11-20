@@ -150,4 +150,18 @@ jobs:
         if: (success() || failure()) && startsWith(github.ref, 'refs/heads/vm/')
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: zig build vm-branch-delete -- "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+        run: |
+          # The driver needs this branch's build.zig to compile; when it cannot, the REST call
+          # does the same (the step's `if` has already limited the ref to vm/*). A 404 or 422 is
+          # a branch already gone; anything else, a 401 or 403 included, fails the step.
+          if ! zig build vm-branch-delete -- "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+            echo "the driver could not delete $GITHUB_REF_NAME; deleting it through the API"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME")
+            case "$code" in
+              204|404|422) echo "delete: HTTP $code" ;;
+              *) echo "delete: HTTP $code: the token may not delete $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          fi

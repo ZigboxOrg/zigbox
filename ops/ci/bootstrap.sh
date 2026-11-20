@@ -157,8 +157,9 @@ done
 
 # The bound on the Zig caches: hourly, a scope whose Zig caches pass 30 GiB is emptied. Every
 # step's command holds <scope>/.prune-lock shared (`flock -s /cache/.prune-lock`, .woodpecker/*);
-# the prune takes it exclusive without waiting, so it skips a scope a step is using (the next hour
-# tries again) and a step that starts meanwhile waits until the prune is done. The VM entries bound
+# the prune takes it exclusive, waiting up to 30 minutes for a gap between steps (shared holders do
+# not queue behind a writer, so it needs one), and a step that starts meanwhile waits until the
+# prune is done. A scope skipped after the wait is logged; the next hour tries again. The VM entries bound
 # themselves (src/testing/vm/cache.zig keeps two keys per entry and scope).
 cat > /usr/local/sbin/zigbox-ci-prune <<'PRUNE'
 #!/bin/bash
@@ -167,7 +168,8 @@ set -euo pipefail
 limit_kib=$((30 * 1024 * 1024))
 for scope in /var/lib/zigbox-ci/*/; do
     (
-        flock -x -n 9 || { echo "zigbox-ci-prune: $scope is in use; next hour"; exit 0; }
+        flock -x -w 1800 9 ||
+            { echo "zigbox-ci-prune: SKIPPED $scope: in use for 30 minutes; next hour"; exit 0; }
         used=$(du -sk "$scope"zig "$scope"zig-root 2>/dev/null | awk '{s += $1} END {print s + 0}')
         [ "$used" -le "$limit_kib" ] && exit 0
         echo "zigbox-ci-prune: $scope Zig caches use $((used / 1024 / 1024)) GiB; emptying them"
