@@ -7,9 +7,9 @@
 //!   ci --zig ZIG changes                 print (and with --output append) the decision
 //!   ci --zig ZIG gate NAME               run one gate if the change touches code
 //!   ci --zig ZIG demos [--demo ID]       run the demos the change can affect, or one if it can
-//!   ci --zig ZIG vm-branch vm/DEMO-SLUG  run that scratch branch's demos
+//!   ci --zig ZIG vm-branch vm/DEMO-SLUG  run that scratch branch's demos (vm/* or vmw/*)
 //!   ci --zig ZIG delete-branch vm/D-SLUG delete that scratch branch (its own step, which alone
-//!                                        gets `GITHUB_TOKEN`)
+//!                                        gets `GITHUB_TOKEN`; refuses any other branch)
 //!
 //! Every command takes the change: `--event`, `--branch`, `--labels`, and the changed paths as
 //! `--files TEXT` (one per line), `--files-from FILE` (one per line; for long lists, as Linux caps
@@ -266,8 +266,7 @@ fn exec(ctx: *Ctx, extra: []const []const u8, argv: []const []const u8) !void {
 /// `runuser -u USER -- env HOME=... ZIG_GLOBAL_CACHE_DIR=... ZIG_LOCAL_CACHE_DIR=...`: the work's
 /// own home and Zig caches, apart from the root build's that is running this driver.
 fn append_user_prefix(ctx: *Ctx, full: *std.ArrayList([]const u8), user: []const u8) !void {
-    const cache = ctx.env.get("ZBX_CI_USER_ZIG_CACHE") orelse
-        try std.fmt.allocPrint(ctx.gpa, "/home/{s}/.cache/zig", .{user});
+    const cache = try user_zig_cache(ctx, user);
     const gpa = ctx.gpa;
     try full.appendSlice(gpa, &.{ "runuser", "-u", user, "--", "env" });
     try full.append(gpa, try std.fmt.allocPrint(gpa, "HOME=/home/{s}", .{user}));
@@ -300,10 +299,27 @@ fn wait_ok(ctx: *Ctx, argv: []const []const u8, stdout: std.process.SpawnOptions
     return error.Reported;
 }
 
-/// Hands the workspace to the work's user (a checkout made by root is not theirs to write).
+/// Hands the workspace to the work's user (a checkout made by root is not theirs to write), and
+/// makes the user's Zig cache theirs: a cache scope the box has not seen yet is a fresh bind
+/// mount, made by Docker as root, so nothing else creates it.
 fn hand_over_workspace(ctx: *Ctx) !void {
     const user = work_user(ctx) orelse return;
     try wait_ok(ctx, &.{ "chown", "-R", user, "." }, .ignore);
+    const cache = try user_zig_cache(ctx, user);
+    Io.Dir.cwd().createDirPath(ctx.io, cache) catch |err| {
+        ctx.say("the Zig cache directory {s} cannot be created: {s}", .{ cache, describe(err) });
+        return error.Reported;
+    };
+    // Not recursive: what is inside was written by the user already, and a full cache is large.
+    try wait_ok(ctx, &.{ "chown", user, cache }, .ignore);
+}
+
+/// The work's Zig cache: `ZBX_CI_USER_ZIG_CACHE`, or the user's own under their home.
+fn user_zig_cache(ctx: *Ctx, user: []const u8) ![]const u8 {
+    if (ctx.env.get("ZBX_CI_USER_ZIG_CACHE")) |path| {
+        if (path.len > 0) return path;
+    }
+    return std.fmt.allocPrint(ctx.gpa, "/home/{s}/.cache/zig", .{user});
 }
 
 fn zig_build(ctx: *Ctx, extra: []const []const u8, tail: []const []const u8) !void {
@@ -456,14 +472,26 @@ fn run_step(ctx: *Ctx, step: []const u8) !void {
 
 // Scratch branches.
 
+/// The scratch prefixes: vm/* runs on GitHub's vm.yml, vmw/* on the box's Woodpecker
+/// (docs/decisions/2026-11-19-ci-on-woodpecker.md). Only these are ever run or deleted.
+const scratch_prefixes = [_][]const u8{ "vm/", "vmw/" };
+
+/// The `<demo>-<slug>` of a scratch branch, or null for any other branch.
+fn scratch_name(branch: []const u8) ?[]const u8 {
+    for (scratch_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, branch, prefix)) return branch[prefix.len..];
+    }
+    return null;
+}
+
 fn cmd_vm_branch(ctx: *Ctx) !u8 {
     const branch = ctx.args.positional orelse return error.Usage;
-    if (!std.mem.startsWith(u8, branch, "vm/")) {
-        ctx.say("{s} is not a vm/<demo>-<slug> branch", .{branch});
+    const name = scratch_name(branch) orelse {
+        ctx.say("{s} is not a vm/<demo>-<slug> or vmw/<demo>-<slug> branch", .{branch});
         return 1;
-    }
-    const plan = demos.plan_for_branch(branch["vm/".len..]) orelse {
-        ctx.say("branch {s} names no demo (vm/<demo>-<slug>; see ci/demos.zig)", .{branch});
+    };
+    const plan = demos.plan_for_branch(name) orelse {
+        ctx.say("branch {s} names no demo (<demo>-<slug>; see ci/demos.zig)", .{branch});
         return 1;
     };
     switch (plan) {
@@ -474,11 +502,13 @@ fn cmd_vm_branch(ctx: *Ctx) !u8 {
 }
 
 /// The pipeline's last step, run whatever the demos did: deletes the scratch branch. Only this
-/// step is given `GITHUB_TOKEN`, so the demo steps (privileged) never hold it.
+/// step is given `GITHUB_TOKEN`, so the demo steps (privileged) never hold it. It refuses any
+/// branch but a scratch one, so a run started by hand on another ref deletes nothing.
 fn cmd_delete_branch(ctx: *Ctx) !u8 {
     const branch = ctx.args.positional orelse return error.Usage;
-    if (!std.mem.startsWith(u8, branch, "vm/")) {
-        ctx.say("not deleting {s}: only vm/<demo>-<slug> scratch branches are deleted", .{branch});
+    const name = scratch_name(branch) orelse "";
+    if (name.len == 0) {
+        ctx.say("not deleting {s}: only vm/* and vmw/* scratch branches are deleted", .{branch});
         return 1;
     }
     delete_branch(ctx, branch);
@@ -549,6 +579,18 @@ test {
     _ = @import("ci/changes_tests.zig");
     _ = @import("ci/demos.zig");
     _ = @import("testing/vm/cache.zig");
+}
+
+test "ci: only vm/* and vmw/* are scratch branches" {
+    // Goal: the deleter never touches another branch (main, a session's). Method: each prefix,
+    // a bare prefix and look-alikes.
+    try std.testing.expectEqualStrings("m4-x", scratch_name("vm/m4-x").?);
+    try std.testing.expectEqualStrings("m4-x", scratch_name("vmw/m4-x").?);
+    try std.testing.expectEqualStrings("", scratch_name("vm/").?);
+    try std.testing.expect(scratch_name("main") == null);
+    try std.testing.expect(scratch_name("claude/vm/m4-x") == null);
+    try std.testing.expect(scratch_name("vmx/m4") == null);
+    try std.testing.expect(scratch_name("vm") == null);
 }
 
 test "ci: change inputs are read as lines and as a JSON array" {

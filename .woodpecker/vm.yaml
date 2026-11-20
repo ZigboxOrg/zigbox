@@ -1,20 +1,22 @@
-# VM runs on demand: a push to vm/<demo>-<anything> runs that demo in a KVM guest on the fleet box
+# VM runs on demand on the fleet box: a push to vmw/<demo>-<anything> runs that demo in a KVM guest
 # (ops/ci/README.md), then deletes the scratch branch through the GitHub API. <demo> is any name
-# src/ci/demos.zig takes, or all. Woodpecker owns vm/*; .github/workflows/vm.yml runs only the
-# three it cannot (vm/top20-*, vm/m6d-*, vm/m8-push-ghcr: they need GitHub's own credentials) and,
-# by hand, any other when the box is down. A newer push to the same branch cancels the older run
-# (the repository's cancel-previous setting, ops/ci/woodpecker-setup.sh). The steps are
-# `zig build vm-branch` and `zig build vm-branch-delete`; the rest is CI-only.
+# src/ci/demos.zig takes, or all. vm/* stays on GitHub's .github/workflows/vm.yml (vm/top20-* is
+# top20.yml's) until a pull-request pipeline is green here; moving vm/* to the box is then a
+# one-line change of this trigger and vm.yml's (docs/decisions/2026-11-19-ci-on-woodpecker.md).
+# The prefixes are disjoint, so each branch has one runner and one deleter. A newer push to the
+# same branch cancels the older run (the repository's cancel-previous setting,
+# ops/ci/woodpecker-setup.sh). The steps are `zig build vm-branch` and `zig build
+# vm-branch-delete`; the rest is CI-only. Every command holds /cache/.prune-lock shared, as in
+# check.yaml.
 when:
   - event: push
-    branch:
-      include: vm/**
-      exclude: [vm/top20-**, vm/m6d-**, vm/m8-push-ghcr]
+    branch: vmw/**
 
 clone:
   - name: clone
     image: docker.io/woodpeckerci/plugin-git:2.12.1@sha256:b8d2401997be68ec25d62bd753fe5d30236e029fe007a5e823177e0e485ae205
     settings:
+      # As demos.yaml: build_old fetches the old/* branches and tags it needs.
       depth: 0
       partial: false
 
@@ -33,10 +35,13 @@ steps:
       ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
       ZBX_VM_CACHE: /cache/vm-entries
     commands:
-      - zig build vm-branch -- "$CI_COMMIT_BRANCH"
+      - flock -s /cache/.prune-lock zig build vm-branch -- "$CI_COMMIT_BRANCH"
 
   # Runs whatever the demo did, and alone holds the token (the github_token secret; without it the
-  # branch stays and the step still passes). Not privileged.
+  # branch stays and the step still passes). Not privileged. The driver deletes only vm/* and
+  # vmw/* branches. The pipeline's YAML comes from the pushed branch, so whoever can push a
+  # branch can read this token: it must be a contents:write token on this repository only, from
+  # an account that cannot bypass main's protection (ops/ci/README.md).
   - name: delete-branch
     image: zigbox-ci:0.17.0
     depends_on: [demo]
@@ -50,4 +55,4 @@ steps:
       GITHUB_TOKEN:
         from_secret: github_token
     commands:
-      - zig build vm-branch-delete -- "$CI_COMMIT_BRANCH"
+      - flock -s /cache/.prune-lock zig build vm-branch-delete -- "$CI_COMMIT_BRANCH"

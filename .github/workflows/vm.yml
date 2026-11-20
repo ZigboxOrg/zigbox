@@ -6,15 +6,13 @@
 # A newer push to the same branch cancels the run it supersedes. See AGENTS.md, "Git".
 name: vm
 
-# Woodpecker on the fleet box owns vm/* (.woodpecker/vm.yaml, docs/decisions/
-# 2026-11-19-ci-on-woodpecker.md). A push runs here only for the two that need GitHub's own
-# credentials: vm/m6d-* (the OIDC token Google's STS exchanges) and vm/m8-push-ghcr (the run's
-# GITHUB_TOKEN pushes to GHCR); Woodpecker skips those. Any other vm/* branch runs here only by
-# hand, when the box is down: `gh workflow run vm.yml --ref vm/<demo>-<slug>`. Each branch then
-# has one run, so one deleter.
+# GitHub runs vm/* (docs/decisions/2026-11-19-ci-on-woodpecker.md): the box's Woodpecker runs only
+# vmw/* (.woodpecker/vm.yaml) until a pull-request pipeline is green there, so each branch has one
+# runner and one deleter. vm/top20-* is top20.yml's. By hand (`gh workflow run vm.yml --ref
+# vm/<demo>-<slug>`) it runs only on a vm/* ref: on any other it fails at once and deletes nothing.
 on:
   push:
-    branches: ['vm/m6d-**', 'vm/m8-push-ghcr']
+    branches: ['vm/**', '!vm/top20-**']
   workflow_dispatch:
 
 concurrency:
@@ -40,6 +38,12 @@ jobs:
       ZBX_GAR_REGISTRY: ${{ vars.ZBX_GAR_REGISTRY }}
       ZBX_GCR_REGISTRY: ${{ vars.ZBX_GCR_REGISTRY }}
     steps:
+      # A run started by hand on main or a session's branch must neither run nor delete it.
+      - name: Refuse a branch that is not vm/*
+        if: ${{ !startsWith(github.ref, 'refs/heads/vm/') }}
+        run: |
+          echo "vm: $GITHUB_REF is not a vm/<demo>-<slug> branch; nothing runs and nothing is deleted"
+          exit 1
       # The whole history: demo-m3 and later build an older release for the upgrade test.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,6 +54,8 @@ jobs:
         uses: ./.github/actions/m6d-setup
         with:
           fork: 'false'
+      # Before the demo is picked: the deleter at the end is the driver, built with this Zig.
+      - uses: ./.github/actions/setup-zig
       - name: Which demo
         id: pick
         env:
@@ -72,7 +78,6 @@ jobs:
           # The slice 12 check pushes to GHCR from the runner and runs no guest demo.
           if [ "$name" = "m8-push-ghcr" ]; then steps=""; fi
           echo "steps=$steps" >> "$GITHUB_OUTPUT"
-      - uses: ./.github/actions/setup-zig
       - name: Install QEMU
         uses: ./.github/actions/install-apt
         with:
@@ -139,8 +144,10 @@ jobs:
             ./zig-out/bin/zbx push --username "$ZBX_PUSH_USER" --password-stdin \
               "$digest" "$ref"
       # Not on cancel: a newer push to the branch superseded this run and still needs the branch.
+      # Only on a vm/* ref, and through the driver's delete-branch, which refuses any other branch
+      # as well (src/ci_main.zig).
       - name: Delete the scratch branch
-        if: success() || failure()
+        if: (success() || failure()) && startsWith(github.ref, 'refs/heads/vm/')
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/${{ github.ref_name }}"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: zig build vm-branch-delete -- "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"

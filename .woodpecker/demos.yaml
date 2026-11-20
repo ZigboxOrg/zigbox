@@ -8,6 +8,9 @@
 # /dev/kvm, the /cache mount).
 # The /cache mount is per event (/var/lib/zigbox-ci/<event>): a push here is only ever to main, so
 # main reads and writes /var/lib/zigbox-ci/push and never a directory a pull request wrote.
+# Each command runs under `flock -s /cache/.prune-lock` (the root build of the driver included):
+# the hourly prune empties a scope's Zig caches only while it holds that lock exclusively
+# (ops/ci/bootstrap.sh), so no step's build loses files under it.
 when:
   - event: pull_request
   # A label added to an open pull request: `full-ci` runs everything now, without a new push
@@ -15,7 +18,9 @@ when:
   # forge does not pass the labels with this event, nothing runs here and the next push picks
   # the label up.
   - event: pull_request_metadata
-    evaluate: 'CI_PIPELINE_EVENT_REASON == "label_updated" && CI_COMMIT_PULL_REQUEST_LABELS contains "full-ci"'
+    # The whole label, not a substring (`no-full-ci` is not `full-ci`). While full-ci is on, any
+    # other label change runs everything again too (ops/ci/README.md).
+    evaluate: 'CI_PIPELINE_EVENT_REASON == "label_updated" && ("," + CI_COMMIT_PULL_REQUEST_LABELS + ",") contains ",full-ci,"'
   - event: push
     branch: main
   - event: manual
@@ -47,7 +52,9 @@ clone:
   - name: clone
     image: docker.io/woodpeckerci/plugin-git:2.12.1@sha256:b8d2401997be68ec25d62bd753fe5d30236e029fe007a5e823177e0e485ae205
     settings:
-      # The whole history: demo-m3 and later build an older release for the upgrade test.
+      # The whole history of this ref. demo-m2b, m3 to m9 build an older release whose commit is
+      # only on origin's old/* branches or tags; build_old fetches those itself when it is missing
+      # (src/testing/vm/build_old.zig), as this clone fetches one ref.
       depth: 0
       partial: false
 
@@ -65,4 +72,4 @@ steps:
       ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
       ZBX_VM_CACHE: /cache/vm-entries
     commands:
-      - zig build ci-demos -- --demo ${DEMO}
+      - flock -s /cache/.prune-lock zig build ci-demos -- --demo ${DEMO}

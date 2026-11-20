@@ -19,7 +19,9 @@
 //!   - `save` prunes: of each entry's keys it keeps the current one and the newest of the others,
 //!     `keys_per_entry_max` in all, so a pin that moves never leaves more than one old copy.
 //!
-//! The pipelines of pull requests and of `main` mount different store directories
+//! The hashes catch corruption and truncation, not tampering: the list is written by whoever
+//! writes the entry, so a pipeline that rewrites both passes the check. What keeps `main` clean is
+//! the scopes: the pipelines of pull requests and of `main` mount different store directories
 //! (.woodpecker/*.yaml), so nothing a pull request saves is ever restored on `main`.
 //!
 //! Build-host tooling: it runs in the CI driver, never in `zbx`.
@@ -454,7 +456,7 @@ test "vm cache: save stores once, restore copies, nothing is overwritten" {
 }
 
 test "vm cache: a stored file that fails its hash is not restored, and the entry is dropped" {
-    // Goal: a corrupted or tampered store never reaches a demo (m4-blobs.img is a disk image the
+    // Goal: a corrupted or truncated store never reaches a demo (m4-blobs.img is a disk image the
     // guest boots). Method: save, change the stored copy, restore into a fresh workspace: the
     // copy must be gone and the stored entry too; an entry with no hash list must be a miss.
     var tmp = testing.tmpDir(.{});

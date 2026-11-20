@@ -1155,12 +1155,12 @@ const ci_commands = [_]CiCommand{
     },
     .{
         .name = "vm-branch",
-        .help = "Run a vm/<demo>-<slug> branch's demos",
+        .help = "Run a vm/* or vmw/* <demo>-<slug> branch's demos",
         .args = &.{"vm-branch"},
     },
     .{
         .name = "vm-branch-delete",
-        .help = "Delete a vm/<demo>-<slug> scratch branch (GITHUB_TOKEN)",
+        .help = "Delete a vm/* or vmw/* scratch branch (GITHUB_TOKEN)",
         .args = &.{"delete-branch"},
     },
 };

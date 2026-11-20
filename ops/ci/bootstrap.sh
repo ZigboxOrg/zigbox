@@ -155,20 +155,24 @@ for scope in push pull_request pull_request_metadata manual vm; do
         "$cache/$scope/zig-root" "$cache/$scope/vm-entries"
 done
 
-# The bound on the Zig caches: hourly, a scope whose Zig caches pass 30 GiB is emptied, but only
-# while no step runs (a step's build would lose files under it). The VM entries bound themselves
-# (src/testing/vm/cache.zig keeps two keys per entry and scope).
+# The bound on the Zig caches: hourly, a scope whose Zig caches pass 30 GiB is emptied. Every
+# step's command holds <scope>/.prune-lock shared (`flock -s /cache/.prune-lock`, .woodpecker/*);
+# the prune takes it exclusive without waiting, so it skips a scope a step is using (the next hour
+# tries again) and a step that starts meanwhile waits until the prune is done. The VM entries bound
+# themselves (src/testing/vm/cache.zig keeps two keys per entry and scope).
 cat > /usr/local/sbin/zigbox-ci-prune <<'PRUNE'
 #!/bin/bash
-# Empties each /var/lib/zigbox-ci/<scope>/zig* over 30 GiB while no step container runs.
+# Empties each /var/lib/zigbox-ci/<scope>/zig* over 30 GiB, holding <scope>/.prune-lock exclusive.
 set -euo pipefail
 limit_kib=$((30 * 1024 * 1024))
-if docker ps --format '{{.Image}}' | grep -q '^zigbox-ci:'; then exit 0; fi
 for scope in /var/lib/zigbox-ci/*/; do
-    used=$(du -sk "$scope"zig "$scope"zig-root 2>/dev/null | awk '{s += $1} END {print s + 0}')
-    [ "$used" -le "$limit_kib" ] && continue
-    echo "zigbox-ci-prune: $scope Zig caches use $((used / 1024 / 1024)) GiB; emptying them"
-    find "$scope"zig "$scope"zig-root -mindepth 1 -delete
+    (
+        flock -x -n 9 || { echo "zigbox-ci-prune: $scope is in use; next hour"; exit 0; }
+        used=$(du -sk "$scope"zig "$scope"zig-root 2>/dev/null | awk '{s += $1} END {print s + 0}')
+        [ "$used" -le "$limit_kib" ] && exit 0
+        echo "zigbox-ci-prune: $scope Zig caches use $((used / 1024 / 1024)) GiB; emptying them"
+        find "$scope"zig "$scope"zig-root -mindepth 1 -delete
+    ) 9>"$scope.prune-lock"
 done
 PRUNE
 chmod 0755 /usr/local/sbin/zigbox-ci-prune
