@@ -1195,7 +1195,14 @@ fn find_fuzzer(name: []const u8) ?*const Fuzzer {
     return null;
 }
 
-const UsageError = error{ NoFuzzer, UnknownFuzzer, BadSeed, BadIterations, TooManyArguments, BadShard };
+const UsageError = error{
+    NoFuzzer,
+    UnknownFuzzer,
+    BadSeed,
+    BadIterations,
+    TooManyArguments,
+    BadShard,
+};
 
 fn parse_arguments(arguments: []const []const u8) UsageError!Parsed {
     if (arguments.len == 0) return error.NoFuzzer;
