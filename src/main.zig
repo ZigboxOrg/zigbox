@@ -279,6 +279,8 @@ test {
     _ = @import("runtime/hosts_file_tests.zig");
     // CI path selection (`.github/ci-changes.sh`).
     _ = @import("ci_changes_tests.zig");
+    // The git backup's copy job (`ops/backup/sync.sh`).
+    _ = @import("backup_sync_tests.zig");
 }
 
 test {
