@@ -49,69 +49,59 @@ subkey, so until a release is signed with the new key:
 
 - the weekly `package-refresh` fails every Monday (the schedule stays on; its failure is expected,
   and nothing about it needs the owner);
-- the served apt `Release` passes its `Valid-Until` (21 days after its last signing,
-  `apt_valid_seconds` in `src/constants.zig`) and stays expired: every apt user, whatever keyring
-  they hold, sees `Release file ... is expired` (apt refuses it, or warns, depending on the
-  version) and cannot install or upgrade until 0.6.0;
+- the served apt `Release` (Date 18 Nov 2026) has `Valid-Until` Wed, 09 Dec 2026 00:57:35 UTC, so apt
+  is not broken today. After that date, unless a release signed with the new key has shipped, every
+  apt user, whatever keyring they hold, sees `Release file ... is expired` (apt refuses it, or warns,
+  depending on the version) and cannot install or upgrade. They must not disable the expiry check;
+  they wait for the release, for which no date is promised;
 - the keyring at `https://zigbox.org/zigbox-archive-keyring.gpg` and `.asc` stays the old one.
 
-So the served keyring changes only with 0.6.0, the first release signed by the new key. Before
+So the served keyring changes only with the first release signed by the new key (planned: 0.6.0). Before
 announcing, the owner fetches both URLs and checks that `gpg --show-keys` prints
 `1207 CB86 00CE 25FF DD3C  C87E CCBE C141 C334 8787`, and that the served `InRelease` verifies against it.
 
-## What existing users do (from 0.6.0 on)
+## What existing users do (from the first release signed with the new key, planned 0.6.0)
 
-Do not run these before 0.6.0 is out: the served keyring is the old one until then, and the
+Do not run these before that release is out: the served keyring is the old one until then, and the
 fingerprint check below will fail. Packages and repository metadata signed from then on are by the
 new key. A machine that holds only the old keyring refuses them: apt fails `apt update` with
 `NO_PUBKEY C07B2441C39645B7` (the long id of the new signing subkey; it may also say `EXPKEYSIG` or
-`BADSIG`), and dnf or rpm refuses the signature. Each step below downloads to a temporary file,
-checks the fingerprint, and only then installs it. If the check does not show
-`1207 CB86 00CE 25FF DD3C  C87E CCBE C141 C334 8787`, stop and delete the file.
+`BADSIG`), and dnf or rpm refuses the signature. Each block below downloads to a temporary file (`mktemp`),
+checks the fingerprint, and only then installs it; if the check fails, nothing is installed.
 
-apt (Debian, Ubuntu), replacing the file the install guide wrote:
-
-```sh
-curl -fsSLo /tmp/zigbox-new.gpg https://zigbox.org/zigbox-archive-keyring.gpg
-```
+apt (Debian, Ubuntu), replacing the file the install guide wrote (the check requires exactly one
+key with the new primary fingerprint; nothing is installed otherwise):
 
 ```sh
-gpg --show-keys --with-fingerprint /tmp/zigbox-new.gpg
-```
-
-```sh
-sudo install -m 0644 /tmp/zigbox-new.gpg /usr/share/keyrings/zigbox.gpg
-```
-
-```sh
-sudo apt update
+f=$(mktemp) && curl -fsSLo "$f" https://zigbox.org/zigbox-archive-keyring.gpg
+test "$(gpg --show-keys --with-colons "$f" | awk -F: '$1=="pub"{n++;w=1} $1=="fpr"&&w{print $10;w=0} END{if(n!=1)print "BAD"}')" = 1207CB8600CE25FFDD3CC87ECCBEC141C3348787 \
+  && sudo install -m 0644 "$f" /usr/share/keyrings/zigbox.gpg && echo installed
+rm -f "$f"
 ```
 
 dnf (Fedora, Rocky, RHEL):
 
 ```sh
-curl -fsSLo /tmp/zigbox-new.asc https://zigbox.org/zigbox-archive-keyring.asc
+f=$(mktemp) && curl -fsSLo "$f" https://zigbox.org/zigbox-archive-keyring.asc
+test "$(gpg --show-keys --with-colons "$f" | awk -F: '$1=="pub"{n++;w=1} $1=="fpr"&&w{print $10;w=0} END{if(n!=1)print "BAD"}')" = 1207CB8600CE25FFDD3CC87ECCBEC141C3348787 \
+  && sudo rpm --import "$f" && echo imported
+rm -f "$f"
 ```
 
-```sh
-gpg --show-keys --with-fingerprint /tmp/zigbox-new.asc
-```
-
-```sh
-sudo rpm --import /tmp/zigbox-new.asc
-```
+Then remove the old key from rpm and refresh:
 
 ```sh
 sudo rpm -e gpg-pubkey-28b7dbb7
-```
-
-```sh
 sudo dnf clean metadata && sudo dnf makecache
 ```
 
+If dnf asks to import the repository key itself (`repo_gpgcheck=1`), compare the fingerprint it
+prints with `1207 CB86 00CE 25FF DD3C C87E CCBE C141 C334 8787` and do not use `-y` for that first
+import; not yet checked on a dnf 4 host.
+
 `rpm -qa 'gpg-pubkey*'` lists the old key's entry as `gpg-pubkey-28b7dbb7-*`; the `rpm -e` removes it
 (use the full name that listing prints if rpm says the short one is ambiguous). Skipping it is
-harmless, but the old key then stays trusted by rpm. Delete the temporary files afterwards.
+harmless, but the old key then stays trusted by rpm.
 
 The `zigbox-archive-keyring` package of
 [2026-11-13-keyring-renewal-needs-refetch.md](2026-11-13-keyring-renewal-needs-refetch.md) would have
