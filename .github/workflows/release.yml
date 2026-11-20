@@ -260,7 +260,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: |
             homebrew-tap
             website
@@ -721,7 +721,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: |
             homebrew-tap
             website
@@ -855,7 +855,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: homebrew-tap
           permission-contents: write
       - name: The tap's formula differs only where it may
@@ -911,7 +911,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: website
           permission-contents: write
           permission-actions: read
