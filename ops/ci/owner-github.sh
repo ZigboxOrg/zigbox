@@ -11,11 +11,15 @@
 # requests are authored from, and any other human who merges). ALLOW_APPS: optional, comma-
 # separated slugs of GitHub Apps that must push to main (none today).
 #
-# It makes the bot an outside collaborator on zigbox only, never an organisation member (a member
-# can inherit the organisation's default repository permission on every other repository), with the
-# given role (`admin` only for the run that turns the repository on in Woodpecker, since GitHub lets
-# only an admin do that). It sets main's protection so that only OWNER_LOGINS can push or merge: no
-# approvals are required, so the supervisor's merges from the author's account still work.
+# It makes the bot a plain member of the organisation (role `member`, never an owner, in no team):
+# Woodpecker logs in only members of the organisation (WOODPECKER_ORGS), and GitHub lets only a
+# member make a fine-grained token on one of its repositories. A member inherits the organisation's
+# base repository permission on every repository, so the script sets that to `none` and reads it
+# back (this takes the base access away from every member, not only the bot: each keeps what a team
+# or a direct grant gives). The bot then gets the given role on zigbox alone (`admin` only for the
+# run that turns the repository on in Woodpecker, since GitHub lets only an admin do that). It sets
+# main's protection so that only OWNER_LOGINS can push or merge: no approvals are required, so the
+# supervisor's merges from the author's account still work.
 #
 # The protection PUT REPLACES the whole protection of main (status checks, review rules, restrictions,
 # every flag); anything set by hand and not written below is gone after a run. The read-back then
@@ -41,27 +45,67 @@ for login in $(jq -r '.[]' <<<"$owners"); do
     case "$perm" in admin | maintain | write) ;; *) fail "$login has $perm on $repo; it cannot merge" ;; esac
 done
 
-echo "owner-github: the bot $BOT_LOGIN on $repo only, and $level there"
-# Membership of the organisation would give the bot the organisation's default permission on every
-# repository, so it is refused unless that default grants nothing.
-state=$(gh api "orgs/$org/memberships/$BOT_LOGIN" --jq .state 2>/dev/null || echo none)
-if [ "$state" != none ]; then
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+# gh_or_404 PATH: the body on stdout, or nothing when GitHub answers 404; any other failure fails.
+gh_or_404() {
+    if gh api "$1" 2>"$work/err"; then return 0; fi
+    case "$(cat "$work/err")" in
+        *"HTTP 404"*) return 0 ;;
+        *) fail "cannot read $1 ($(head -c 200 "$work/err" | tr '\n' ' '))" ;;
+    esac
+}
+
+echo "owner-github: the bot $BOT_LOGIN: a plain member of $org, with no base permission, $level on $repo only"
+# The base permission first: from the moment the bot is a member, it holds whatever this grants on
+# every repository of the organisation.
+base=$(gh api "orgs/$org" --jq .default_repository_permission) ||
+    fail "cannot read $org's base repository permission (gh must be logged in as an owner of $org)"
+if [ "$base" != none ]; then
+    echo "owner-github: $org's base repository permission is $base; setting it to none (members keep" \
+        "what a team or a direct grant gives them)"
+    gh api -X PATCH "orgs/$org" -f default_repository_permission=none >/dev/null ||
+        fail "could not set $org's base repository permission to none"
     base=$(gh api "orgs/$org" --jq .default_repository_permission) ||
-        fail "cannot read $org's default repository permission"
-    case "$base" in none | read) ;; *)
-        fail "$BOT_LOGIN is a member of $org, whose default repository permission is $base: remove it \
-(gh api -X DELETE orgs/$org/memberships/$BOT_LOGIN) and run this again; it joins as an outside \
-collaborator" ;; esac
-    echo "owner-github: WARNING $BOT_LOGIN is a member of $org (default permission $base is harmless, \
-but an outside collaborator is what the runbook sets)"
+        fail "cannot read $org's base repository permission back"
 fi
-resp=$(gh api -X PUT "repos/$repo/collaborators/$BOT_LOGIN" -f permission="$level")
-inv=$(jq -r '.id // empty' <<<"$resp")
-if [ -n "$inv" ]; then
-    echo "owner-github: invited $BOT_LOGIN to $repo; log in as it and accept (gh api -X PATCH" \
-        "user/repository_invitations/$inv), then run this again"
+[ "$base" = none ] || fail "$org's base repository permission is $base after setting it to none"
+
+# A 404 is the one answer that means "not a member"; any other failure stops here (a command
+# substitution's failure is checked by `||`, never left to a test, which would read it as empty).
+membership=$(gh_or_404 "orgs/$org/memberships/$BOT_LOGIN") || exit 1
+[ -n "$membership" ] || membership='{}'
+state=$(jq -r '.state // "none"' <<<"$membership")
+role=$(jq -r '.role // "none"' <<<"$membership")
+case "$state/$role" in
+    none/none)
+        gh api -X PUT "orgs/$org/memberships/$BOT_LOGIN" -f role=member >/dev/null ||
+            fail "could not invite $BOT_LOGIN to $org as a member"
+        state=pending role=member ;;
+    pending/member | active/member) ;;
+    */admin) fail "$BOT_LOGIN is an owner of $org; make it a plain member (gh api -X PUT \
+orgs/$org/memberships/$BOT_LOGIN -f role=member) and run this again" ;;
+    *) fail "$BOT_LOGIN's membership of $org is '$state', role '$role', which this script does not know" ;;
+esac
+if [ "$state" = pending ]; then
+    echo "owner-github: invited $BOT_LOGIN to $org as a member; log in as it and accept (gh api -X" \
+        "PATCH user/memberships/orgs/$org -f state=active), then run this again"
     exit 0
 fi
+# A team can grant the bot more than its own role, on zigbox or on any other repository.
+teams=$(gh api --paginate "orgs/$org/teams" --jq '.[].slug') || fail "cannot list $org's teams"
+for slug in $teams; do
+    team=$(gh_or_404 "orgs/$org/teams/$slug/memberships/$BOT_LOGIN") || exit 1
+    [ -z "$team" ] ||
+        fail "$BOT_LOGIN is in $org's team $slug; remove it (gh api -X DELETE \
+orgs/$org/teams/$slug/memberships/$BOT_LOGIN) and run this again"
+done
+# A member is added directly (no invitation); an answer with an invitation means it is not one.
+resp=$(gh api -X PUT "repos/$repo/collaborators/$BOT_LOGIN" -f permission="$level")
+[ -n "$resp" ] || resp='{}'
+inv=$(jq -r '.id // empty' <<<"$resp")
+[ -z "$inv" ] || fail "GitHub invited $BOT_LOGIN to $repo (invitation $inv) instead of adding it: it is \
+not an active member of $org; run this again"
 
 echo "owner-github: main: pushes and merges only by $OWNER_LOGINS"
 jq -n --argjson users "$owners" --argjson apps "$apps" '{
@@ -79,6 +123,12 @@ jq -n --argjson users "$owners" --argjson apps "$apps" '{
 echo "owner-github: reading it back"
 perm=$(gh api "repos/$repo/collaborators/$BOT_LOGIN/permission" --jq .permission)
 [ "$perm" = "$level" ] || fail "$BOT_LOGIN has $perm on $repo, not $level"
+role=$(gh api "orgs/$org/memberships/$BOT_LOGIN" --jq '"\(.state)/\(.role)"') ||
+    fail "cannot read $BOT_LOGIN's membership of $org back"
+[ "$role" = active/member ] || fail "$BOT_LOGIN's membership of $org is $role, not active/member"
+base=$(gh api "orgs/$org" --jq .default_repository_permission) ||
+    fail "cannot read $org's base repository permission back"
+[ "$base" = none ] || fail "$org's base repository permission is $base, not none"
 prot=$(gh api "repos/$repo/branches/main/protection")
 jq -e --arg bot "$BOT_LOGIN" --argjson users "$owners" --argjson apps "$apps" '
     .enforce_admins.enabled == true
@@ -90,4 +140,5 @@ jq -e --arg bot "$BOT_LOGIN" --argjson users "$owners" --argjson apps "$apps" '
     and .allow_force_pushes.enabled == false and .allow_deletions.enabled == false' \
     >/dev/null <<<"$prot" || fail "main's protection is not as set: $(jq -c .restrictions <<<"$prot")"
 who=$(jq -r '[.restrictions.users[].login] | join(",")' <<<"$prot")
-echo "owner-github: OK $BOT_LOGIN is $level; only $who can push or merge into main"
+echo "owner-github: OK $BOT_LOGIN is a plain member of $org (base permission none, no team) and" \
+    "$level on $repo; only $who can push or merge into main"

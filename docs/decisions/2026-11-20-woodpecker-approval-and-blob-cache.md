@@ -53,8 +53,10 @@ write access. Proposed wording, to replace "(a collaborator, a team, a bot, an a
 `contents: write`)" with "(a collaborator, a team, an app with `contents: write`, or a second
 bot)", and to add this sentence after it: "The one exception is the Woodpecker bot of
 `ops/ci/README.md` 3a: a single machine account with the `write` role on `ZigboxOrg/zigbox` only,
-added as an outside collaborator (never an organisation member), not on `main`'s push
-restrictions, whose token lives only on this box; it widens nothing because it is the account
+a plain member of `ZigboxOrg` (role `member`, never an owner, in no team: Woodpecker's
+`WOODPECKER_ORGS` logs in only members, and only a member can make a fine-grained token on the
+organisation's repository) while the organisation's base repository permission is `none`, so the
+membership grants it nothing on any other repository, not on `main`'s push restrictions, whose token lives only on this box; it widens nothing because it is the account
 Woodpecker acts as, and `woodpecker-setup.sh` refuses while it, or any other account Woodpecker
 holds, can change `main` or is a repository admin."
 

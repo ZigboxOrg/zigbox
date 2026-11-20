@@ -93,8 +93,11 @@ To change a setting later, edit `/etc/zigbox-ci/ci.env` (or delete a secret file
 and rerun.
 
 **3a. Owner steps: a Woodpecker account that cannot change `main`, and `main`'s protection.**
-Do this before step 4 (the facts behind it are under "What a writer can reach"). Everything runs
-on your own machine, never on the box. Values you supply:
+On a fresh box, make the account (1 below) before the bootstrap of step 3, which asks for its
+login; the rest follow the bootstrap, in order. Section 4 is the detail of 3a.6, not a separate
+step: do not run its script before 3a.5. Steps 1, 2, 3, 5, 7 and 10 run on your own machine or in a
+browser; steps 4, 6, 8 and 9 run **on the box, as root** (each says so). The facts behind all of it
+are under "What a writer can reach". Values you supply:
 
 - `BOT_LOGIN`: the GitHub login of a new account made for Woodpecker, for example
   `zigbox-ci-bot` (a machine user: GitHub's terms allow one per person, and it needs its own
@@ -114,8 +117,12 @@ and runs nothing, with no error anywhere.
 
 1. **Make the account** (browser: GitHub has no API to create an account or to enrol two-factor
    authentication): sign up as `BOT_LOGIN`, turn on two-factor authentication, and keep its
-   password and recovery codes with the owner. It is never an organisation member: step 2 adds it
-   to `ZigboxOrg/zigbox` alone, as an outside collaborator.
+   password and recovery codes with the owner. Step 2 makes it a plain member of `ZigboxOrg`
+   (never an owner, in no team), because Woodpecker logs in only members of the organisation
+   (`WOODPECKER_ORGS`) and GitHub lets only a member make a fine-grained token on one of its
+   repositories. A member inherits the organisation's base repository permission on every
+   repository, so step 2 sets that to **none**, and gives the bot a role on `ZigboxOrg/zigbox`
+   alone.
 2. **Add it to the repository and set `main`'s protection** (needs `gh`, `jq`; log in with
    `gh auth login` as an owner of `ZigboxOrg`). The role is `admin` on a fresh box, where the bot
    turns the repository on (GitHub lets only an admin do that), and `write` when the repository is
@@ -126,16 +133,22 @@ and runs nothing, with no error anywhere.
    bash ops/ci/owner-github.sh admin    # or: write, on a box whose repository is already on
    ```
 
-   The first run invites the bot to `ZigboxOrg/zigbox` and stops. Log in as the bot in a private
-   browser window, accept at <https://github.com/ZigboxOrg/zigbox/invitations> (or `gh api -X
-   PATCH user/repository_invitations/ID` with the bot's own `gh` login; the command printed the
-   id), and run the same command again. It then replaces `main`'s protection (**the whole
+   It first sets `ZigboxOrg`'s base repository permission to `none` and reads it back. **This
+   applies to every member, not only the bot:** a member then keeps only what a team or a direct
+   grant on a repository gives them; check with `gh api orgs/ZigboxOrg/members --jq '.[].login'`
+   who that is before the first run. The first run then invites the bot to `ZigboxOrg` as a
+   `member` and stops. Log in as the bot in a private browser window, accept at
+   <https://github.com/orgs/ZigboxOrg/invitation> (or `gh api -X PATCH user/memberships/orgs/ZigboxOrg
+   -f state=active` with the bot's own `gh` login), and run the same command again. It refuses
+   (and fails on any answer it cannot read, never taking it for "not a member") while the bot is
+   an owner of the organisation or in any of its teams. It adds the bot to `ZigboxOrg/zigbox` with
+   the role, then replaces `main`'s protection (**the whole
    protection: anything set by hand and not listed here is gone**) with: pull requests required
    (**no approving review**, so the supervisor's merges still work), `enforce_admins`, force pushes
-   and deletion off, and **pushes and merges restricted to `OWNER_LOGINS`**. It refuses if the bot
-   is an organisation member while `ZigboxOrg`'s default repository permission is more than
-   `read`. It reads everything back (the restrictions are exactly `OWNER_LOGINS` and `ALLOW_APPS`,
-   reviews are required) and ends in `owner-github: OK ...`. Before you run it, check that no
+   and deletion off, and **pushes and merges restricted to `OWNER_LOGINS`**. It reads everything
+   back (the bot is an active `member` with the role on the repository, the base permission is
+   `none`, the restrictions are exactly `OWNER_LOGINS` and `ALLOW_APPS`, reviews are required) and
+   ends in `owner-github: OK ...`. Before you run it, check that no
    workflow pushes to `main` with a token of its own: `grep -n 'git push' .github/workflows/*.yml`
    (none does today besides tags); if one does, pass its GitHub App's slug in `ALLOW_APPS=slug`.
 3. **Make the two read tokens** (browser: GitHub has no API for fine-grained tokens), at
@@ -148,8 +161,8 @@ and runs nothing, with no error anywhere.
    step 3 again. It installs `sqlite3`, which step 6 uses to check the repository's owner.
 5. **Log in to Woodpecker as the bot** (browser, a private window, <https://ci.zigbox.org>, grant
    access to `ZigboxOrg`) and copy its token from **User settings → CLI & API**.
-6. **Set the repository up: this makes the bot its owner.** As root on the box (step 4 below has
-   the details):
+6. **Set the repository up: this makes the bot its owner.** As root on the box (section 4 below
+   has the details):
 
    ```bash
    bash /opt/zigbox-ci/src/ops/ci/woodpecker-setup.sh
@@ -272,14 +285,17 @@ which is false):
   itself defines.
 - **Releases and the Homebrew tap.** A writer's token can also edit a *published* release's assets
   and re-dispatch `release.yml`, whose `tap` job commits the release's formula to
-  `ZigboxOrg/homebrew-tap`, which Homebrew users install from. Three things stop that: a run on an
-  already published release waits for the owner's approval of the `release` environment; the job
-  re-runs the draft's check on the published assets (the Linux files against `SHA256SUMS` and its
-  signature by the pinned key, the formula's url, version and sha256 against the zip, which must
-  hold only `zbx`); and `tap-formula` refuses a formula whose url is not the release's own zip. What
-  is **not** covered: the Mac zip and the formula are outside the signed `SHA256SUMS`, so a writer
-  who replaces both consistently passes the check and only the approval stops it. Closing that
-  needs the Mac zip's hash in a signed file (a decision for the owner: `docs/releases/`).
+  `ZigboxOrg/homebrew-tap`, which Homebrew users install from. The Mac zip, its sums and the
+  formula are outside the signed `SHA256SUMS`, so a writer can replace all four consistently, on
+  the draft after `mac` attaches them or on the release before `tap` reads them. What stops that:
+  `mac` gives the zip's SHA-256 as its job output, which no token can change, and both `prepare`
+  and `tap` refuse a zip that is not that one (the formula's sha256 and both sums files must match
+  the zip, so they are pinned with it). On an already published release `mac` does not run, so a
+  re-dispatch waits for the owner's approval (`tap-approve`, on the `release` environment) before
+  `tap` runs. Both also re-check the Linux files against `SHA256SUMS` and its signature by the
+  pinned key, the formula's url and version, and that the zip holds only `zbx`; and `tap-formula`
+  refuses a formula whose url is not the release's own zip. Left to the approval: on a re-dispatch,
+  the owner approves assets that nothing signed pins (`docs/releases/automation.md`).
 - **So the control is on accounts, not on the protection alone:** Woodpecker only ever knows a
   dedicated bot account with the `write` role, which is not on `main`'s restriction list; the owner
   accounts that can merge never log in to it (step 3a). `woodpecker-setup.sh` checks this, with a

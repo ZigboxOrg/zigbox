@@ -18,7 +18,8 @@
 # not stored). Before it changes anything it refuses unless main's protection is as the runbook
 # sets it and the token's own account cannot change main; it ends by refusing if another account
 # Woodpecker holds a token for can change main (it names the one to delete, and by then the bot owns
-# the repository, so deleting it is safe), or if any of them is a repository admin.
+# the repository, so deleting it is safe; this comes before the admin check, so an owner's account
+# is named for deletion, never for demotion), or else if any of them is a repository admin.
 #
 # Why the owner matters: Woodpecker looks the repository's owner user up on every webhook, and
 # deleting that user leaves the repository pointing at a row that is gone, so every push and pull
@@ -159,8 +160,11 @@ owner_login=$(sql "select u.login from repos r join users u on u.id = r.user_id 
 no pipeline would run; this script's chown should have set it, so report it"
 [ "$owner_login" = "$me_login" ] ||
     fail "$repo_name is owned by $owner_login in Woodpecker, not by $me_login"
+# Only an active repository receives webhooks; a deactivated one whose owner is gone harms nothing.
+# A value of `active` this does not know counts as active (fail closed).
 orphans=$(sql "select r.full_name from repos r left join users u on u.id = r.user_id \
-    where u.id is null") || fail "cannot read Woodpecker's repositories from $db"
+    where u.id is null and coalesce(r.active, 1) not in (0, '0', 'false')") ||
+    fail "cannot read Woodpecker's repositories from $db"
 [ -z "$orphans" ] ||
     fail "Woodpecker holds a repository whose owner user is gone, so its webhooks answer 404: \
 $(paste -sd' ' <<<"$orphans"); run this script as the bot to take it over, or deactivate it"
@@ -214,6 +218,16 @@ want='.active == true and .trusted.security == true and .trusted.volumes == true
 jq -e --arg a "$approval" "$want" >/dev/null <<<"$settings" ||
     fail "the settings did not stick: $(jq -c '{active, trusted, require_approval, approval_allowed_users, timeout,
         cancel_previous_pipeline_events}' <<<"$settings")"
+# Accounts that may push, merge or bypass on main are refused first, with the one instruction that
+# fixes them: delete the account from Woodpecker. By now the bot owns the repository, so that is
+# safe. They are refused before the admin check because an owner's account is usually also an
+# admin, and telling the owner to demote their own account (an organisation owner cannot even be
+# demoted) would be the wrong fix: the account must go from Woodpecker, whatever its role.
+if [ -n "$stale" ]; then
+    fail "Woodpecker still holds a token for$stale, which may push, merge or bypass on main. $repo_name \
+is owned by $me_login now, so deleting it is safe: for each login, curl -fsS -X DELETE -H @AUTH_FILE \
+$server/api/users/LOGIN (ops/ci/README.md, step 3a), and revoke its grant on GitHub, then run this again"
+fi
 # An admin can edit main's protection with the token Woodpecker stores. The repository can only be
 # turned on by an admin, so the run that turns it on may meet one: it warns and says what to do; every
 # other run refuses. A permission that cannot be read is a failure, never "not an admin".
@@ -234,11 +248,6 @@ repos/$repo_name/collaborators/LOGIN -f permission=write (ops/ci/README.md, step
     [ "$active" != true ] || fail "$msg"
     echo "ci-setup: WARNING $msg; this run turned the repository on, which needs an admin. Do it \
 now and run this script again: it refuses to finish while an admin is known here."
-fi
-if [ -n "$stale" ]; then
-    fail "Woodpecker still holds a token for$stale, which may push, merge or bypass on main. $repo_name \
-is owned by $me_login now, so deleting it is safe: for each login, curl -fsS -X DELETE -H @AUTH_FILE \
-$server/api/users/LOGIN (ops/ci/README.md, step 3a), and revoke its grant on GitHub, then run this again"
 fi
 has_secret=no
 api GET "/repos/$repo_id/secrets/github_token" >/dev/null 2>&1 && has_secret=yes

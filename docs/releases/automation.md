@@ -63,12 +63,18 @@ release PR merged to main (supervisor; version in build.zig.zon, notes in docs/r
        │    attach all of it to the draft
        ├─ mac         env release ┘ macos-15 (hosted)
        │    build arm64 and x86_64, lipo, sign, notarize, check, attach
-       │    zbx-<v>-macos-universal.zip, its .sha256, SHA256SUMS.macos and the formula to the draft
+       │    zbx-<v>-macos-universal.zip, its .sha256, SHA256SUMS.macos and the formula to the draft;
+       │    its job output is the zip's SHA-256, which no token can change afterwards
        ├─ prepare     env release-publish: the draft holds exactly the expected assets, each checked,
-       │              both sums files match, SHA256SUMS.asc is by a subkey of the pinned key;
+       │              both sums files match, SHA256SUMS.asc is by a subkey of the pinned key,
+       │              the zip is the one `mac` built (its output);
        │              the tap's formula differs only in url, version, sha256 (and the one-off lines)
        ├─ publish     the draft becomes the release; THIS creates the tag, at the release commit
-       ├─ tap         env release-publish: commit Formula/zigbox.rb to ZigboxOrg/homebrew-tap main
+       ├─ tap-approve env release, only when the release was already published (a re-dispatch):
+       │              the owner's approval, nothing else
+       ├─ tap         env release-publish: the published assets checked again (the zip against
+       │              `mac`'s output when `mac` ran), then commit Formula/zigbox.rb to
+       │              ZigboxOrg/homebrew-tap main
        ├─ site        repository_dispatch to ZigboxOrg/website, wait for the deploy
        └─ verify      macos-15 and macos-15-intel: the public zip (signature, Gatekeeper,
                       both architectures, zbx --version), then brew install, zbx --version, brew test
@@ -85,7 +91,9 @@ version, finishes a half-done release:
 - no draft: it is created; a draft exists: it is reused (its target must be the release commit,
   its notes are refreshed, its assets are replaced with `--clobber`);
 - the release is already public (`plan` sees it): `draft`, `linux`, `mac`, `prepare`, `publish`
-  are skipped, and the run goes on to `tap`, `site` and `verify`;
+  are skipped, and the run goes on to `tap-approve` (the owner approves the `release`
+  environment: `mac` did not run, so no build hash pins the published zip), `tap`, `site` and
+  `verify`;
 - the tag exists at another commit: `plan` refuses, before anything is written.
 
 By hand, the commit is found, not given: it is the commit of `main` that added
@@ -127,7 +135,11 @@ Apple silicon, whose kernel the VM requires.
 
 ### The tap
 
-`tap` takes the formula from the published release (not from an artifact), checks its hash
+`tap` takes the formula from the published release (not from an artifact), checks the published
+assets as `prepare` checked the draft (without the apt freshness window: it publishes no apt
+`Release`, and a re-run may come weeks after the last signing), checks the zip against the hash
+`mac` gave as its job output when `mac` ran in the same run (on an already published release the
+owner's approval of `tap-approve` stands in for it), checks the formula's hash
 against the zip's, fetches the tap's current `Formula/zigbox.rb` through the API, and refuses unless
 the difference is only `url`, `version` and `sha256` lines. The first universal release also
 changes the header comment (and the formula may still drop the `depends_on arch: :arm64` line
@@ -199,7 +211,8 @@ the environment; it is never printed and never on a command line.
 - The App can write the contents of two repositories, `homebrew-tap` and `website`, and
   read Actions on the site; it is not installed on `ZigboxOrg/zigbox`. Its key is a secret of
   `release-publish` alone (no reviewers, `main` only): `preflight`, `prepare`, `tap` and `site`
-  can read it. Tokens are minted per job for the repositories that job needs.
+  can read it. `tap-approve` is the one job that adds an approval in front of `tap` (for a
+  re-dispatch on a published release); it runs on `release`, holds no secret and runs nothing. Tokens are minted per job for the repositories that job needs.
 - `publish` and the draft use `GITHUB_TOKEN` with `contents: write` on `ZigboxOrg/zigbox`, in jobs that
   hold no signing secret. A tag made with `GITHUB_TOKEN` starts no workflow, and none is meant to.
 - Nothing prints a secret, and no secret is a command-line argument: secrets enter through `env:`
@@ -230,7 +243,7 @@ the environment; it is never printed and never on a command line.
 | 10 | `MAC_NOTARY_KEY_ID`, `MAC_NOTARY_ISSUER_ID` | variables | env `release` | owner | new |
 | 11 | GitHub-hosted runners `ubuntu-24.04`, `macos-15`, `macos-15-intel` | runners | GitHub | GitHub | exist |
 | 12 | Zig 0.17.0, `gh` 2.74.0 (SHA-256 pinned), `actions/*` (full SHA) | tools | `.github/actions/`, `release.yml` | implementer | changed |
-| 13 | `release.yml`: `plan`, `mac-check`, `preflight`, `draft`, `linux`, `mac`, `prepare`, `publish`, `tap`, `site`, `verify`, `test`, `mac-test`, `draft-test` | workflow | ZigboxOrg/zigbox | implementer | changed |
+| 13 | `release.yml`: `plan`, `mac-check`, `preflight`, `draft`, `linux`, `mac`, `prepare`, `publish`, `tap-approve`, `tap`, `site`, `verify`, `test`, `mac-test`, `draft-test` | workflow | ZigboxOrg/zigbox | implementer | changed |
 | 14 | `.github/actions/`: `setup-gh`, `find-draft`, `tap-formula`, `mac-check-zip` | actions | ZigboxOrg/zigbox | implementer | new |
 | 15 | `zig build mac-release` builds and joins both architectures; tests | code | ZigboxOrg/zigbox | implementer | changed |
 | 16 | `packaging.md`, this file, AGENTS.md line, STYLE.md (`lipo`), decision | docs | ZigboxOrg/zigbox | implementer, supervisor | changed |
