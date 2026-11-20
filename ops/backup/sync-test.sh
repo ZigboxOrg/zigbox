@@ -158,15 +158,28 @@ else
     echo "sync-test: flock is missing, the lock case was not run"
 fi
 
-# 10. The heartbeat: pinged on OK, and a failed ping is said but does not change the result.
+# 10. The heartbeat: an OK run pings the URL itself, a FAIL run pings URL/fail, and a failed ping is
+# said but does not change the result. A curl shim first on PATH records each URL the sync pings
+# (its config arrives on curl's stdin), then runs the real curl, so the test sees the ping itself.
 if command -v curl >/dev/null; then
+    real_curl=$(command -v curl)
+    mkdir -p "$work/bin"
+    cat > "$work/bin/curl" <<EOF
+#!/bin/sh
+cfg=\$(cat)
+printf '%s\n' "\$cfg" | sed -n 's/^url = "\(.*\)"\$/\1/p' >> "$work/hits"
+printf '%s\n' "\$cfg" | "$real_curl" "\$@"
+EOF
+    chmod +x "$work/bin/curl"
     : > "$work/ping"
     echo "file://$work/ping" > "$etc/heartbeat-url"
-    sync
+    PATH="$work/bin:$PATH" sync
     expect 0 "backup: OK"
     grep -q 'heartbeat' <<<"$out" && die "a good ping was reported failed"
-    ZIGBOX_BACKUP_GITHUB_URL=$work/nowhere sync # pings .../ping/fail, which does not exist
+    grep -qxF "file://$work/ping" "$work/hits" || die "an OK run did not ping the heartbeat URL"
+    PATH="$work/bin:$PATH" ZIGBOX_BACKUP_GITHUB_URL=$work/nowhere sync # pings .../ping/fail
     expect 1 "the heartbeat ping failed"
+    grep -qxF "file://$work/ping/fail" "$work/hits" || die "a FAIL run did not ping URL/fail"
     rm "$etc/heartbeat-url"
 else
     echo "sync-test: curl is missing, the heartbeat case was not run"

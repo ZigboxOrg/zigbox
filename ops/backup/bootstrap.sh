@@ -290,7 +290,7 @@ if ! fja user list --admin | awk 'NR > 1 {print $2}' | grep -qx "$BACKUP_ADMIN";
     [ -n "$pw" ] || fail "Forgejo created $BACKUP_ADMIN but its output has no password line to read"
     (umask 077; printf '%s\n' "$pw" > "$admin_pw"); chmod 0400 "$admin_pw"
 elif [ "${ZIGBOX_BACKUP_RESET_ADMIN:-}" = 1 ]; then
-    step "setting a new first-login password for $BACKUP_ADMIN"
+    step "setting a new password for $BACKUP_ADMIN"
     pw=$(head -c 18 /dev/urandom | base64)
     fja user change-password --username "$BACKUP_ADMIN" --password "$pw" \
         --must-change-password=false >/dev/null || fail "Forgejo refused the new password"
@@ -390,7 +390,7 @@ echo "$out"
 systemctl enable -q --now zigbox-backup-sync.timer
 if [ -s "$admin_pw" ]; then
     echo "Log in at https://$BACKUP_HOST as $BACKUP_ADMIN with the password in $admin_pw"
-    echo "(cat it as root); change it under Settings, Account, then delete the file."
+    echo "(cat it as root). The file is kept: the README's later steps read it."
 fi
 echo "backup-bootstrap: OK https://$BACKUP_HOST (Forgejo $forgejo_version, $BACKUP_REPOS, \
 every 5 minutes)"

@@ -53,10 +53,14 @@ hcloud context create zigbox-backup
 ```
 
 **1. The box and its DNS name,** one re-runnable block. It creates the VPS (a second run finds
-it), then the `A` record (a second run finds that too). The record must be unproxied (grey cloud),
-because Forgejo gets its certificate itself over ports 80 and 443:
+it), then the `A` record (a second run finds that too, and points it at the box's current address
+if it differs). The record must be unproxied (grey cloud), because Forgejo gets its certificate
+itself over ports 80 and 443. The block runs in a subshell with `set -e`, so the first failing
+command stops it and the last line is printed only on success:
 
 ```bash
+(
+set -euo pipefail
 name=git.zigbox.org
 cf=https://api.cloudflare.com/client/v4
 hcloud ssh-key describe zigbox-backup >/dev/null 2>&1 ||
@@ -66,13 +70,19 @@ hcloud server describe zigbox-backup >/dev/null 2>&1 ||
         --location fsn1 --ssh-key zigbox-backup
 ip=$(hcloud server ip zigbox-backup)
 zone=$(curl -fsS -H @$HOME/.zigbox-cloudflare-header "$cf/zones?name=${name#*.}" |
-    jq -r '.result[0].id')
-curl -fsS -H @$HOME/.zigbox-cloudflare-header "$cf/zones/$zone/dns_records?name=$name&type=A" |
-    jq -e '.result[0]' >/dev/null ||
+    jq -er '.result[0].id')
+body="{\"type\":\"A\",\"name\":\"$name\",\"content\":\"$ip\",\"proxied\":false}"
+rec=$(curl -fsS -H @$HOME/.zigbox-cloudflare-header "$cf/zones/$zone/dns_records?name=$name&type=A" |
+    jq -r '.result[0] // empty | "\(.id) \(.content)"')
+if [ -z "$rec" ]; then
     curl -fsS -X POST -H @$HOME/.zigbox-cloudflare-header -H 'Content-Type: application/json' \
-        --data "{\"type\":\"A\",\"name\":\"$name\",\"content\":\"$ip\",\"proxied\":false}" \
-        "$cf/zones/$zone/dns_records" | jq -e .success
+        --data "$body" "$cf/zones/$zone/dns_records" | jq -e .success >/dev/null
+elif [ "${rec#* }" != "$ip" ]; then
+    curl -fsS -X PATCH -H @$HOME/.zigbox-cloudflare-header -H 'Content-Type: application/json' \
+        --data "$body" "$cf/zones/$zone/dns_records/${rec%% *}" | jq -e .success >/dev/null
+fi
 echo "$name -> $ip"
+)
 ```
 
 (`cx22` is an x86 type; if `hcloud server create` says it is gone, take the smallest x86 type
@@ -104,20 +114,29 @@ the organisation `ZigboxOrg` and its two private repositories, and the timer, an
 copy. The last line must be `backup-bootstrap: OK https://git.zigbox.org (...)`; any failure ends
 in a `backup-bootstrap: FAIL <what>` line, with the failing step's own message above it.
 
-**4. A heartbeat, so a failing backup is noticed.** Create a check at a heartbeat service that
-alerts when pings stop and accepts `<url>/fail` for an explicit failure (healthchecks.io does;
-its project API key makes the check through its API, or use the browser), and give the box its
-ping URL. The URL is a secret, so it goes in a root-written file, read by the sync as its own user:
+**4. A heartbeat, so a failing backup is noticed.** Use healthchecks.io, which alerts when pings stop and
+accepts `<url>/fail` for an explicit failure. Its project API key is made in the browser (the one
+browser step here: no CLI mints a healthchecks.io key): sign in, open the project, Settings → API
+Access, create a read-write API key, and copy it. The block below stores the key in a 0600 header
+file on your laptop (the first run asks for it, a rerun does not), creates the check through the
+API (`unique` makes a rerun find the same check), and writes its ping URL onto the box. The URL never
+passes through the terminal or the clipboard, and the key is never on a command line:
 
 ```bash
-ssh -t root@$ip "read -r -s -p 'Heartbeat URL: ' u; echo
-  (umask 077; printf '%s' \"\$u\" > /etc/zigbox-backup/heartbeat-url)
-  chown zigbox-backup:zigbox-backup /etc/zigbox-backup/heartbeat-url"
+ip=$(hcloud server ip zigbox-backup)
+hdr=~/.zigbox-healthchecks-header
+[ -s "$hdr" ] || (umask 077; read -r -s -p 'healthchecks.io project API key: ' k; echo
+    printf 'X-Api-Key: %s\n' "$k" > "$hdr")
+curl -fsS -X POST -H @$hdr -H 'Content-Type: application/json' https://healthchecks.io/api/v3/checks/ \
+    --data '{"name":"zigbox-backup","timeout":600,"grace":600,"unique":["name"]}' |
+    jq -er .ping_url |
+    ssh root@$ip 'umask 077; cat > /etc/zigbox-backup/heartbeat-url &&
+        chown zigbox-backup:zigbox-backup /etc/zigbox-backup/heartbeat-url'
 ```
 
-Every good run pings the URL, and every failing run pings `<url>/fail`, so an expired GitHub token,
-a refused ref or a dead box all raise the alert. Set the check's period to 10 minutes and its
-grace to 10 more.
+The check's period is 10 minutes and its grace 10 more (the `timeout` and `grace` above). Every
+good run pings the URL, and every failing run pings `<url>/fail`, so an expired GitHub token,
+a refused ref or a dead box all raise the alert.
 
 **5. Check it.** Log in at <https://git.zigbox.org> as the admin, with the password from
 `ssh root@$ip cat /etc/zigbox-backup/admin-password`; both repositories must list `main` and the
