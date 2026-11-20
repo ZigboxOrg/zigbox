@@ -277,6 +277,8 @@ test {
     _ = @import("runtime/knobs_tests.zig");
     _ = @import("runtime/listen_tests.zig");
     _ = @import("runtime/hosts_file_tests.zig");
+    // The git backup's copy job (`ops/backup/sync.sh`).
+    _ = @import("backup_sync_tests.zig");
 }
 
 test {

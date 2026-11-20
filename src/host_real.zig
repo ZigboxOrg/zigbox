@@ -471,17 +471,46 @@ pub const HostReal = struct {
         return @intCast(result);
     }
 
-    fn start_keeper(context: *anyopaque, hold: host.Handle) host.Error!host.Pid {
+    /// Forks the keeper and reads its member's pid from a pipe the member writes it to (see
+    /// `Host.start_keeper`). The read cannot wait for long: the member writes as soon as it
+    /// runs, and a keeper process that fails first writes its step's errno and ends, and the
+    /// pipe's write end goes with it, which is the end of file here. The keeper is then killed
+    /// and reaped, and the start fails with the errno it wrote.
+    fn start_keeper(context: *anyopaque, hold: host.Handle) host.Error!host.Keeper {
         _ = from_context(context);
+        var report: [2]i32 = undefined;
+        try check(linux.pipe2(&report, .{ .CLOEXEC = true }));
         const parent: i32 = linux.getpid();
         const forked = linux.fork();
         // In the child (result 0) only raw system calls run, and it never returns into the
         // caller: `keeper_main` ends it.
-        if (forked == 0) keeper_main(parent, @intCast(hold));
-        try check(forked);
+        if (forked == 0) keeper_main(parent, @intCast(hold), report[1]);
+        _ = linux.close(report[1]);
+        check(forked) catch |err| {
+            const errno_fork = errno_last;
+            _ = linux.close(report[0]);
+            errno_last = errno_fork; // The close must not hide why the fork failed.
+            return err;
+        };
         assert(forked > 1);
         assert(forked <= std.math.maxInt(i32));
-        return @intCast(forked);
+        const said = keeper_report_read(report[0]);
+        _ = linux.close(report[0]);
+        const pid: host.Pid = @intCast(forked);
+        switch (said) {
+            .member => |member| return .{ .pid = pid, .member = member },
+            .failed => |errno| {
+                keeper_reap(pid);
+                errno_last = errno; // The keeper's own cause, such as EAGAIN from its clone.
+                return host.error_for_errno(errno);
+            },
+            .unknown => {
+                keeper_reap(pid);
+                // No step said why: a keeper process ended (or was killed) without a cause.
+                errno_last = @backingInt(linux.E.CHILD);
+                return error.IoFailed;
+            },
+        }
     }
 
     /// Opens the child's stdin and stderr here, where a failure can be reported, then forks;
@@ -1706,31 +1735,169 @@ pub const HostReal = struct {
     }
 };
 
-// ---- Container constants ----------------------------------------------------------------
+// ---- The scope's keeper -----------------------------------------------------------------
 
-/// The arguments of `clone3` up to and including `tls`: `CLONE_ARGS_SIZE_VER0`, 64 bytes. The
-/// later fields (`set_tid`, `cgroup`) are not used, and the kernel accepts the short size.
+/// What a keeper's pipe `report` said: one `i32`, either the member's pid or, from a keeper
+/// process that failed at a step, that step's errno negated (`keeper_fail`).
+const KeeperReport = union(enum) {
+    /// The member's pid: both keeper processes are running.
+    member: host.Pid,
+    /// The errno of the step a keeper process failed at; for a refused clone, EAGAIN.
+    failed: u16,
+    /// Nothing whole: the pipe ended first (a keeper process ended without saying why), a read
+    /// failed, or the value is out of range. The keeper may still be alive.
+    unknown,
+};
+
+/// Reads one report from the pipe `report` (see `KeeperReport`).
+fn keeper_report_read(report: i32) KeeperReport {
+    assert(report >= 0);
+    var bytes: [@sizeOf(i32)]u8 = undefined;
+    var at: usize = 0;
+    for (0..constants.keeper_reads_max) |_| {
+        if (at == bytes.len) break;
+        assert(at < bytes.len);
+        const result = linux.read(report, bytes[at..].ptr, bytes.len - at);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result == 0) return .unknown else {
+                at += result;
+            },
+            .INTR => {},
+            else => return .unknown,
+        }
+    }
+    if (at != bytes.len) return .unknown;
+    return keeper_report_decode(@bitCast(bytes));
+}
+
+/// The meaning of the `i32` a keeper process wrote: a pid above 1, or an errno from 1 to 4095
+/// negated; anything else is `unknown`.
+fn keeper_report_decode(value: i32) KeeperReport {
+    if (value > 1) return .{ .member = @intCast(value) };
+    if (value >= 0) return .unknown;
+    if (value < -errno_max) return .unknown;
+    assert(-value >= 1);
+    assert(-value <= errno_max);
+    return .{ .failed = @intCast(-value) };
+}
+
+/// The largest errno the kernel returns (`MAX_ERRNO`).
+const errno_max: i32 = 4095;
+
+/// Ends a keeper process that failed at the step whose raw result is `result`, after writing
+/// the step's errno, negated, to `report`: zbx then reports the real cause (a clone refused
+/// with EAGAIN is the user's process limit), not just that the keeper ended. The write is best
+/// effort; if it fails, zbx sees the pipe end with nothing in it.
+fn keeper_fail(report: i32, result: usize) noreturn {
+    assert(report >= 0);
+    const code = linux.errno(result);
+    assert(code != .SUCCESS);
+    const value: i32 = -@as(i32, @backingInt(code));
+    const bytes: [@sizeOf(i32)]u8 = @bitCast(value);
+    _ = linux.write(report, &bytes, bytes.len); // Four bytes to a pipe: all or nothing.
+    linux.exit_group(1);
+}
+
+/// Ends the keeper zbx forked, `pid`, and reaps it, after a start that failed. It is killed
+/// first because it may still be alive (a read of its pipe failed, or the value was out of
+/// range, while it ran): its member then goes with it by its death signal, so the wait is short
+/// whatever went wrong. Without the kill, a member blocked reading `hold`, whose write end the
+/// caller still holds, would keep the keeper suspended and this wait would never end.
+fn keeper_reap(pid: host.Pid) void {
+    assert(pid > 1);
+    assert(pid <= std.math.maxInt(i32));
+    _ = linux.kill(@intCast(pid), .KILL); // ESRCH is impossible: it is not reaped yet.
+    var status: i32 = 0;
+    for (0..constants.keeper_waits_max) |_| {
+        const result = linux.wait4(@intCast(pid), &status, 0, null);
+        if (linux.errno(result) != .INTR) return;
+    }
+}
+
+/// The keeper's member's stack. It runs in the keeper's memory (`CLONE_VM`), where this array is
+/// the keeper's own copy, while the keeper is suspended: nothing else uses it then.
+var keeper_member_stack: [constants.keeper_stack_bytes]u8 align(16) = undefined;
+
+/// What the keeper hands its member: its own pid, the pipe end to hold, and where to report.
+const KeeperMember = struct { keeper: i32, hold: i32, report: i32 };
+
 /// The keeper's whole life, in the forked child: raw system calls only, no allocation. It asks
 /// to be killed with its parent, checks the parent is still the one that forked it (it may have
 /// ended before the request took effect), leaves the terminal's process group so that a ^C meant
-/// for the container does not reach it, closes every descriptor but `hold`, and reads `hold`
-/// until the end of file. Any failure ends it, which at worst makes the scope empty early; that
-/// is the state before the keeper existed, and zbx copes with it.
-fn keeper_main(parent: i32, hold: i32) noreturn {
+/// for the container does not reach it, and closes every descriptor but `hold` and `report`.
+/// Then it makes its member with vfork semantics and is suspended until the member ends (see
+/// `Host.start_keeper` for why), reaps it, and ends the way it did. Any failure ends it, which
+/// at worst makes the scope empty early; that is the state before the keeper existed, and zbx
+/// copes with it.
+fn keeper_main(parent: i32, hold: i32, report: i32) noreturn {
     assert(parent > 1);
     assert(hold >= 0);
+    assert(report >= 0);
+    assert(report != hold);
     const kill: usize = @backingInt(linux.SIG.KILL);
-    if (linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), kill, 0, 0, 0) != 0) linux.exit_group(1);
-    if (linux.getppid() != parent) linux.exit_group(1);
+    const asked = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), kill, 0, 0, 0);
+    if (asked != 0) keeper_fail(report, asked);
+    if (linux.getppid() != parent) linux.exit_group(1); // zbx is gone: nobody reads `report`.
     _ = linux.setpgid(0, 0); // Best effort: the keeper still ends with its parent without it.
-    const flags: linux.CLOSE_RANGE = .{ .UNSHARE = false, .CLOEXEC = false };
-    if (hold > 0) {
-        if (linux.close_range(0, hold - 1, flags) != 0) linux.exit_group(1);
+    const closed = close_all_but(@min(hold, report), @max(hold, report));
+    if (closed != 0) keeper_fail(report, closed);
+    const member: KeeperMember = .{ .keeper = linux.getpid(), .hold = hold, .report = report };
+    // The member shares this memory and this descriptor table: its close of `report` is ours.
+    const flags: u32 = linux.CLONE.VM | linux.CLONE.VFORK | linux.CLONE.FILES |
+        @as(u32, @backingInt(linux.SIG.CHLD));
+    const stack_top = @intFromPtr(&keeper_member_stack) + keeper_member_stack.len;
+    const argument = @intFromPtr(&member);
+    const cloned = linux.clone(keeper_member_main, stack_top, flags, argument, null, 0, null);
+    // EAGAIN here is the user's process limit: the keeper takes two of its processes.
+    if (linux.errno(cloned) != .SUCCESS) keeper_fail(report, cloned);
+    var status: i32 = 0;
+    for (0..constants.keeper_waits_max) |_| {
+        const result = linux.wait4(@intCast(cloned), &status, 0, null);
+        switch (linux.errno(result)) {
+            .SUCCESS => linux.exit_group(if (status == 0) 0 else 1),
+            .INTR => {},
+            else => linux.exit_group(1),
+        }
     }
-    if (linux.close_range(hold + 1, -1, flags) != 0) linux.exit_group(1);
+    linux.exit_group(1);
+}
+
+/// Closes every descriptor but `low` and `high` (`low < high`). The raw result: 0, or that of
+/// the first `close_range` that failed.
+fn close_all_but(low: i32, high: i32) usize {
+    assert(low >= 0);
+    assert(low < high);
+    const flags: linux.CLOSE_RANGE = .{ .UNSHARE = false, .CLOEXEC = false };
+    if (low > 0) {
+        const below = linux.close_range(0, low - 1, flags);
+        if (below != 0) return below;
+    }
+    if (high > low + 1) {
+        const between = linux.close_range(low + 1, high - 1, flags);
+        if (between != 0) return between;
+    }
+    return linux.close_range(high + 1, -1, flags);
+}
+
+/// The keeper's member: the process in the scope. Raw system calls only, on its own small stack
+/// in the keeper's memory. It asks to be killed with the keeper, checks the keeper is still its
+/// parent, reports its pid on `report` and closes it, then reads `hold` until the end of file.
+fn keeper_member_main(argument: usize) callconv(.c) u8 {
+    assert(argument != 0);
+    const member: *const KeeperMember = @ptrFromInt(argument);
+    assert(member.keeper > 1);
+    const kill: usize = @backingInt(linux.SIG.KILL);
+    const asked = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), kill, 0, 0, 0);
+    if (asked != 0) keeper_fail(member.report, asked);
+    if (linux.getppid() != member.keeper) linux.exit_group(1); // The keeper was killed.
+    const pid: i32 = linux.getpid();
+    const bytes: [@sizeOf(i32)]u8 = @bitCast(pid);
+    // A pipe write of four bytes is atomic: it is all or nothing.
+    if (linux.write(member.report, &bytes, bytes.len) != bytes.len) linux.exit_group(1);
+    _ = linux.close(member.report);
     var byte: [1]u8 = undefined;
     for (0..constants.keeper_reads_max) |_| {
-        const result = linux.read(hold, &byte, byte.len);
+        const result = linux.read(member.hold, &byte, byte.len);
         switch (linux.errno(result)) {
             .SUCCESS => if (result == 0) linux.exit_group(0), // The writers are gone.
             .INTR => {},
@@ -1740,6 +1907,10 @@ fn keeper_main(parent: i32, hold: i32) noreturn {
     linux.exit_group(1);
 }
 
+// ---- Container constants ----------------------------------------------------------------
+
+/// The arguments of `clone3` up to and including `tls`: `CLONE_ARGS_SIZE_VER0`, 64 bytes. The
+/// later fields (`set_tid`, `cgroup`) are not used, and the kernel accepts the short size.
 const CloneArgs = extern struct {
     flags: u64,
     pidfd: u64,
@@ -3067,31 +3238,102 @@ test "real wait_event sees a child that ended before the signals were blocked" {
 test "real keeper holds one descriptor, lives until its pipe's writers are gone, and ends 0" {
     // Goal: Host.start_keeper on a real kernel. Method: open a second pipe first so there is
     // something to inherit, start the keeper on the first pipe's read end, and wait until it has
-    // closed everything else (it holds exactly one descriptor, the pipe). It is alive while the
-    // write end is open and, with that closed, ends with status 0 and is reaped. The death
-    // signal and the parent check are the kernel's; the VM demo kills a zbx and looks.
+    // closed everything else (the keeper and its member share one table, which holds exactly
+    // one descriptor, the pipe). Both are alive while the write end is open and, with that
+    // closed, the keeper ends with status 0 and is reaped. The death signal and the parent
+    // check are the kernel's; the VM demo kills a zbx and looks.
     var real: HostReal = .{};
     const subject = real.interface();
     const hold = try subject.pipe();
     const other = try subject.pipe();
-    const pid = try subject.start_keeper(hold.read);
+    const keeper = try subject.start_keeper(hold.read);
     subject.close(hold.read);
     subject.close(other.read);
     subject.close(other.write);
     var settled = false;
     for (0..400) |_| {
-        if (descriptor_count(pid) == 1) {
+        if (descriptor_count(keeper.pid) == 1 and descriptor_count(keeper.member) == 1) {
             settled = true;
             break;
         }
         subject.sleep_ms(5);
     }
     try std.testing.expect(settled);
-    try subject.signal(pid, 0); // Alive: it is blocked reading.
+    try subject.signal(keeper.pid, 0); // Alive: it is suspended until its member ends.
+    try subject.signal(keeper.member, 0); // Alive: it is blocked reading.
     subject.close(hold.write);
-    const status = try subject.wait_for(pid);
+    const status = try subject.wait_for(keeper.pid);
     try std.testing.expectEqual(host.ExitStatus{ .exited = 0 }, status);
     try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+test "real keeper: the process in the scope is never an OOM victim" {
+    // Goal: the regression for demo-m2 on PR 4 (run 44671710258): a 32 MiB run that the OOM
+    // killer ended was reported as a plain SIGKILL, because a second OOM kill took the keeper,
+    // the scope was empty, and the manager removed it with its counters. The kernel never
+    // picks a task in the middle of a vfork, and shows that in /proc/<pid>/oom_score as 0
+    // (`oom_badness` is LONG_MIN); any other task with the default adjustment reads at least
+    // 666. Method: start a keeper and read both of its processes' scores. Before the fix the
+    // keeper was one forked process, and its score was 666 or more.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    const hold = try subject.pipe();
+    const keeper = try subject.start_keeper(hold.read);
+    subject.close(hold.read);
+    var member_buffer: [32]u8 = undefined;
+    const member_score = try oom_score(subject, keeper.member, &member_buffer);
+    var keeper_buffer: [32]u8 = undefined;
+    const keeper_score = try oom_score(subject, keeper.pid, &keeper_buffer);
+    subject.close(hold.write);
+    _ = try subject.wait_for(keeper.pid);
+    var adjust_buffer: [32]u8 = undefined;
+    const adjust = try subject.read_file("/proc/self/oom_score_adj", &adjust_buffer);
+    try std.testing.expectEqualStrings("0", member_score);
+    // The keeper itself is a candidate like any process, which is why it stays out of the scope.
+    // It inherits this process's adjustment, and at -1000 (a runner started under
+    // `OOMScoreAdjust=-1000`) every score reads 0, so the comparison says nothing there.
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, adjust, "\n"), "-1000")) {
+        try std.testing.expect(!std.mem.eql(u8, keeper_score, "0"));
+    }
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
+}
+
+test "real keeper report: a pid, a failed step's errno, and everything else" {
+    // Goal: the keeper's report carries the cause of a failure in either keeper process (a
+    // clone refused with EAGAIN at the user's process limit) back to zbx, and nothing else
+    // passes for a pid or an errno. Method: the decoder at and past each boundary, then the
+    // reader on a real pipe holding what `keeper_fail` writes for EAGAIN, and on one that ends
+    // early. The clone itself cannot be refused here: root is exempt from RLIMIT_NPROC, and as
+    // another user the limit counts every process of that user, which a test cannot pin.
+    try std.testing.expectEqual(KeeperReport{ .member = 2 }, keeper_report_decode(2));
+    try std.testing.expectEqual(KeeperReport.unknown, keeper_report_decode(1));
+    try std.testing.expectEqual(KeeperReport.unknown, keeper_report_decode(0));
+    try std.testing.expectEqual(KeeperReport{ .failed = 1 }, keeper_report_decode(-1));
+    try std.testing.expectEqual(KeeperReport{ .failed = 4095 }, keeper_report_decode(-4095));
+    try std.testing.expectEqual(KeeperReport.unknown, keeper_report_decode(-4096));
+    try std.testing.expectEqual(KeeperReport.unknown, keeper_report_decode(std.math.minInt(i32)));
+    var ends: [2]i32 = undefined;
+    try HostReal.check(linux.pipe2(&ends, .{ .CLOEXEC = true }));
+    const value: i32 = -@as(i32, @backingInt(linux.E.AGAIN));
+    const bytes: [@sizeOf(i32)]u8 = @bitCast(value);
+    try std.testing.expectEqual(bytes.len, linux.write(ends[1], &bytes, bytes.len));
+    _ = linux.close(ends[1]);
+    const said = keeper_report_read(ends[0]);
+    try std.testing.expectEqual(KeeperReport{ .failed = @backingInt(linux.E.AGAIN) }, said);
+    try std.testing.expectEqual(error.WouldBlock, host.error_for_errno(said.failed));
+    try std.testing.expectEqual(KeeperReport.unknown, keeper_report_read(ends[0])); // Ended.
+    _ = linux.close(ends[0]);
+}
+
+/// `/proc/<pid>/oom_score`, without its newline.
+fn oom_score(subject: host.Host, pid: host.Pid, buffer: *[32]u8) host.Error![]const u8 {
+    assert(pid > 1);
+    var path: [40]u8 = undefined;
+    // Cannot fail: "/proc/4294967295/oom_score" is 26 bytes.
+    const text = std.fmt.bufPrint(&path, "/proc/{d}/oom_score", .{pid}) catch unreachable;
+    const read = try subject.read_file(text, buffer);
+    assert(read.len <= buffer.len);
+    return std.mem.trimEnd(u8, read, "\n");
 }
 
 /// The signal's number, as `interrupt_signal` returns it.

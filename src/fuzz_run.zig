@@ -284,7 +284,12 @@ const Scenario = struct {
     /// The scope's keeper cannot be forked (the run is refused), or ends the moment its scope is
     /// up (the manager may then remove the scope, and its counters, before they are read).
     keeper_fork_fails: bool,
+    /// When the keeper fails, it is its clone of its member that is refused, not zbx's fork.
+    keeper_fails_in_member: bool,
     keeper_dies: bool,
+    /// The OOM killer kills again in the cgroup before the reap (`World.oom_takes_keeper`). It
+    /// changes nothing the run reports: the keeper's member is never its victim.
+    oom_again: bool,
     removal: Removal,
     stop_fault: StopFault,
     inherited: Inherited,
@@ -451,7 +456,9 @@ fn random_cgroup(random: std.Random, scenario: *Scenario) void {
     scenario.oom = random.uintLessThan(u8, 6) == 0;
     scenario.pids_hit = random.uintLessThan(u8, 6) == 0;
     scenario.keeper_fork_fails = random.uintLessThan(u8, 10) == 0;
+    scenario.keeper_fails_in_member = random.boolean();
     scenario.keeper_dies = random.uintLessThan(u8, 5) == 0;
+    scenario.oom_again = random.boolean();
     scenario.knobs = if (random.boolean()) .none else random.enumValue(KnobsChoice);
     scenario.sysctl_refused = scenario.knobs.has_sysctl() and random.uintLessThan(u8, 4) == 0;
     scenario.cgroup_namespace_refused = scenario.bus == .fine and random.uintLessThan(u8, 8) == 0;
@@ -1258,7 +1265,14 @@ fn set_bus(sim: *HostSim, scenario: *const Scenario) void {
     sim.world.cgroup_stays = scenario.stop_effective() == .stays;
     sim.world.oom_kills = @intFromBool(scenario.oom);
     sim.world.keeper_dies_early = scenario.keeper_dies;
-    if (scenario.keeper_fork_fails) sim.world.keeper_fork_errno = 11;
+    sim.world.oom_takes_keeper = scenario.oom_again;
+    if (scenario.keeper_fork_fails) {
+        if (scenario.keeper_fails_in_member) {
+            sim.world.keeper_member_errno = 11;
+        } else {
+            sim.world.keeper_fork_errno = 11;
+        }
+    }
     sim.world.pids_max_hits = @intFromBool(scenario.pids_hit);
     switch (scenario.inherited) {
         .none, .stale => {},

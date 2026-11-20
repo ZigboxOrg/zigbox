@@ -39,6 +39,12 @@ const shell_allowlist = [_][]const u8{
     // The repository's settings in that Woodpecker, through its HTTP API with `curl` and `jq`, on
     // the same box and before any Zig is there either; ops/ci/README.md, step 4.
     "ops/ci/woodpecker-setup.sh",
+    // The git backup box (Forgejo on a small VPS): its one-time setup, and the timer's copy job,
+    // glue around `git fetch` and `git push`, with no Zig on that box; ops/backup/README.md.
+    "ops/backup/bootstrap.sh",
+    "ops/backup/sync.sh",
+    // Its test: runs the same file against local bare repositories (src/backup_sync_tests.zig).
+    "ops/backup/sync-test.sh",
     // The release workflow's signing glue around `gpg` and `rpm`, which no Zig code can replace
     // (docs/STYLE.md, "The Linux package release"); its test script runs the same file.
     ".github/release-sign.sh",

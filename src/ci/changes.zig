@@ -145,8 +145,9 @@ const rules = [_]Rule{
         "docs/releases/packaging.md",
         "src/testing/vm/*m8_packages*",
     }, .kind = .packages },
-    // Not part of any CI demo: the Mac build, the weekly top-20 run, the Z7 check, packaging,
-    // docs and the site.
+    // Not part of any CI demo: the scripts under ops/ (the owner's setup, the backup box; the
+    // step image, ops/ci/image/*, is matched by the rule above), the Mac build, the weekly top-20
+    // run, the Z7 check, packaging, docs and the site.
     .{ .patterns = &.{
         "src/mac/*",
         "src/macos_main.zig",
@@ -156,6 +157,7 @@ const rules = [_]Rule{
         "src/testing/vm/*z7*",
         "src/testing/vm/*s2_probe*",
         "src/testing/vm/*m2b_probe*",
+        "ops/*",
         "LICENSE",
         "docs/*",
         "site/*",

@@ -266,6 +266,50 @@ test "without the keeper the same removal loses the counters (the model can show
     try expect_clean(&sim, &before);
 }
 
+test "an OOM kill is reported when the OOM killer strikes again before the reap" {
+    // Goal: the regression for demo-m2 on PR 4 (run 44671710258): `--memory 32m` and a hog that
+    // the OOM killer ended were reported as a plain SIGKILL. The kernel's log showed why: a
+    // second process of the command was still charging, a second OOM kill in the cgroup took
+    // the keeper, the scope was empty, and the manager removed it with its counters before zbx
+    // read them. The model kills the scope's other process again (`oom_takes_keeper`) unless it
+    // is in a vfork, as the keeper's member is. Method: the run of the demo with that fault and
+    // a prompt removal: the reason is oom and the code 137, and nothing is left behind. With the
+    // keeper's own pid in the scope, as before the fix, the reason here was signal 9.
+    // What this cannot show: that the kernel spares the member. The model was told so
+    // (`World.oom_kill_again`), so that half is assumed here, not tested. What it does check is
+    // zbx's side: the pid it puts in the scope is the member's, not the keeper's it forked. The
+    // kernel's half rests on the real-kernel test "real keeper: the process in the scope is
+    // never an OOM victim" and on demo-m2 in the VM.
+    var sim: HostSim = undefined;
+    sim_run.init(&sim, 11);
+    const before = sim_run.baseline(&sim);
+    sim.world.bus.model.scope_removal = .promptly;
+    sim.world.oom_takes_keeper = true;
+    sim.world.oom_kills = 1;
+    sim.world.command_exit = .{ .signaled = 9 };
+    const args = [_][:0]const u8{
+        "zbx", "run", "--net", "none", "--rootfs", rootfs, "--name", "web-1", "--memory", "32m",
+        "--",  "sh",
+    };
+    try testing.expectEqual(@as(u8, 137), run(&sim, &args));
+    try testing.expectEqualStrings(
+        "zbx: killed: out of memory (limit 32 MiB)\n",
+        sim.stderr(),
+    );
+    try testing.expectEqual(@as(u32, 1), sim.world.keepers_started);
+    try testing.expectEqual(@as(u32, 0), sim.world.bus.scope_count());
+    try expect_clean(&sim, &before);
+    const parsed = try parsed_record(&sim);
+    try testing.expectEqual(records.EndReason.oom, parsed.reason);
+    // The scope held the keeper's member, not the keeper zbx forked and reaps.
+    const keeper_pid = sim.world.bus.last_scope.keeper_pid;
+    try testing.expect(keeper_pid != 0);
+    const keeper = sim.world.find_process(keeper_pid).?;
+    try testing.expect(keeper.keeper);
+    try testing.expectEqual(keeper.keeper_member, keeper_pid);
+    try testing.expect(keeper.pid != keeper_pid);
+}
+
 test "a keeper that cannot be forked is a coded start failure, and nothing is left behind" {
     // Goal: the keeper is a step of the plan like any other. A refused fork (EAGAIN, the user's
     // process limit) is ZBX-E0205 naming the step, exit 125, before any scope exists, with the
@@ -286,10 +330,37 @@ test "a keeper that cannot be forked is a coded start failure, and nothing is le
     try expect_clean(&sim, &before);
 }
 
+test "a keeper whose member cannot be cloned names the process limit, not a vanished child" {
+    // Goal: the keeper is two processes of the user's RLIMIT_NPROC, so zbx's fork can work and
+    // the keeper's clone of its member be refused with EAGAIN. That must read as the same
+    // coded start failure as a refused fork, with the real cause (the process limit), exit
+    // 125, no scope and nothing left behind; it once read "No child processes". Method: the
+    // fault `keeper_member_errno`, and the line compared with the refused fork's.
+    var fork_sim: HostSim = undefined;
+    sim_run.init(&fork_sim, 10);
+    fork_sim.world.keeper_fork_errno = 11;
+    const args = [_][:0]const u8{
+        "zbx", "-v", "run", "--rootfs", rootfs, "--name", "web-1", "--memory", "64m", "--", "sh",
+    };
+    try testing.expectEqual(@as(u8, 125), run(&fork_sim, &args));
+    var sim: HostSim = undefined;
+    sim_run.init(&sim, 10);
+    const before = sim_run.baseline(&sim);
+    sim.world.keeper_member_errno = 11;
+    try testing.expectEqual(@as(u8, 125), run(&sim, &args));
+    const text = sim.stderr();
+    try testing.expect(std.mem.startsWith(u8, text, "error[ZBX-E0205]: "));
+    try testing.expect(std.mem.indexOf(u8, text, "No child processes") == null);
+    try testing.expectEqualStrings(fork_sim.stderr(), text);
+    try testing.expectEqual(@as(u32, 0), sim.world.bus.scopes_started);
+    try expect_clean(&sim, &before);
+}
+
 test "the keeper is outside the container's namespaces and holds nothing but its pipe" {
     // Goal: the keeper does not appear inside the container. Method: run, then look at the
     // model's process table: the keeper was created without the container's user, pid and IPC
-    // namespaces, in the host's mount table and hostname, and it is the second pid of the scope.
+    // namespaces, in the host's mount table and hostname, and its member (not the keeper zbx
+    // forked) is the second pid of the scope.
     var sim: HostSim = undefined;
     sim_run.init(&sim, 11);
     const args = [_][:0]const u8{
@@ -306,8 +377,9 @@ test "the keeper is outside the container's namespaces and holds nothing but its
     try testing.expect(!keeper.new_ipc);
     try testing.expectEqual(@as(u8, 0), keeper.table);
     try testing.expectEqual(@as(u8, 0), keeper.uts);
-    try testing.expectEqual(keeper.pid, sim.world.bus.last_scope.keeper_pid);
-    try testing.expect(keeper.pid != sim.world.bus.last_scope.pid);
+    try testing.expectEqual(keeper.keeper_member, sim.world.bus.last_scope.keeper_pid);
+    try testing.expect(keeper.keeper_member != keeper.pid);
+    try testing.expect(keeper.keeper_member != sim.world.bus.last_scope.pid);
     try testing.expectEqual(host_mod.ExitStatus{ .exited = 0 }, keeper.exit.?);
 }
 
