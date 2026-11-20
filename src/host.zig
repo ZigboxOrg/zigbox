@@ -180,6 +180,14 @@ pub const ProbeOutcome = enum {
 /// A process id in the caller's PID namespace.
 pub const Pid = u32;
 
+/// The two processes of a scope's keeper (`Host.start_keeper`): `pid`, this process's child,
+/// which is the one to end and reap, and `member`, its vfork child, which is the one to put in
+/// the scope.
+pub const Keeper = struct {
+    pid: Pid,
+    member: Pid,
+};
+
 /// The two ends of a pipe. Both are close-on-exec, so a successful `exec` closes them: that EOF
 /// is how a parent learns that the child's command started.
 pub const Pipe = struct {
@@ -505,7 +513,7 @@ pub const VTable = struct {
         entry_context: *anyopaque,
     ) Error!Pid,
     /// Forks the scope's keeper (see `Host.start_keeper`).
-    start_keeper: *const fn (context: *anyopaque, hold: Handle) Error!Pid,
+    start_keeper: *const fn (context: *anyopaque, hold: Handle) Error!Keeper,
     /// Starts a program that outlives the call (see `Host.start_program`).
     start_program: *const fn (
         context: *anyopaque,
@@ -1021,11 +1029,23 @@ pub const Host = struct {
     ///
     /// The kernel sends the death signal when the *thread* that forked ends, not the process:
     /// the thread that starts a run must be the one that waits for it, as `run.zig` requires.
-    pub fn start_keeper(host: Host, hold: Handle) Error!Pid {
+    ///
+    /// The keeper is two processes, and only the second, `member`, goes in the scope. The
+    /// first (`pid`, the child to end and reap) makes `member` with `vfork` semantics
+    /// (`CLONE_VM | CLONE_VFORK`) and is suspended until it ends; `member` does the blocking
+    /// read. The kernel's OOM killer never picks a task in the middle of a vfork (`in_vfork` in
+    /// `oom_badness`), so when the container's memory runs out the keeper is never the victim.
+    /// A keeper that could be one was: right after the OOM killer killed the container's
+    /// biggest process, a second OOM kill (a writer still charging the pipe it fed) took the
+    /// keeper, the scope was empty, the manager removed it, and the OOM kill was reported as a
+    /// plain SIGKILL. `member` ends when `pid` does (its death signal), and with it.
+    pub fn start_keeper(host: Host, hold: Handle) Error!Keeper {
         assert(hold < std.math.maxInt(i32));
-        const pid = try host.vtable.start_keeper(host.context, hold);
-        assert(pid > 1);
-        return pid;
+        const keeper = try host.vtable.start_keeper(host.context, hold);
+        assert(keeper.pid > 1);
+        assert(keeper.member > 1);
+        assert(keeper.member != keeper.pid);
+        return keeper;
     }
 
     /// Starts `request` as a child of this process that goes on running: pasta. It has a session

@@ -479,6 +479,10 @@ pub const scope_keeper_tasks: u32 = 1;
 /// the pipe, so one read that waits for the end of file is the whole life of a keeper; the bound
 /// is for interrupted reads and for a pipe that someone writes to by mistake.
 pub const keeper_reads_max: u32 = 4096;
+/// The stack of the keeper's member (`Host.start_keeper`), the vfork child that runs in the
+/// keeper's memory: it makes a handful of system calls, so a small one is plenty, and an
+/// untouched static array costs zbx nothing.
+pub const keeper_stack_bytes: u32 = 64 * 1024;
 pub const scope_prefix = "zbx-";
 pub const scope_suffix = ".scope";
 pub const scope_name_bytes_max: u32 = 4 + container_name_bytes_max + 6;

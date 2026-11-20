@@ -115,8 +115,8 @@ pub const ScopeRequest = struct {
     /// "zbx: <container>".
     description: []const u8,
     pid: u32,
-    /// The scope's keeper (`Host.start_keeper`), put in `PIDs` after the container so that the
-    /// scope is never empty before zbx has read its counters.
+    /// The member of the scope's keeper (`Host.Keeper`), put in `PIDs` after the container so
+    /// that the scope is never empty before zbx has read its counters.
     keeper_pid: u32,
     /// The user manager's `app.slice`, or null for the manager's default.
     slice: ?[]const u8,
