@@ -38,6 +38,8 @@ const shell_allowlist = [_][]const u8{
     // glue around `git fetch` and `git push`, with no Zig on that box; ops/backup/README.md.
     "ops/backup/bootstrap.sh",
     "ops/backup/sync.sh",
+    // Its test, which runs the same file against local bare repositories (src/backup_sync_tests.zig).
+    "ops/backup/sync-test.sh",
     // The release workflow's signing glue around `gpg` and `rpm`, which no Zig code can replace
     // (docs/STYLE.md, "The Linux package release"); its test script runs the same file.
     ".github/release-sign.sh",

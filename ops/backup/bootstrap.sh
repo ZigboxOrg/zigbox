@@ -11,9 +11,11 @@
 # main) and runs the copy there; ZIGBOX_BACKUP_IN_CHECKOUT=1 runs the file where it is instead. It
 # asks for what it does not have yet: the DNS name, the Forgejo admin's name and e-mail, and a
 # read-only GitHub token (read without echo, never put on a command line). Safe to run again: it
-# asks only for what is missing and changes only what differs. The last line is
+# asks only for what is missing and changes only what differs. A heartbeat URL, if the owner puts
+# one in /etc/zigbox-backup/heartbeat-url (ops/backup/README.md, step 4), is kept readable by the
+# sync. Any failure ends in one line, and the last line is
 # `backup-bootstrap: OK ...` or `backup-bootstrap: FAIL <why>`.
-set -euo pipefail
+set -Eeuo pipefail
 
 # Forgejo's long-term-support line (supported until 2027-07-15), signed by Forgejo's release key
 # (https://forgejo.org/download/).
@@ -30,7 +32,10 @@ home=/var/lib/zigbox-backup
 fj_data=/var/lib/forgejo
 fj_etc=/etc/forgejo
 
-fail() { echo "backup-bootstrap: FAIL $*"; exit 1; }
+fail() { trap - ERR; echo "backup-bootstrap: FAIL $*"; exit 1; }
+# Every step no `fail` covers still ends in one FAIL line (a failed download, a wrong
+# ZIGBOX_BACKUP_REF, apt); the tool's own message is above it.
+trap '[ "$BASHPID" != "$$" ] || fail "step failed at line $LINENO: $BASH_COMMAND"' ERR
 cleanup=()
 trap 'rm -rf "${cleanup[@]}"' EXIT
 step() { echo "backup-bootstrap: $*"; }
@@ -270,17 +275,19 @@ fja() { # fja ARGS: forgejo admin ARGS, as the user git.
         admin "$@"
 }
 # The admin's first password is kept in admin-password (root only, 0400), and the last lines name
-# the file. Never --must-change-password: the backup's API token is the admin's, and Forgejo
-# answers 403 to every API call of a user who must change their password. ZIGBOX_BACKUP_RESET_ADMIN=1 on a rerun sets
-# a new one there (Forgejo's change-password takes it in argv: a moment, on a box with no users).
+# the file. The admin must never be made to change the password: the backup's API token is the
+# admin's, and Forgejo answers 403 to every API call of a user who must change it, so `user create`
+# says --must-change-password=false whatever is already in the database. ZIGBOX_BACKUP_RESET_ADMIN=1
+# on a rerun sets a new password there (Forgejo's change-password takes it in argv: a moment, on a
+# box with no users).
 admin_pw="$etc/admin-password"
 if ! fja user list --admin | awk 'NR > 1 {print $2}' | grep -qx "$BACKUP_ADMIN"; then
     step "creating the Forgejo admin $BACKUP_ADMIN"
     created=$(fja user create --username "$BACKUP_ADMIN" --email "$BACKUP_EMAIL" --admin \
-        --random-password 2>&1) ||
-        fail "Forgejo refused the admin: $(tail -1 <<<"$created")"
+        --random-password --must-change-password=false 2>&1) ||
+        fail "Forgejo refused the admin: $(tail -1 <<<"$created" | sed "s/'[^']*'/(masked)/g")"
     pw=$(sed -n "s/.*generated random password is '\(.*\)'.*/\1/p" <<<"$created")
-    [ -n "$pw" ] || fail "Forgejo created $BACKUP_ADMIN but printed no password: $created"
+    [ -n "$pw" ] || fail "Forgejo created $BACKUP_ADMIN but its output has no password line to read"
     (umask 077; printf '%s\n' "$pw" > "$admin_pw"); chmod 0400 "$admin_pw"
 elif [ "${ZIGBOX_BACKUP_RESET_ADMIN:-}" = 1 ]; then
     step "setting a new first-login password for $BACKUP_ADMIN"
@@ -295,12 +302,15 @@ fi
 install -d -m 0750 -o zigbox-backup -g zigbox-backup "$home" "$home/mirrors"
 if [ ! -s "$etc/forgejo-token" ]; then
     step "making the sync's Forgejo token"
-    (umask 077; fja user generate-access-token --username "$BACKUP_ADMIN" --raw \
+    token=$(fja user generate-access-token --username "$BACKUP_ADMIN" --raw \
         --token-name "zigbox-backup-sync-$(date -u +%s)" \
-        --scopes write:repository,write:organization > "$etc/forgejo-token")
+        --scopes write:repository,write:organization)
+    [ -n "$token" ] || fail "Forgejo made no access token for $BACKUP_ADMIN"
+    (umask 077; printf '%s' "$token" > "$etc/forgejo-token")
 fi
-chown zigbox-backup:zigbox-backup "$etc/github-token" "$etc/forgejo-token"
-chmod 0400 "$etc/github-token" "$etc/forgejo-token"
+for f in github-token forgejo-token heartbeat-url; do
+    [ ! -e "$etc/$f" ] || { chown zigbox-backup:zigbox-backup "$etc/$f"; chmod 0400 "$etc/$f"; }
+done
 
 api_header=$(mktemp)
 cleanup+=("$api_header")
@@ -330,7 +340,11 @@ done
 # --- The sync ------------------------------------------------------------------------------------
 install -d -m 0755 "$lib"
 install -m 0755 "$here/sync.sh" "$lib/sync.sh"
-cat > "$home/.gitconfig" <<EOF
+# Written through a temp file and `install`, which replaces a symlink the zigbox-backup user may
+# have put at .gitconfig instead of writing through it (root runs this, the user runs git).
+gitconfig=$(mktemp)
+cleanup+=("$gitconfig")
+cat > "$gitconfig" <<EOF
 [credential "https://github.com"]
 	username = x-access-token
 	helper = $lib/sync.sh credential $etc/github-token
@@ -338,7 +352,8 @@ cat > "$home/.gitconfig" <<EOF
 	username = $BACKUP_ADMIN
 	helper = $lib/sync.sh credential $etc/forgejo-token
 EOF
-chown zigbox-backup:zigbox-backup "$home/.gitconfig"
+rm -f "$home/.gitconfig"
+install -m 0644 -o zigbox-backup -g zigbox-backup "$gitconfig" "$home/.gitconfig"
 
 cat > /etc/systemd/system/zigbox-backup-sync.service <<EOF
 [Unit]
