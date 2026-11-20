@@ -878,25 +878,34 @@ const build_cases = [_]Case{
     .{ .code = .W0803, .args = &.{}, .direct = build_pin_warned, .warning = true, .exit = 0 },
 };
 
-/// The lazy start's codes (fuse/diagnose.zig). E1201's memory cause, E1202's catalog check and
-/// E1207 need a real server, which the simulated run does not build: their goldens are the
+/// The lazy start's codes (fuse/diagnose.zig). E1201 is a lazy run on a host where this user
+/// may not open `/dev/fuse`, refused before anything starts. E1202's catalog check and E1207
+/// need a real server, which the simulated run does not build: their goldens are the
 /// diagnostics as `fuse/diagnose.zig` builds them.
 const lazy_cases = [_]Case{
-    .{ .code = .E1201, .args = &.{}, .direct = lazy_out_of_memory, .exit = 1 },
+    .{
+        .code = .E1201,
+        .args = &.{ "run", "--lazy", "alpine", "--", "/bin/sh" },
+        .prepare = prepare_fuse_denied,
+        .exit = 125,
+    },
     .{ .code = .W1201, .args = &.{}, .direct = lazy_no_index, .warning = true, .exit = 0 },
     .{ .code = .E1202, .args = &.{}, .direct = lazy_index_disagrees, .exit = 1 },
     .{ .code = .W1202, .args = &.{}, .direct = lazy_lied, .warning = true, .exit = 0 },
     .{ .code = .E1203, .args = &.{}, .direct = lazy_unavailable, .exit = 1 },
     .{ .code = .E1206, .args = &.{}, .direct = lazy_store_full, .exit = 1 },
     .{ .code = .E1207, .args = &.{}, .direct = lazy_too_large, .exit = 1 },
-    // 0.5.2 refuses `--lazy` at parse time (E0004), so E1208 is built directly, as the parse
-    // would with `-Dlazy-start` (docs/decisions/2026-11-16-0.5.2-s2-dormant.md).
-    .{ .code = .E1208, .args = &.{}, .direct = lazy_flag_refused, .exit = 125 },
+    .{
+        .code = .E1208,
+        .args = &.{ "run", "--lazy", "--rootfs", "/srv/alpine", "--", "/bin/sh" },
+        .exit = 125,
+    },
 };
 
-fn lazy_out_of_memory(diag: *Diag) void {
-    const tree_digest = Digest.parse("b3:" ++ test_util.repeat('7', 64)).?;
-    lazy_diagnose.out_of_memory(diag, tree_digest);
+/// A container host where `/dev/fuse` is there and this user may not open it (EACCES).
+fn prepare_fuse_denied(sim: *HostSim) void {
+    sim_run.init(sim, 1);
+    sim.world.fuse_device_errno = 13;
 }
 
 fn lazy_index_disagrees(diag: *Diag) void {
@@ -915,16 +924,12 @@ fn lazy_lied(diag: *Diag) void {
 
 fn lazy_unavailable(diag: *Diag) void {
     const object = Digest.parse("b3:" ++ test_util.repeat('5', 64)).?;
-    lazy_diagnose.chunk_unavailable(diag, object, 3, "registry: timed out");
+    lazy_diagnose.chunk_unavailable(diag, object, 3, .deadline, "registry: timed out");
 }
 
 fn lazy_store_full(diag: *Diag) void {
     const object = Digest.parse("b3:" ++ test_util.repeat('5', 64)).?;
     lazy_diagnose.store_full(diag, object, 3);
-}
-
-fn lazy_flag_refused(diag: *Diag) void {
-    lazy_diagnose.flag_refused(diag, "--rootfs");
 }
 
 fn lazy_too_large(diag: *Diag) void {

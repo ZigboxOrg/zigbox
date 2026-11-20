@@ -81,14 +81,14 @@ const help_text =
     \\usage: zbx [options] <command>
     \\
     \\commands:
-    \\  run             run a command in a container whose root is a tree or a directory (see below)
+    \\  run             run a command in a container rooted at a tree or a directory (see below)
     \\  bundle          collect a redacted diagnostic bundle for a run (see below)
     \\  doctor          check that this host can run zbx (--output json: zbx schema doctor)
     \\  ps              list the containers (--all: the ones that ended too)
     \\  stop <name>     stop a container: SIGTERM, then SIGKILL after --grace
     \\  logs <name>     show what a container wrote to its output and error (see below)
     \\  exec <name>     run a command inside a running container (see below)
-    \\  commit <name>   turn what a stopped container changed into a new tree and print its digest
+    \\  commit <name>   turn a stopped container's changes into a tree and print its digest
     \\  store <cmd>     the content-addressed store: import, ls, du, rm, diff, export, verify,
     \\                  gc, restore
     \\  state <cmd>     volumes that outlive containers: ls, rm, export, restore (see below)
@@ -102,9 +102,9 @@ const help_text =
     \\  pull <ref>      pull an image from a registry into the store (see below)
     \\  push <source> <ref>   pack a build result, an image or a tree and put it in a registry
     \\                  (see below)
-    \\  build --graph   check the project's zbx.build.zon and print its steps in order (see below)
+    \\  build --graph   check zbx.build.zon and print its steps in order (see below)
     \\  import          write a zbx.build.zon from a Dockerfile, running nothing (see below)
-    \\  inspect <id>    print a build result: its tree and the config it runs with
+    \\  inspect <id>    print a build result: its tree and run config
     \\  schema <cmd>    print the JSON schema of a command's output
     \\  explain <code>  explain a diagnostic code offline, as E0001 (zbx schema explain)
     \\  help            show this text
@@ -141,6 +141,7 @@ const help_text =
     \\                  =<value> that value, without it zbx's own (an error if unset there).
     \\                  A value is never stored or printed, only its name
     \\  -d, --detach    start the container and return; zbx ps and zbx stop find it again
+    \\  --lazy          fetch files as read (needs FUSE)
     \\  --timeout <ms>  stop the container after this long (SIGTERM, then SIGKILL)
     \\  --grace <ms>    time between SIGTERM and SIGKILL (default 10000)
     \\  --state <name>:<path>[:ro]   the state volume <name> at <path> (repeatable, up to
@@ -203,7 +204,7 @@ const help_text =
     \\  zbx store export --oci <source> <dir>   write the image of a build result, an image
     \\                           or a tree as an OCI layout (dir must be new or empty);
     \\                           --output json prints zbx.export/1
-    \\  zbx store verify         rehash everything; name each damaged file and the paths it breaks
+    \\  zbx store verify         rehash everything; name each damaged file and what it breaks
     \\  zbx store gc             plan a collection of what no root reaches (changes nothing)
     \\  zbx store gc --confirm <hash>   do that plan: move it to the trash, kept 7 days
     \\  zbx store gc --trash     list the trash
@@ -221,7 +222,7 @@ const help_text =
     \\  volumes live in $XDG_DATA_HOME/zbx/state; only state rm removes one
     \\
     \\key:
-    \\  zbx key new <name>       make an Ed25519 signing key, its secret sealed under a passphrase
+    \\  zbx key new <name>       make an Ed25519 signing key, sealed under a passphrase
     \\                          ; asked twice on a terminal, or the first line of
     \\                           --passphrase-file <file>, which only you can read
     \\  zbx key new <name> --no-passphrase   keep the secret in the clear, mode 0600
@@ -3275,7 +3276,7 @@ fn unknown_option(diag: *Diag, argument: []const u8) ParseError {
     return error.UnknownOption;
 }
 
-/// `--lazy`: a run flag in a build with lazy start, refused in one without it (0.5.2).
+/// `--lazy`: a run flag, opt-in (docs/briefs/S2-lazy-start.md, decision 6).
 fn take_lazy(
     diag: *Diag,
     run_args: *RunArgs,
@@ -3283,23 +3284,7 @@ fn take_lazy(
     argument: []const u8,
 ) ParseError!void {
     assert(classify(argument) == .lazy);
-    if (!build_options.lazy_start) return lazy_not_yet(diag, argument);
     try take_run_flag(diag, run_args, operands, argument);
-}
-
-/// `--lazy` in a build without lazy start (`-Dlazy-start`, off in a release): 0.5.2 ships S2's
-/// code dormant (docs/decisions/2026-11-16-0.5.2-s2-dormant.md), so the flag is refused as an
-/// option this zbx does not take yet. 0.6.0 removes this refusal.
-fn lazy_not_yet(diag: *Diag, argument: []const u8) ParseError {
-    assert(diag.code == null);
-    assert(std.mem.eql(u8, argument, "--lazy"));
-    diag.raise(.E0004);
-    diag.while_("reading the command line", .{});
-    diag.cause("lazy start arrives in 0.6.0", .{});
-    diag.context("arg", "{s}", .{argument});
-    diag.fix(.{ .sentence = "leave out --lazy" });
-    assert(diag.code.? == .E0004);
-    return error.UnknownOption;
 }
 
 fn check_output_value(diag: *Diag, value: []const u8) ParseError!void {
@@ -4088,7 +4073,7 @@ fn run_container(
     // A `--mount` outside the project is refused before an image is pulled for the run.
     const spec_mounts = try resolve_writable(host, &given, storage, diag);
     // Before the image is looked for: a lazy start from a registry fetches its index.
-    if (given.lazy) try check_lazy(&given, invocation, diag);
+    if (given.lazy) try check_lazy(host, &given, invocation, diag);
     // A lazy start from a registry holds its token for the run: wiped on every way out of it.
     defer if (given.lazy) lazy_start.wipe(&storage.pull, lazy_workspace);
     var prepared: run_image.Prepared = .{
@@ -4131,8 +4116,10 @@ fn run_container(
         .binding = binding_of(subject.binding),
     };
     const ran = ran_of(invocation, &prepared);
-    if (given.detach) return run_detached(host, invocation, &container, times, storage, &ran, diag);
     const lazy: Lazy = if (!given.lazy) .none else if (prepared.remote) .remote else .local;
+    if (given.detach) {
+        return run_detached(host, invocation, &container, times, storage, &ran, lazy, diag);
+    }
     return run_foreground(host, invocation, &container, times, storage, &ran, lazy, diag);
 }
 
@@ -4275,7 +4262,7 @@ fn run_foreground(
     };
     const handle = &storage.handle;
     if (container.listen != null) try check_listen_send(host, invocation, diag);
-    if (lazy == .remote) try attach_remote(host, invocation, storage, diag);
+    if (lazy == .remote) try attach_remote(host, invocation, storage, null, diag);
     // The serving threads end with the container's mount namespace: joined after the run.
     defer if (lazy != .none) lazy_finish(storage);
     runtime.start(host, container, options, handle, diag) catch {
@@ -4311,10 +4298,14 @@ fn lazy_of(refusing: *RefusingLazy) runtime.Lazy {
 fn lazy_finish(storage: *Storage) void {
     if (comptime builtin.os.tag != .linux) return; // As in `lazy_of`: no real server there.
     const server = lazy_server orelse return;
-    if (server.report()) |report| {
-        storage.lazy_remote.lines.summary(&report, server.source_names());
-    }
     const remote = server.remote != null;
+    // A detached run's summary went to its log before the log closed (`LazyRemote.ended`).
+    const summarized = remote and storage.lazy_remote.summarized;
+    if (server.report()) |report| {
+        if (!summarized) storage.lazy_remote.lines.summary(&report, server.source_names());
+    }
+    // A fill that ended after the last tick (or a run shorter than one).
+    server.whole_check();
     server.finish();
     if (remote) lazy_start.finish(&storage.pull, lazy_workspace);
     assert(server.fd == -1);
@@ -4330,10 +4321,11 @@ pub var lazy_workspace: ?*lazy_start.Workspace = null;
 /// Null, or a path it cannot read, counts the store's disk as never full.
 pub var free_bytes: ?*const fn (path: [:0]const u8) ?u64 = null;
 
-/// `Services.lazy` of a run: only `run --lazy` in the foreground with the real server fetches.
+/// `Services.lazy` of a run: only `run --lazy` with the real server fetches, in the foreground or
+/// detached (the supervisor serves it after the fork).
 fn lazy_workspace_of(invocation: *const Invocation) ?*lazy_start.Workspace {
     if (invocation.command != .run) return null;
-    if (!invocation.run.lazy or invocation.run.detach) return null;
+    if (!invocation.run.lazy) return null;
     if (lazy_server == null) return null;
     return lazy_workspace;
 }
@@ -4349,6 +4341,16 @@ const LazyRemote = struct {
     root: [@sizeOf(@FieldType(layout.Store, "root"))]u8,
     root_len: u32,
     index_fetched: u64,
+    host: Host,
+    /// The image the run fetches, for `whole`; `image` is its record's scratch.
+    manifest: Sha256,
+    image: @import("store/images.zig").Image,
+    /// A detached run (`attach_remote` given a `FrameSink`): the lines go to the run's log,
+    /// and, until the start is reported, to the caller as warnings as well.
+    handle: ?*runtime.Handle,
+    frames: ?*FrameSink,
+    /// The summary went to the log at the container's end (`ended`).
+    summarized: bool,
 
     fn free(context: *anyopaque) u64 {
         const remote: *const LazyRemote = @ptrCast(@alignCast(context));
@@ -4362,6 +4364,33 @@ const LazyRemote = struct {
         const remote: *const LazyRemote = @ptrCast(@alignCast(context));
         remote.lines.progress(remote.index_fetched, report);
     }
+
+    /// Every object is local: the image's record is rewritten whole.
+    fn whole(context: *anyopaque) void {
+        const remote: *LazyRemote = @ptrCast(@alignCast(context));
+        assert(remote.root_len > 0);
+        var store: layout.Store = undefined;
+        store.at(remote.host, remote.root[0..remote.root_len]);
+        lazy_start.record_whole(&store, remote.manifest, &remote.image);
+    }
+
+    /// A detached run's line: into its log, and to the caller while it waits for the start.
+    fn sink(context: *anyopaque, text: []const u8) void {
+        const remote: *LazyRemote = @ptrCast(@alignCast(context));
+        assert(text.len > 0);
+        runtime.log_line(remote.handle.?, text);
+        remote.frames.?.warning(text[0..@min(text.len, constants.output_bytes_max - 1)]);
+    }
+
+    /// A detached run's container has ended: the summary goes to its log before it closes.
+    fn ended(context: *anyopaque) void {
+        const remote: *LazyRemote = @ptrCast(@alignCast(context));
+        assert(remote.handle != null);
+        const server = lazy_server.?;
+        const report = server.report() orelse return;
+        remote.lines.summary(&report, server.source_names());
+        remote.summarized = true;
+    }
 };
 
 /// Gives the server the verified index of an image the store lacks and its registry, before
@@ -4370,10 +4399,12 @@ fn attach_remote(
     host: Host,
     invocation: *const Invocation,
     storage: *Storage,
+    frames: ?*FrameSink,
     diag: *Diag,
 ) RunError!void {
     assert(diag.code == null);
     assert(invocation.run.lazy);
+    assert((frames != null) == invocation.run.detach);
     const server = lazy_server.?; // `lazy_workspace_of` gave a workspace only with a server.
     const ws = lazy_workspace.?;
     const remote = &storage.lazy_remote;
@@ -4387,16 +4418,28 @@ fn attach_remote(
     @memcpy(remote.root[0 .. store.root_len + 1], store.root[0 .. store.root_len + 1]);
     remote.root_len = store.root_len;
     remote.index_fetched = ws.index_fetched;
+    remote.host = host;
+    remote.manifest = storage.pull.library.resolved.manifest_digest;
     const mode = invocation.options.mode();
     remote.lines = .init(host, mode, mode != .json and host.color_enabled(.stderr));
+    remote.handle = if (frames != null) &storage.handle else null;
+    remote.frames = frames;
+    remote.summarized = false;
+    if (frames != null) remote.lines.sink = .{ .context = remote, .call = LazyRemote.sink };
     const reference = &storage.pull.library.reference;
     ws.range.init(&ws.client, reference, ws.layer, server.threaded.io());
+    const ended: ?lazy_server_mod.Call = if (frames == null) null else .{
+        .context = remote,
+        .call = LazyRemote.ended,
+    };
     server.attach(.{
         .index = ws.index,
         .registry = ws.range.source(),
         .log = remote.lines.log(),
         .free = .{ .context = remote, .query = LazyRemote.free },
         .started = .{ .context = remote, .call = LazyRemote.started },
+        .whole = .{ .context = remote, .call = LazyRemote.whole },
+        .ended = ended,
     });
 }
 
@@ -4426,15 +4469,26 @@ const RefusingLazy = struct {
     }
 };
 
-/// `--lazy` in slice 4 runs an image from the store in the foreground: its server lives in this
-/// process, so `-d` (which leaves it) and `--rootfs` (no tree) are refused.
-fn check_lazy(given: *const RunArgs, invocation: *const Invocation, diag: *Diag) RunError!void {
+/// `--lazy`'s refusals, before anything of the run starts (no index fetched, no process made):
+/// a run of a directory (E1208), and a host where this user cannot open `/dev/fuse` (E1201).
+/// The kernel's refusal of the mount itself shows only in the setup child, also as E1201.
+fn check_lazy(
+    host: Host,
+    given: *const RunArgs,
+    invocation: *const Invocation,
+    diag: *Diag,
+) RunError!void {
     assert(given.lazy);
     assert(diag.code == null);
-    if (!given.detach and invocation.operand != null) return;
-    const flag: []const u8 = if (given.detach) "-d" else "--rootfs";
-    lazy_diagnose.flag_refused(diag, flag);
-    return error.StartFailed;
+    if (invocation.operand == null) {
+        lazy_diagnose.flag_refused(diag, "--rootfs");
+        return error.StartFailed;
+    }
+    host.open_fuse_device() catch |err| {
+        lazy_diagnose.device_refused(diag, err, host.last_errno());
+        return error.StartFailed;
+    };
+    assert(diag.code == null);
 }
 
 /// `--listen-send` names an open Unix stream socket of this process, before anything starts
@@ -4672,15 +4726,35 @@ const FrameSink = struct {
     host: Host,
     fd: host_mod.Handle,
     options: Options,
+    /// One frame at a time: a lazy run's resolver threads send lines while the start warns.
+    lock: std.atomic.Mutex = .unlocked,
+    /// The start has been reported: nothing more is sent (`LazyRemote.sink`).
+    ended: bool = false,
+
+    /// Sends one warning frame, whole, unless the start has been reported.
+    fn warning(sink: *FrameSink, text: []const u8) void {
+        assert(text.len < constants.output_bytes_max);
+        while (!sink.lock.tryLock()) std.Thread.yield() catch {};
+        defer sink.lock.unlock();
+        if (sink.ended) return;
+        write_frame(sink.host, sink.fd, frame_warning, null, text) catch return;
+    }
+
+    /// The start is reported next: later lines of a lazy run go to its log alone.
+    fn end(sink: *FrameSink) void {
+        while (!sink.lock.tryLock()) std.Thread.yield() catch {};
+        defer sink.lock.unlock();
+        sink.ended = true;
+    }
 };
 
 fn frame_warning_call(context: *anyopaque, diag: *const Diag) void {
-    const sink: *const FrameSink = @ptrCast(@alignCast(context));
+    const sink: *FrameSink = @ptrCast(@alignCast(context));
     assert(diag.code != null);
     assert(sink.options.runs_container);
     var buffer: [constants.output_bytes_max]u8 = undefined;
     const text = render.render(diag, sink.options.mode(), false, &buffer);
-    write_frame(sink.host, sink.fd, frame_warning, null, text) catch return;
+    sink.warning(text);
 }
 
 fn run_detached(
@@ -4690,11 +4764,13 @@ fn run_detached(
     times: Times,
     storage: *Storage,
     ran: *const Ran,
+    lazy: Lazy,
     diag: *Diag,
 ) RunError!u8 {
     assert(diag.code == null);
     assert(container.command.len > 0);
     assert(invocation.run.detach);
+    assert(invocation.run.lazy == (lazy != .none));
     assert(times.grace_ms <= constants.wait_timeout_ms_max);
     const pipe = host.pipe() catch |err| return supervisor_failed(host, diag, err);
     // A write to a caller that has gone is an error to ignore, not a signal that kills us.
@@ -4712,7 +4788,7 @@ fn run_detached(
         },
         .supervisor => {
             host.close(pipe.read);
-            const code = supervise(host, invocation, container, times, storage, pipe.write);
+            const code = supervise(host, invocation, container, times, storage, lazy, pipe.write);
             // exit_now closes the pipe: `supervise` may already have, and that number may be
             // another file by now.
             host.exit_now(code);
@@ -4733,16 +4809,19 @@ fn supervisor_failed(host: Host, diag: *Diag, err: host_mod.Error) RunError {
 
 /// The supervisor: starts the container, says how it went, waits for it. The caller of
 /// `run -d` is waiting on `fd` for the first frame that is not a warning. Never writes to
-/// the terminal (its streams are on /dev/null).
+/// the terminal (its streams are on /dev/null). A lazy run's server, its threads and its
+/// registry client's I/O start here, after the fork, and end before the supervisor does.
 fn supervise(
     host: Host,
     invocation: *const Invocation,
     container: *const runtime_spec.Spec,
     times: Times,
     storage: *Storage,
+    lazy: Lazy,
     fd: host_mod.Handle,
 ) u8 {
     var sink: FrameSink = .{ .host = host, .fd = fd, .options = invocation.options };
+    var refusing: RefusingLazy = .{ .host = host };
     assert(times.grace_ms <= constants.wait_timeout_ms_max);
     assert(container.command.len > 0);
     const options: runtime.StartOptions = .{
@@ -4752,20 +4831,21 @@ fn supervise(
         .detached = true,
         .image_workspace = &storage.image,
         .tree_check = tree_check_of(storage),
+        .lazy = if (lazy != .none) lazy_of(&refusing) else null,
     };
     var diag: Diag = undefined;
     diag.reset();
     const handle = &storage.handle;
+    if (lazy == .remote) {
+        attach_remote(host, invocation, storage, &sink, &diag) catch {
+            return supervise_failed(host, invocation, fd, &diag);
+        };
+    }
+    // The serving threads end with the container's mount namespace: joined after the run, and
+    // the registry token wiped, before `exit_now` (which runs no caller's `defer`).
+    defer if (lazy != .none) lazy_finish(storage);
     runtime.start(host, container, options, handle, &diag) catch {
-        if (diag.code == null) {
-            diag.raise(.B0001);
-            diag.cause("a failure reached the supervisor with no diagnostic", .{});
-        }
-        var buffer: [constants.output_bytes_max]u8 = undefined;
-        const text = render.render(&diag, invocation.options.mode(), false, &buffer);
-        const code = diag.exit_code_in(.container_run);
-        write_frame(host, fd, frame_failed, code, text) catch return code;
-        return code;
+        return supervise_failed(host, invocation, fd, &diag);
     };
     const started_bytes_max = constants.container_name_bytes_max +
         constants.scope_name_bytes_max + 24 + constants.store_digest_text_bytes + 1;
@@ -4779,10 +4859,30 @@ fn supervise(
         scope,
         tree,
     }) catch unreachable; // A name, a pid, a scope name and a tree fit the buffer.
+    sink.end();
     write_frame(host, fd, frame_started, null, made) catch {};
     host.close(fd); // The caller can go; the container's end is ours to see to.
     _ = runtime.wait(handle);
     return constants.exit_ok;
+}
+
+/// The supervisor's start failed: the diagnostic goes to the caller as the failed frame.
+fn supervise_failed(
+    host: Host,
+    invocation: *const Invocation,
+    fd: host_mod.Handle,
+    diag: *Diag,
+) u8 {
+    if (diag.code == null) {
+        diag.raise(.B0001);
+        diag.cause("a failure reached the supervisor with no diagnostic", .{});
+    }
+    assert(diag.code != null);
+    var buffer: [constants.output_bytes_max]u8 = undefined;
+    const text = render.render(diag, invocation.options.mode(), false, &buffer);
+    const code = diag.exit_code_in(.container_run);
+    write_frame(host, fd, frame_failed, code, text) catch return code;
+    return code;
 }
 
 /// Reads exactly `into.len` bytes; false at the end of the pipe.
@@ -5525,28 +5625,13 @@ test "parse: every usage error has its code, at the exact boundary" {
     }
 }
 
-test "--lazy is refused at parse time with E0004 in a build without lazy start (0.5.2)" {
-    // Goal: 0.5.2 ships S2 dormant, so `run --lazy` is refused before anything runs, with one
-    // line saying lazy start arrives in 0.6.0. Method: parse it, then run it and read stderr.
-    if (build_options.lazy_start) return error.SkipZigTest;
-    var invocation: Invocation = undefined;
-    const args = [_][]const u8{ "run", "--lazy", "alpine", "--", "/bin/sh" };
-    try testing.expectEqual(@as(?codes.Code, .E0004), try parse_case(&args, &invocation));
-    var sim: HostSim = undefined;
-    const argv = [_][:0]const u8{ "zbx", "run", "--lazy", "alpine", "--", "/bin/sh" };
-    try testing.expectEqual(@as(u8, 125), try run_case(&sim, &argv));
-    try testing.expect(std.mem.indexOf(u8, sim.stderr(), "lazy start arrives in 0.6.0") != null);
-    try testing.expect(std.mem.indexOf(u8, sim.stderr(), "leave out --lazy") != null);
-    try testing.expectEqual(@as(usize, 0), sim.stdout().len);
-}
-
 test "a lazy run wipes the registry token on an early exit as well as at its end" {
     // Goal: the supervisor's ruling for S2 slice 5b: no exit from a lazy run, the ones between
     // the start and the run's own teardown included, leaves a registry token in memory. Method:
     // a token-shaped marker in the run's client workspace, then a lazy run of a pulled image
     // that a bad `--memory` ends after the image is prepared; the marker is gone. A plain run
     // ended the same way keeps it, so the check is not vacuous. The run is parsed without
-    // `--lazy` and then marked lazy, so its code runs past the parse-time gate in every build.
+    // `--lazy` and then marked lazy, so one command line serves both runs.
     const pull_tests = @import("pull_tests.zig");
     const reference = @import("registry/test_registry.zig").TestRegistry.reference(.open);
     var world: pull_tests.World = undefined;
@@ -5572,6 +5657,89 @@ test "a lazy run wipes the registry token on an early exit as well as at its end
         try testing.expect(std.mem.indexOf(u8, world.sim.stderr(), "--memory") != null);
         const kept = std.mem.eql(u8, client.token[0..marker.len], marker);
         try testing.expectEqual(!lazy, kept);
+    }
+}
+
+test "run -d --lazy is taken; only --rootfs is refused with E1208" {
+    // Goal: S2 slice 6: a detached lazy run is no longer refused. Method: `check_lazy` passes
+    // `-d` with an image and refuses `--rootfs`. The supervisor's serving needs the real FUSE
+    // server: the VM demo runs it.
+    var sim: HostSim = undefined;
+    sim.init(1, &.{});
+    var diag: Diag = undefined;
+    const lines = [_][]const []const u8{
+        &.{ "run", "-d", "--lazy", "alpine", "--", "/bin/sh" },
+        &.{ "run", "-d", "--lazy", "--rootfs", "/srv/alpine", "--", "/bin/sh" },
+    };
+    for (lines, [_]bool{ true, false }) |line, image| {
+        diag.reset();
+        var invocation: Invocation = undefined;
+        try parse(line, &invocation, &diag);
+        const checked = check_lazy(sim.interface(), &invocation.run, &invocation, &diag);
+        if (image) try checked else try testing.expectError(error.StartFailed, checked);
+        try testing.expectEqual(@as(?codes.Code, if (image) null else .E1208), diag.code);
+    }
+}
+
+test "run --lazy where /dev/fuse does not open is refused with E1201 naming why" {
+    // Goal: the S2 demo's step 8: `--lazy` on a host where this user cannot open `/dev/fuse` is
+    // E1201 before anything starts, its cause saying whether the device is missing or denied.
+    // Method: the model's device fails with each errno; `check_lazy` raises E1201 with the cause
+    // for it, and opens nothing. A device that opens passes, so the check is not vacuous.
+    var sim: HostSim = undefined;
+    const Case = struct { errno: u16, cause: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .errno = 0, .cause = null },
+        .{ .errno = 13, .cause = "/dev/fuse is not openable: this user may not open it" },
+        .{ .errno = 1, .cause = "/dev/fuse is not openable: this user may not open it" },
+        .{ .errno = 2, .cause = "/dev/fuse is missing: the fuse module is not loaded" },
+        .{ .errno = 19, .cause = "/dev/fuse is missing: the fuse module is not loaded" },
+        .{ .errno = 12, .cause = "/dev/fuse could not be opened" },
+    };
+    for (cases) |case| {
+        sim.init(2, &.{});
+        sim.world.fuse_device_errno = case.errno;
+        var diag: Diag = undefined;
+        diag.reset();
+        var invocation: Invocation = undefined;
+        try parse(&.{ "run", "--lazy", "alpine", "--", "/bin/sh" }, &invocation, &diag);
+        const checked = check_lazy(sim.interface(), &invocation.run, &invocation, &diag);
+        try testing.expectEqual(@as(u32, 0), sim.open_count());
+        const cause = case.cause orelse {
+            try checked;
+            try testing.expectEqual(@as(?codes.Code, null), diag.code);
+            continue;
+        };
+        try testing.expectError(error.StartFailed, checked);
+        try testing.expectEqual(@as(?codes.Code, .E1201), diag.code);
+        try testing.expectEqualStrings(cause, diag.last_cause().?);
+        try testing.expectEqual(@as(u32, 2), diag.causes.count);
+    }
+}
+
+test "a lazy run where /dev/fuse is denied starts nothing and exits with E1201" {
+    // Goal: the refusal is whole-run: a lazy run of a pulled image on a host whose `/dev/fuse`
+    // this user may not open ends with one E1201 line and no process made. Method: the pulled
+    // image of the token test, the model's device denied (EACCES); the run fails, stderr names
+    // the cause and the code, and no process slot changed state.
+    const pull_tests = @import("pull_tests.zig");
+    const reference = @import("registry/test_registry.zig").TestRegistry.reference(.open);
+    var world: pull_tests.World = undefined;
+    pull_tests.project_world(&world, 43, "web-1");
+    const pulled = pull_tests.run_text(&world, &.{ "zbx", "pull", reference });
+    try testing.expectEqual(@as(u8, 0), pulled);
+    // The pull may have used process slots; the run must change none of them.
+    var states: [constants.sim_processes_max]@TypeOf(world.sim.world.processes[0].state) =
+        undefined;
+    for (&states, &world.sim.world.processes) |*state, *process| state.* = process.state;
+    world.sim.world.fuse_device_errno = 13;
+    const ran = pull_tests.run_text(&world, &.{ "zbx", "run", "--lazy", reference, "--", "sh" });
+    try testing.expectEqual(@as(u8, 125), ran);
+    const stderr = world.sim.stderr();
+    try testing.expect(std.mem.indexOf(u8, stderr, "error[ZBX-E1201]") != null);
+    try testing.expect(std.mem.indexOf(u8, stderr, "/dev/fuse is not openable") != null);
+    for (&states, &world.sim.world.processes) |state, *process| {
+        try testing.expectEqual(state, process.state);
     }
 }
 
