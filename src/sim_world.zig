@@ -245,8 +245,11 @@ pub const Process = struct {
     /// The listener sockets this process holds (`World.make_listener`).
     listener_holds: [constants.sim_listeners_max]bool,
     /// A scope's keeper (`World.start_keeper`): alive in the `command` state until the pipe it
-    /// holds has no writer left, or it is killed.
+    /// holds has no writer left, or it is killed. It is two processes in the kernel: the keeper
+    /// zbx forked (`pid`) and its member (`keeper_member`), the vfork child that goes in the
+    /// scope and that the OOM killer never picks. Both pids name this one slot.
     keeper: bool,
+    keeper_member: u32,
     /// pasta (`World.start_program`): alive in the `command` state, serving the namespaces of
     /// `pasta_target`, listening on the host's `ports`, until it is killed, its parent dies, or
     /// (unless `World.pasta_stays`) the process it serves is gone.
@@ -496,7 +499,15 @@ pub const World = struct {
     /// Faults for the keeper: forking it fails with this errno; it ends by itself (as if
     /// something killed it) the moment its scope has started.
     keeper_fork_errno: ?u16,
+    /// The keeper forked, but its clone of its member failed with this errno (EAGAIN: the
+    /// keeper is two processes of the user's limit, and the second was refused). The real host
+    /// kills and reaps that keeper itself before the start fails, so nothing is left behind.
+    keeper_member_errno: ?u16,
     keeper_dies_early: bool,
+    /// The OOM killer, having killed the command, kills again in the same cgroup before zbx
+    /// reaps it (a second process of the command was still charging) and picks the scope's
+    /// other process unless that process is in a vfork (demo-m2, run 44671710258).
+    oom_takes_keeper: bool,
     /// Keepers started so far.
     keepers_started: u32,
     /// The pasta model: how it behaves, the line it fails with, the host ports other programs
@@ -612,7 +623,9 @@ pub const World = struct {
         world.cgroup_stays = false;
         world.ended_memory_max = null;
         world.keeper_fork_errno = null;
+        world.keeper_member_errno = null;
         world.keeper_dies_early = false;
+        world.oom_takes_keeper = false;
         world.keepers_started = 0;
         world.pasta_behaviour = .works;
         world.pasta_message = "Couldn't set up tap device in namespace";
@@ -768,7 +781,9 @@ pub const World = struct {
 
     fn find_index(world: *const World, pid: u32) ?u8 {
         for (&world.processes, 0..) |*process, index| {
-            if (process.pid == pid and process.state != .unused) return @intCast(index);
+            if (process.state == .unused) continue;
+            if (process.pid == pid) return @intCast(index);
+            if (process.keeper and process.keeper_member == pid) return @intCast(index);
         }
         return null;
     }
@@ -956,13 +971,33 @@ pub const World = struct {
         process.exit = status;
         process.state = .zombie;
         process.holds = @splat(false);
-        world.process_died(process.pid);
-        world.scope_lost_process(process.pid);
+        // Both of its processes end: the member by its pipe's end or its death signal.
+        for ([_]u32{ process.pid, process.keeper_member }) |pid| {
+            world.process_died(pid);
+            world.scope_lost_process(pid);
+        }
+        assert(!world.process_alive(process.keeper_member));
+    }
+
+    /// The command of a scope ended by the OOM killer (`oom_kills`), and the fault says the
+    /// killer struck again before the reap: the scope's other process dies too, unless it is a
+    /// keeper's member, which the kernel never picks (`oom_badness` skips a task in a vfork).
+    fn oom_kill_again(world: *World, command: *const Process) void {
+        assert(command.state == .zombie);
+        assert(!command.keeper);
+        if (!world.oom_takes_keeper or world.oom_kills == 0) return;
+        for (&world.bus.scopes) |*scope| {
+            if (!scope.active or scope.pid != command.pid or scope.keeper_pid == 0) continue;
+            const other = world.find_process(scope.keeper_pid) orelse continue;
+            assert(other.keeper);
+            if (other.keeper_member == scope.keeper_pid) continue; // In a vfork: never a victim.
+            if (other.state == .command) world.keeper_ends(other, .{ .signaled = 9 });
+        }
     }
 
     /// Forks a keeper that holds the read end `hold`, outside every namespace. Null if no
     /// process is free or the fault says the fork fails (the errno is `keeper_fork_errno`).
-    pub fn start_keeper(world: *World, hold: host.Handle) ?u32 {
+    pub fn start_keeper(world: *World, hold: host.Handle) ?host.Keeper {
         const slot = for (world.processes[1..], 1..) |*process, index| {
             if (process.state == .unused or process.state == .reaped) break index;
         } else return null;
@@ -974,10 +1009,12 @@ pub const World = struct {
         keeper.state = .command;
         keeper.keeper = true;
         keeper.pid = world.take_pid();
+        keeper.keeper_member = world.take_pid();
         keeper.cwd = world.processes[world.current].cwd;
         keeper.holds[read_end] = true; // It closes everything else.
         world.keepers_started += 1;
-        return keeper.pid;
+        assert(keeper.keeper_member != keeper.pid);
+        return .{ .pid = keeper.pid, .member = keeper.keeper_member };
     }
 
     /// The scope the process was in has one process fewer; with none left, the manager removes
@@ -1130,6 +1167,7 @@ pub const World = struct {
         child.exit = if (child.execd) world.command_exit else .{ .exited = code };
         child.state = .zombie;
         world.namespace_gone(child.pid);
+        if (child.execd) world.oom_kill_again(child);
     }
 
     /// Ends a child that has not run: it never gets to. Returns false if it is not pending.
@@ -1430,6 +1468,7 @@ pub const World = struct {
         process.exit = world.command_exit;
         process.state = .zombie;
         world.process_died(process.pid);
+        world.oom_kill_again(process);
     }
 
     /// A container's PID 1 got SIGKILL and takes `pid1_exit_ms` to exit: the kernel's `do_exit`
@@ -2668,6 +2707,7 @@ fn unused_process() Process {
         .holds = @splat(false),
         .listener_holds = @splat(false),
         .keeper = false,
+        .keeper_member = 0,
         .pasta = false,
         .pasta_target = 0,
         .ports = undefined,
