@@ -13,8 +13,10 @@ decision 2). Decision: `docs/decisions/2026-11-19-ci-on-woodpecker.md`.
 | Settings, secrets | `/etc/zigbox-ci/` (`ci.env`, `github-client-id`, `github-client-secret`, `agent-secret`) |
 | The image every step runs in | `image/Dockerfile`, built on the box as `zigbox-ci:0.17.0` |
 | Pipelines | `.woodpecker/check.yaml` (code gates), `demos.yaml` (VM demos), `vm.yaml` (`vm/*` branches) |
-| Step logic | `zig build ci-*` and `vm-branch` (`src/ci_main.zig`, `src/ci/`); the VM image caches are `src/testing/vm/cache.zig` |
-| Caches | `/var/lib/zigbox-ci/zig` (Zig's global cache), `/var/lib/zigbox-ci/vm-entries` (VM images) |
+| Repository settings, `github_token` secret | `woodpecker-setup.sh` (step 4) |
+| Step logic | `zig build ci-*`, `vm-branch` and `vm-branch-delete` (`src/ci_main.zig`, `src/ci/`); the VM image caches are `src/testing/vm/cache.zig` |
+| Caches | `/var/lib/zigbox-ci/<scope>/` with `zig`, `zig-root` (Zig's caches) and `vm-entries` (VM images); a scope per event (`push` is `main`, `pull_request`, `pull_request_metadata`, `manual`) and `vm` for `vm/*` branches |
+| Cache bound | `zigbox-ci-prune.timer` (hourly, `/usr/local/sbin/zigbox-ci-prune`), written by `bootstrap.sh` |
 
 The YAML holds only what the build cannot: triggers, the demo matrix, `privileged`, volumes, the
 `github_token` secret and these environment values. Each step is one `zig build ...` line.
@@ -26,17 +28,27 @@ The YAML holds only what the build cannot: triggers, the demo matrix, `privilege
   root `zig build` keeps its caches outside the workspace, so nothing root-owned is left in
   `.zig-cache` for `tester` to trip on. `tester` uses `/cache/zig`.
 - `ZBX_VM_CACHE=/cache/vm-entries`: switches on the VM image cache for `ci-demos`.
+- `/cache` is `/var/lib/zigbox-ci/${CI_PIPELINE_EVENT}` (`/var/lib/zigbox-ci/vm` in `vm.yaml`), so
+  a pipeline on `main` (event `push`) never reads a cache a pull request wrote.
 - `dbus-run-session` for the dbus-live gate is started by the driver, not by YAML.
 
 Not ported yet (they stay in `.github/workflows/` until they are): `release.yml`, `top20.yml`,
 `package-refresh.yml`, `pages.yml`, `mac.yml` (needs a Mac), and `vm/m8-push-ghcr` and `demo-m6d`
-(they need tokens GitHub gave Actions; each says NOT RUN).
+(they need tokens GitHub gave Actions; in `demos.yaml` m6d says NOT RUN).
+
+`vm/*` scratch branches belong to Woodpecker (`vm.yaml`), which runs the demo and then deletes the
+branch in a separate, unprivileged step that alone holds `github_token`. GitHub's `vm.yml` runs on
+a push only for `vm/m6d-*` and `vm/m8-push-ghcr`, which Woodpecker skips; for any other `vm/*`
+branch it runs only by hand, when the box is down (`gh workflow run vm.yml --ref vm/<demo>-<slug>`).
+So each branch has one run and one deleter.
 
 ## Set it up
 
 You need: a bare-metal server with Ubuntu 24.04 and root on it (a cloud VM has no `/dev/kvm`; the
 bootstrap refuses one), a DNS name for it (below, `ci.zigbox.org`), and owner rights on the GitHub
-organisation `ZigboxOrg`. Every step can be run again safely.
+organisation `ZigboxOrg`. On the box everything else is installed by the bootstrap (Docker,
+BuildKit, Compose, QEMU, `curl`, `git` and `jq`, which step 4's script needs). On your own machine
+you need only `git` and an SSH client. Every step can be run again safely.
 
 **1. DNS.** Add an `A` record from the name to the box's public IPv4 (unproxied, if your DNS
 provider is Cloudflare). The bootstrap checks that the name resolves to an address of the box.
@@ -63,40 +75,58 @@ It clones this repository into `/opt/zigbox-ci/src` (`ZIGBOX_CI_REF=<branch>` be
 another branch than `main`) and runs the copy there. On the first run it asks for the DNS name, your
 GitHub login (the Woodpecker admin), and the OAuth app's Client ID and secret (read without echo; it
 lands in `/etc/zigbox-ci/github-client-secret`, mode 0640, group 1000: the server image runs as uid
-1000). Then it installs Docker, BuildKit, Compose and QEMU, builds the step image, starts Woodpecker and
-Caddy, and waits for the certificate and the agent. The last line must be `ci-bootstrap: OK
+1000). Then it installs Docker, BuildKit, Compose, QEMU and jq, builds the step image, starts Woodpecker and
+Caddy, installs the hourly cache bound (`zigbox-ci-prune.timer`), and waits for the certificate
+and the agent. The last line must be `ci-bootstrap: OK
 https://ci.zigbox.org (...)`. A `FAIL` line says what to fix; fix it and run the same command again.
 To change a setting later, edit `/etc/zigbox-ci/ci.env` (or delete a secret file to be asked again)
 and rerun.
 
-**4. Log in and turn the repositories on.** Logging in is GitHub's OAuth consent, a browser step:
-open <https://ci.zigbox.org>, log in with GitHub and grant access to `ZigboxOrg`. Then, in
-Woodpecker:
+**4. Log in, then set the repository up.** Logging in is GitHub's OAuth consent, so it is a
+browser step: open <https://ci.zigbox.org>, log in with GitHub and grant access to `ZigboxOrg`.
+Then copy your personal token from **User settings → CLI & API** (Woodpecker makes its API tokens
+only for a logged-in browser session; there is no API call that mints the first one).
 
-1. **Add repository** → `ZigboxOrg/zigbox` → enable. (Woodpecker adds the webhook on GitHub.)
-2. Repository **Settings → Project**: turn on **Trusted** (every box it offers: security, volumes),
-   **Cancel previous pipelines** for push and pull request, and set **Timeout** to `180` minutes.
-   Trusted is what gives the demo steps `/dev/kvm` and the `/var/lib/zigbox-ci` mount; only an admin
-   (`CI_ADMINS`) sees it.
-
-Then copy your personal token from **User settings → CLI & API** for the next steps.
-
-**5. The token that deletes `vm/*` branches.** A fine-grained token, `ZigboxOrg/zigbox` only,
-**Contents: Read and write**, made at <https://github.com/settings/personal-access-tokens/new>
-(GitHub has no CLI for fine-grained tokens). Store it as the Woodpecker secret `github_token`, with
-the token from step 4:
+Make the GitHub token that deletes `vm/*` branches: a fine-grained token, `ZigboxOrg/zigbox`
+only, **Contents: Read and write**, at <https://github.com/settings/personal-access-tokens/new>
+(GitHub has no API or CLI that creates fine-grained tokens). Then, as root on the box:
 
 ```bash
-export WOODPECKER_SERVER=https://ci.zigbox.org
+bash /opt/zigbox-ci/src/ops/ci/woodpecker-setup.sh
 ```
 
-```bash
-read -rs WOODPECKER_TOKEN && export WOODPECKER_TOKEN
-```
+It asks for the Woodpecker token and the GitHub token (neither is echoed or put on a command line;
+press Enter at the second to keep the stored one), and through Woodpecker's API it:
 
-```bash
-read -rs GH_PAT && REPO_ID=$(curl -fsS "$WOODPECKER_SERVER/api/repos/lookup/ZigboxOrg/zigbox" -H "Authorization: Bearer $WOODPECKER_TOKEN" | jq -r .id) && jq -n --arg v "$GH_PAT" '{name:"github_token", value:$v, events:["push"]}' | curl -fsS -X POST "$WOODPECKER_SERVER/api/repos/$REPO_ID/secrets" -H "Authorization: Bearer $WOODPECKER_TOKEN" -H 'Content-Type: application/json' -d @- >/dev/null && echo "secret github_token: stored"; unset GH_PAT
-```
+- turns `ZigboxOrg/zigbox` on (Woodpecker adds the webhook on GitHub);
+- sets **Trusted** (security and volumes: the demo steps' `/dev/kvm` and the `/var/lib/zigbox-ci`
+  mount), **approval required for pull requests from forks** (`require_approval: forks`, set
+  explicitly rather than left to the default), cancel-previous for push, pull request and
+  pull-request-metadata events, and a 180-minute timeout;
+- creates the secret `github_token` (push events only), or updates it if it exists.
+
+It reads the settings back; the last line must be `ci-setup: OK ZigboxOrg/zigbox (id N): ...`
+with `"require_approval":"forks"` and `github_token secret: yes`. Run it again at any time: it only
+sets what is not already so.
+
+**5. Before approving a fork's pull request.** The repository is Trusted, so a pipeline that runs
+is root on the box: the demo steps are privileged, every step mounts `/var/lib/zigbox-ci`, and the
+steps run whatever `build.zig` and the driver say. Woodpecker therefore holds every pipeline of a
+pull request from a fork until a maintainer approves it in its UI. Approving means running the
+pull request's code as root on the box, so before approving read every change to:
+
+- `.woodpecker/*` (what runs, privileged or not, which volumes and secrets);
+- `build.zig` and `build.zig.zon` (what any `zig build` runs, including fetched dependencies);
+- `src/ci_main.zig`, `src/ci/*` and `src/testing/vm/*` (the driver and the harness the steps run
+  as root or in the KVM guest);
+- `ops/ci/*` (the image and the box's scripts);
+- anything else a privileged step runs: a demo's code, test scripts, and any file one of the
+  above reads or executes.
+
+If any of it is unclear, do not approve; ask for the change to be split out. An approved run can
+also write to the pull-request cache scope (`/var/lib/zigbox-ci/pull_request`), which only other
+pull requests read; `main` uses its own. Pull requests from branches of this repository, and pushes
+to `vm/*`, need no approval: only people with write access can make them.
 
 **6. Check that it works.** Push a scratch branch that runs the first demo:
 
@@ -105,14 +135,23 @@ git push origin HEAD:vm/m0-ci-check
 ```
 
 Open <https://ci.zigbox.org/repos> → `ZigboxOrg/zigbox`: the run of `vm/m0-ci-check` must end green
-within about ten minutes, its log must end with `demo-m0` passing and `deleted the scratch branch`,
-and the branch must be gone:
+within about ten minutes, the `demo` step must end with `demo-m0` passing, the `delete-branch` step
+with `deleted the scratch branch`, and the branch must be gone:
 
 ```bash
 git ls-remote origin vm/m0-ci-check
 ```
 
-prints nothing. Then open a pull request: `check` and the `demos` workflows appear as checks on it.
+prints nothing. On the box, the run used its own cache scope:
+
+```bash
+ls /var/lib/zigbox-ci/vm/vm-entries
+```
+
+lists `vm-image-...` (if instead a directory named `${CI_PIPELINE_EVENT}` appears under
+`/var/lib/zigbox-ci`, this Woodpecker does not substitute variables in `volumes:`; stop and report
+it). Then open a pull request: `check` and the `demos` workflows appear as checks on it, and
+`ls /var/lib/zigbox-ci/pull_request` fills.
 
 ## Sessions reading results
 
@@ -123,13 +162,22 @@ it never goes in chat or the repository).
 
 ## Running it
 
-- **Restart or upgrade:** change the tags in `compose.yaml` on `main`, then rerun the bootstrap
+- **Restart or upgrade:** change the tags and their digests in `compose.yaml` (and the
+  `plugin-git` digest in `.woodpecker/*.yaml`) on `main`, then rerun the bootstrap
   command (step 3); it fetches the new files. Zig upgrades change `image/Dockerfile` and every
   pipeline's `image:` line together.
 - **Logs:** `docker compose -f /opt/zigbox-ci/compose.yaml logs -f woodpecker-agent`.
 - **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, each a VM guest or a set of builds; the
   simulation fleet shares the box. Lower it if the fleet's rounds slow down.
-- **Disk:** VM images are stored once per pinned version under `/var/lib/zigbox-ci/vm-entries`
-  (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`); an old pin's directory is never read again and can be deleted. Zig's cache
-  (`/var/lib/zigbox-ci/zig`) can be emptied when no pipeline runs. Docker's own:
-  `docker system prune -f`.
+- **Disk:** VM images are stored per pinned version under `/var/lib/zigbox-ci/<scope>/vm-entries`
+  (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`). Each stored entry
+  carries the SHA-256 of its files and is checked on every restore: a file that does not match is
+  not used, and the entry is deleted and stored again from a fresh download. Each save keeps at
+  most two keys per entry (the current pin and the newest older one), so a scope holds at most two
+  copies of each image set. The Zig caches (`zig`, `zig-root`) are bounded by the hourly
+  `zigbox-ci-prune` timer: a scope whose Zig caches pass 30 GiB is emptied, while no step runs
+  (`journalctl -u zigbox-ci-prune` shows when). A cache can be emptied by hand the same way, when no
+  pipeline runs. Docker's own: `docker system prune -f`.
+- **Full CI on a pull request:** the `full-ci` label starts `check` and `demos` again at once
+  (the `pull_request_metadata` event); if Woodpecker does not pass the labels with that event,
+  nothing starts and the next push to the pull request runs everything.
