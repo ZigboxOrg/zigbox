@@ -16,3 +16,5 @@
 4. **Accept and record it** for 0.6.0 with a line in the release text.
 
 Nothing here is built; the slice records the gap under "Cuts and deviations" in docs/demos/s2.md.
+
+The owner accepted the gap for 0.6.0 on 2026-11-20: [2026-11-20-s2-rootless-owner-gap-accepted.md](2026-11-20-s2-rootless-owner-gap-accepted.md).

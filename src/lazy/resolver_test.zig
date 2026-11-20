@@ -966,6 +966,59 @@ test "resolver: outside the store's namespace, the put that completes an object 
     try testing.expectEqual(@as(u32, 3), fixture.registry.calls.load(.monotonic));
 }
 
+test "resolver: rootless, an object owned by a container id is never made whole, yet reads succeed" {
+    // Goal: pin what holds today for the accepted gap in
+    // docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md. Outside the namespace and
+    // without `CAP_CHOWN`, an object of 0:42 (Alpine's /etc/shadow) cannot be assembled: the
+    // last put fails on its owner. Its chunks stay held in `partial/`, verified, so every read
+    // is still served, but only after a round (`lazy_down_fail_ms`); the object is not whole and
+    // `objects_local` never counts it, so the run's record stays partial. A `security.capability`
+    // object fails the same way in the kernel; `SimFs` has no gate for it, so it is not tested.
+    // Method: owners `outside`, the file system refusing a change of owner; object 0 (two
+    // chunks) is owned by 0:42, object 1 by root. Read both; read object 0 again.
+    setup(&.{ 2 * chunk_bytes, 2 * chunk_bytes });
+    const shadow: object_mod.Attrs = .{
+        .mode = 0o640,
+        .uid = 0,
+        .gid = 42,
+        .xattrs = &xattrs.empty,
+    };
+    fixture.objects[0].wanted.attrs = shadow;
+    fixture.objects[0].wanted.id = object_mod.object_id(fixture.objects[0].wanted.content, shadow);
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{ .uid = 0, .gid = 0, .range = null } };
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const report = &fixture.resolver.schedule.report;
+    var out: [chunk_bytes]u8 = @splat(0);
+    // Chunk 0 lands (the object is not complete); chunk 1's put fails on the owner, so the
+    // read waits a round and is then served from the held chunk.
+    try expect_true_read(0, 0, 0);
+    const begun = fixture.resolver.read_begin(0, 1, &out, 0);
+    try testing.expect(begun == .wait);
+    _ = pump(0);
+    const early = fixture.resolver.read_poll(begun.wait, &out, 0);
+    try testing.expect(early == .wait);
+    const round = constants.lazy_down_fail_ms;
+    var served = fixture.resolver.read_poll(begun.wait, &out, round);
+    if (served == .wait) {
+        _ = pump(round);
+        served = fixture.resolver.read_poll(begun.wait, &out, round);
+    }
+    try testing.expect(served == .done);
+    try testing.expectEqualSlices(u8, truth(0, 1), out[0..served.done]);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    try testing.expectEqual(@as(u32, 0), report.objects_local);
+    // Root's object completes at once, and the next read of 0:42's chunk is local.
+    try expect_true_read(1, 0, round);
+    try expect_true_read(1, 1, round);
+    try testing.expect(land_mod.object_is_whole(&fixture.store, &fixture.objects[1].wanted));
+    try testing.expectEqual(@as(u32, 1), report.objects_local);
+    try expect_true_read(0, 1, round);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    try testing.expectEqual(@as(u32, 1), report.objects_local);
+}
+
 /// `SimFs`'s owner gate for a process outside any new user namespace.
 fn outside(context: *anyopaque) bool {
     assert(@intFromPtr(context) != 0);
