@@ -13,11 +13,13 @@
 //!     under a temporary name and renamed, so it appears whole or not at all; and a key once
 //!     stored is not overwritten (as `actions/cache`), with two exceptions below.
 //!   - An entry is replaced, never edited, when what is stored is no use: its hash list is
-//!     missing or unreadable (always), or, for an entry the demo writes into (`grows`, the m4
-//!     blob image), the workspace's files differ from the stored ones by hash and the demo steps
-//!     all passed (`SaveOptions.replace_changed`). Without that, a cold copy saved by the first
+//!     missing or unreadable (after any run, but see the next sentence), or, for an entry the
+//!     demo writes into (`grows`, the m4 blob image), the workspace's files differ from the
+//!     stored ones by hash; a `grows` entry is touched only by a run whose steps all passed
+//!     (`SaveOptions.replace_changed`). Without that, a cold copy saved by the first
 //!     run, before the demo had pulled anything, would stay for good and every later run would
-//!     pull again. The new copy is written under a temporary name, the old one is renamed aside,
+//!     pull again. A growing entry is stored, first or again, only after a run whose steps all
+//!     passed. The new copy is written under a temporary name, the old one is renamed aside,
 //!     the new one renamed to the key and the old one deleted, all under the store's lock; a
 //!     restore, which takes no lock, meets the old copy or the new one, or a miss for the instant
 //!     between the renames, and every copy it takes is checked against its own list.
@@ -148,12 +150,14 @@ pub fn restore(cache: *const Cache, which: []const Entry) void {
     for (which) |*entry| {
         var buffer: [key_bytes_max]u8 = undefined;
         const key = key_of(cache, entry, &buffer) orelse continue;
-        restore_one(cache, entry, key) catch |err| {
+        var seen: ?Io.File.INode = null;
+        restore_one(cache, entry, key, &seen) catch |err| {
             const name = @errorName(err);
             cache.log.print("cache: {s}: miss ({s}: {s})\n", .{ entry.name, key, name }) catch {};
             // An entry that fails its check, or has no usable list (one saved before lists
-            // existed), is dropped so that the next save stores a checked copy.
-            if (is_bad_entry(err)) drop_entry(cache, key);
+            // existed), is dropped so that the next save stores a checked copy. Only the copy
+            // restore read goes: a save may have replaced it since.
+            if (is_bad_entry(err)) drop_entry(cache, key, seen);
             continue;
         };
         cache.log.print("cache: {s}: hit ({s})\n", .{ entry.name, key }) catch {};
@@ -168,11 +172,18 @@ fn is_bad_entry(err: anyerror) bool {
 }
 
 /// Copies the files the entry's list names and checks each copy's SHA-256 against it. A copy
-/// that does not match is deleted from the workspace (`error.HashMismatch`).
-fn restore_one(cache: *const Cache, entry: *const Entry, key: []const u8) !void {
+/// that does not match is deleted from the workspace (`error.HashMismatch`). `seen` is set to the
+/// inode of the stored directory that was read, the identity `drop_entry` checks.
+fn restore_one(
+    cache: *const Cache,
+    entry: *const Entry,
+    key: []const u8,
+    seen: *?Io.File.INode,
+) !void {
     const io = cache.io;
     var source = try cache.store.openDir(io, key, .{});
     defer source.close(io);
+    seen.* = (try source.stat(io)).inode;
     var sums_buffer: [sums_bytes_max]u8 = undefined;
     const sums = source.readFile(io, sums_name, &sums_buffer) catch |err| switch (err) {
         error.FileNotFound => return error.NoHashList,
@@ -197,12 +208,19 @@ fn restore_one(cache: *const Cache, entry: *const Entry, key: []const u8) !void 
     if (count == 0) return error.NoHashList;
 }
 
-/// Deletes a stored entry that failed its check, under the store's lock.
-fn drop_entry(cache: *const Cache, key: []const u8) void {
+/// Deletes the stored copy that failed its check, under the store's lock, and only that copy:
+/// restore takes no lock, so a save may have replaced `key` since it was read, and the new copy
+/// is good. The copy's identity is the inode of its directory (`seen`); a replacement is written
+/// as a new directory while the old one still exists, so the two differ. No identity, or a key
+/// that is gone or has another inode, drops nothing.
+fn drop_entry(cache: *const Cache, key: []const u8, seen: ?Io.File.INode) void {
     const io = cache.io;
+    const inode = seen orelse return;
     const lock_options: Io.Dir.CreateFileOptions = .{ .truncate = false, .lock = .exclusive };
     const lock = cache.store.createFile(io, ".lock", lock_options) catch return;
     defer lock.close(io);
+    const now = cache.store.statFile(io, key, .{}) catch return;
+    if (now.inode != inode) return;
     cache.store.deleteTree(io, key) catch {};
 }
 
@@ -367,6 +385,9 @@ fn save_one(
     options: SaveOptions,
 ) !Saved {
     const io = cache.io;
+    // A growing entry is written only by a run whose steps all passed: a failed run may leave a
+    // half-written image, and a stored one is never replaced by a later failed run.
+    if (entry.grows and !options.replace_changed) return .kept;
     const present = if (cache.store.access(io, key, .{})) |_| true else |_| false;
     if (present) {
         if (!stored_is_stale(cache, entry, key, options)) return .kept;
@@ -849,4 +870,60 @@ test "vm cache: save removes the scratch directories a killed save left" {
     try expect_no_scratch(rig.store);
     try rig.store.access(io, "note.txt", .{});
     try rig.store.access(io, test_key ++ "/" ++ sums_name, .{});
+}
+
+test "vm cache: a growing entry is not stored by a failed run, and a damaged one is kept" {
+    // Goal: a run that failed may leave a half-written image, so it must not become the stored
+    // copy of an absent key, nor replace a copy whose list is unusable (the passing run that
+    // follows does). Method: save as a failed run into an empty store (nothing stored), then as a
+    // passing run (stored), damage the list and save as a failed run (the list stays damaged),
+    // then as a passing run (replaced).
+    var rig: Rig = undefined;
+    try rig.open();
+    defer rig.close();
+    const io = testing.io;
+    const cache = rig.cache();
+    const which = growing_entries();
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "half" });
+    save(&cache, &which, .{ .replace_changed = false });
+    try testing.expectError(error.FileNotFound, rig.store.access(io, test_key, .{}));
+    try expect_no_scratch(rig.store);
+    save(&cache, &which, .{ .replace_changed = true });
+    try expect_stored(rig.store, "half");
+    const sums_path = test_key ++ "/" ++ sums_name;
+    try rig.store.writeFile(io, .{ .sub_path = sums_path, .data = "not a list\n" });
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "whole" });
+    save(&cache, &which, .{ .replace_changed = false });
+    var sums: [sums_bytes_max]u8 = undefined;
+    try testing.expect(!list_is_usable(try rig.store.readFile(io, sums_path, &sums)));
+    try expect_stored(rig.store, "half");
+    save(&cache, &which, .{ .replace_changed = true });
+    try testing.expect(list_is_usable(try rig.store.readFile(io, sums_path, &sums)));
+    try expect_stored(rig.store, "whole");
+}
+
+test "vm cache: dropping a bad entry leaves a copy that replaced it" {
+    // Goal: restore reads without the lock, so by the time it drops what it judged bad, a save
+    // may have put a good copy at the key. Method: read the stored copy's identity, replace the
+    // entry, drop with the old identity (the new copy stays), then with the current one (it goes).
+    var rig: Rig = undefined;
+    try rig.open();
+    defer rig.close();
+    const io = testing.io;
+    const cache = rig.cache();
+    const which = growing_entries();
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "cold" });
+    save(&cache, &which, .{ .replace_changed = true });
+    const old = (try rig.store.statFile(io, test_key, .{})).inode;
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "warm" });
+    save(&cache, &which, .{ .replace_changed = true });
+    try testing.expect(std.mem.indexOf(u8, rig.log.buffered(), "replaced") != null);
+    drop_entry(&cache, test_key, old);
+    try expect_stored(rig.store, "warm");
+    drop_entry(&cache, test_key, null);
+    try expect_stored(rig.store, "warm");
+    const current = (try rig.store.statFile(io, test_key, .{})).inode;
+    try testing.expect(current != old);
+    drop_entry(&cache, test_key, current);
+    try testing.expectError(error.FileNotFound, rig.store.access(io, test_key, .{}));
 }

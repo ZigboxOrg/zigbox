@@ -57,7 +57,7 @@ triggers (docs/decisions/2026-11-19-ci-on-woodpecker.md).
 You need: a bare-metal server with Ubuntu 24.04 and root on it (a cloud VM has no `/dev/kvm`; the
 bootstrap refuses one), a DNS name for it (below, `ci.zigbox.org`), and owner rights on the GitHub
 organisation `ZigboxOrg`. On the box everything else is installed by the bootstrap (Docker,
-BuildKit, Compose, QEMU, `curl`, `git` and `jq`, which step 4's script needs). On your own machine
+BuildKit, Compose, QEMU, `curl`, `git`, `jq` and `gh`, which step 4's script needs). On your own machine
 you need only `git` and an SSH client. Every step can be run again safely.
 
 **1. DNS.** Add an `A` record from the name to the box's public IPv4 (unproxied, if your DNS
@@ -83,31 +83,98 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ZigboxOrg/zigbox/main/ops/ci
 
 It clones this repository into `/opt/zigbox-ci/src` (`ZIGBOX_CI_REF=<branch>` before `bash` picks
 another branch than `main`) and runs the copy there. On the first run it asks for the DNS name, your
-GitHub login (the Woodpecker admin), and the OAuth app's Client ID and secret (read without echo; it
+GitHub login (the bot's from step 3a: the Woodpecker admin), and the OAuth app's Client ID and secret (read without echo; it
 lands in `/etc/zigbox-ci/github-client-secret`, mode 0640, group 1000: the server image runs as uid
-1000). Then it installs Docker, BuildKit, Compose, QEMU and jq, builds the step image, starts Woodpecker and
+1000). Then it installs Docker, BuildKit, Compose, QEMU, jq and gh, builds the step image, starts Woodpecker and
 Caddy, installs the hourly cache bound (`zigbox-ci-prune.timer`), and waits for the certificate
 and the agent. The last line must be `ci-bootstrap: OK
 https://ci.zigbox.org (...)`. A `FAIL` line says what to fix; fix it and run the same command again.
 To change a setting later, edit `/etc/zigbox-ci/ci.env` (or delete a secret file to be asked again)
 and rerun.
 
-**4. Log in, then set the repository up.** Logging in is GitHub's OAuth consent, so it is a
-browser step: open <https://ci.zigbox.org>, log in with GitHub and grant access to `ZigboxOrg`.
+**3a. Owner steps: a Woodpecker account that cannot change `main`, and `main`'s protection.**
+Do this before step 4 (the facts behind it are under "What a writer can reach"). Everything runs
+on your own machine, never on the box. Values you supply:
+
+- `BOT_LOGIN`: the GitHub login of a new account made for Woodpecker, for example
+  `zigbox-ci-bot` (a machine user: GitHub's terms allow one per person, and it needs its own
+  e-mail address). It is the only account that ever logs in to Woodpecker and the one that
+  activates the repository.
+- `OWNER_LOGINS`: the logins that merge into `main`, comma separated: the account the sessions'
+  pull requests are authored from (the supervisor merges from it), and any human who merges. Run
+  `gh pr view <a recent pull request> --json author --jq .author.login` to see the first.
+- The fine-grained check token (below) and the bot's own tokens, which you make in the browser.
+
+1. **Make the account** (browser: GitHub has no API to create an account or to enrol two-factor
+   authentication): sign up as `BOT_LOGIN`, turn on two-factor authentication, and keep its
+   password and recovery codes with the owner. Never give it a role in the organisation beyond
+   member.
+2. **Invite it, give it admin for the activation, and set `main`'s protection** (needs `gh`, `jq`;
+   log in with `gh auth login` as an owner of `ZigboxOrg`):
+
+   ```bash
+   export BOT_LOGIN=zigbox-ci-bot OWNER_LOGINS=zvozin   # your values
+   bash ops/ci/owner-github.sh admin
+   ```
+
+   The first run invites the bot to `ZigboxOrg` and stops. Log in as the bot in a private browser
+   window, accept at <https://github.com/ZigboxOrg> (or `gh api -X PATCH
+   user/memberships/orgs/ZigboxOrg -f state=active` with the bot's own `gh` login), and run the
+   same command again. It then makes the bot a collaborator with `admin` on `ZigboxOrg/zigbox`
+   (GitHub lets only an admin turn a repository on in Woodpecker) and replaces `main`'s protection
+   with: pull requests required (**no approving review**, so the supervisor's merges still work),
+   `enforce_admins`, force pushes and deletion off, and **pushes and merges restricted to
+   `OWNER_LOGINS`**. It reads everything back and ends in `owner-github: OK ...`. Before you run
+   it, check that no workflow pushes to `main` with a token of its own: `grep -n 'git push'
+   .github/workflows/*.yml` (none does today besides tags); if one does, pass its GitHub App's slug
+   in `ALLOW_APPS=slug` to the command.
+3. **Make the two read tokens** (browser: GitHub has no API for fine-grained tokens), at
+   <https://github.com/settings/personal-access-tokens/new>. As the **owner**: `ZigboxOrg/zigbox`
+   only, **Administration: Read** and **Metadata: Read**, expiry 30 days; step 4's script asks for
+   it, uses it for its checks and does not store it. As the **bot** (logged in as the bot):
+   `ZigboxOrg/zigbox` only, **Contents: Read and write**, for the branch deletion (step 4).
+4. Step 3 of this runbook must ask for `BOT_LOGIN` as the Woodpecker admin; to change it later,
+   edit `CI_ADMINS` in `/etc/zigbox-ci/ci.env` and run the bootstrap command again.
+5. **After step 4's first run, take the admin role away and run the script again:**
+
+   ```bash
+   bash ops/ci/owner-github.sh write
+   ```
+
+   then, on the box, rerun `woodpecker-setup.sh` (step 4): it refuses to finish while any account
+   Woodpecker holds a token for is an admin of the repository, or may push or merge into `main`.
+   Woodpecker keeps working with `write`: it clones, posts statuses and receives webhooks with it.
+   If a pipeline later fails with a 403 from GitHub that names the webhook, repeat `admin`, let
+   Woodpecker repair it, and go back to `write`.
+6. **Remove accounts Woodpecker should not know.** If you (or anyone else) ever logged in to
+   Woodpecker, the box holds that account's GitHub token. Delete it from Woodpecker with the bot's
+   Woodpecker token (step 4), then revoke the grant on GitHub, which only the account itself can
+   do in the browser (the API needs the token that is stored): <https://github.com/settings/applications>
+   → Authorized OAuth Apps → Zigbox CI → Revoke.
+
+   ```bash
+   curl -fsS -X DELETE -H "Authorization: Bearer $WOODPECKER_TOKEN" https://ci.zigbox.org/api/users/OWNER_LOGIN
+   curl -fsS -H "Authorization: Bearer $WOODPECKER_TOKEN" https://ci.zigbox.org/api/users | jq -r '.[].login'
+   ```
+
+   The list must show only the bot. Approving a fork's pull request (step 5 of the runbook) then
+   means logging in to Woodpecker as the bot, in a private window.
+
+**4. Log in as the bot, then set the repository up.** Logging in is GitHub's OAuth consent, so it is a
+browser step: in a private window open <https://ci.zigbox.org>, log in with GitHub as the bot of 3a and grant access to `ZigboxOrg`.
 Then copy your personal token from **User settings → CLI & API** (Woodpecker makes its API tokens
 only for a logged-in browser session; there is no API call that mints the first one).
 
-Make the GitHub token that deletes `vmw/*` branches: a fine-grained token, `ZigboxOrg/zigbox`
-only, **Contents: Read and write** and nothing else, from an account that cannot bypass `main`'s
-branch protection, at <https://github.com/settings/personal-access-tokens/new>
-(GitHub has no API or CLI that creates fine-grained tokens). Then, as root on the box:
+The GitHub token that deletes `vmw/*` branches is the bot's from step 3a.3 (a fine-grained token,
+`ZigboxOrg/zigbox` only, **Contents: Read and write**, nothing else). Then, as root on the box:
 
 ```bash
 bash /opt/zigbox-ci/src/ops/ci/woodpecker-setup.sh
 ```
 
-It asks for the Woodpecker token and the GitHub token (neither is echoed or put on a command line;
-press Enter at the second to keep the stored one), and through Woodpecker's API it:
+It asks for the Woodpecker token, the bot's GitHub token and the owner's read-only check token
+(none is echoed or put on a command line; press Enter at the second to keep the stored one;
+the third is not stored), and through Woodpecker's API it:
 
 - turns `ZigboxOrg/zigbox` on (Woodpecker adds the webhook on GitHub);
 - sets **Trusted** (security and volumes: the demo steps' `/dev/kvm` and the `/var/lib/zigbox-ci`
@@ -122,47 +189,55 @@ of this repository. The repository is Trusted, so that YAML can ask for `privile
 host mount, and a privileged step is **root on the host**. The host also holds, and a writer can
 therefore read:
 
-- Woodpecker's database (`woodpecker-data`), with the GitHub OAuth token of the admin who activated
-  the repository (scope `repo`: write access to everything that account can write);
+- Woodpecker's database (`woodpecker-data`), with **the GitHub OAuth token of every account that
+  ever logged in to Woodpecker** (scope `repo`);
 - the Docker socket, the fleet's token and `/etc/zigbox-ci/*` (the OAuth secret, the agent secret);
 - the `github_token` secret (a pipeline can print it; Woodpecker masks the exact string, not a
   transformed copy), and every cache scope.
 
-Woodpecker 3 cannot hold a secret back from one branch or file, and the token's scope limits only
-that one secret. The control that limits the rest is **`main`'s protection, which nobody can
-bypass**: pull requests required, no bypass allowances, `enforce_admins` on, no force pushes or
-deletion. Then even the OAuth token of the activating admin cannot change `main`. (It can still
-write other branches and read the repository; this is not a sandbox against a writer.) On Actions a writer
-reaches only that run's `GITHUB_TOKEN`, not a host. `woodpecker-setup.sh` reads the protection with `gh api` and refuses to finish unless it is
-so. To make it so (as an admin, `gh auth login` first; this replaces `main`'s protection, so add
-any status checks the repository requires to `required_status_checks`, or leave it `null`):
+Woodpecker 3 cannot hold a secret back from one branch or file. What is true of the stored tokens
+(corrected 2026-11-20; this section used to say a protected `main` kept them from changing it,
+which is false):
 
-```bash
-gh api -X PUT repos/ZigboxOrg/zigbox/branches/main/protection --input - <<'JSON'
-{
-  "required_status_checks": null,
-  "enforce_admins": true,
-  "required_pull_request_reviews": {
-    "required_approving_review_count": 0,
-    "bypass_pull_request_allowances": {"users": [], "teams": [], "apps": []}
-  },
-  "restrictions": null,
-  "allow_force_pushes": false,
-  "allow_deletions": false
-}
-JSON
-gh api repos/ZigboxOrg/zigbox/branches/main/protection |
-    jq '{enforce_admins: .enforce_admins.enabled, bypass: .required_pull_request_reviews.bypass_pull_request_allowances}'
-```
+- **The forge is GitHub** (`WOODPECKER_GITHUB`, the OAuth app of step 2). Woodpecker stores the
+  token of each account that logs in, and uses the token of the account that turned the repository
+  on for its clone, statuses and webhook. A token can do what its account can, within the scope
+  `repo`; nothing about the OAuth app narrows it to this repository.
+- **Today `main` is unprotected.** Checked 2026-11-20 as a repository admin: `GET
+  branches/main/protection` answers 404 "Branch not protected", and the repository has no
+  rulesets. So a token of an admin, or of anyone with write access, pushes to `main` or deletes
+  it directly.
+- **The protection the runbook used to prescribe would not have stopped an admin's token.**
+  `enforce_admins` makes admins obey the rules; it does not stop an admin from changing them
+  (`DELETE .../protection/enforce_admins`, or a `PUT` of the whole protection), and with zero
+  required approvals and no required checks a token can open a pull request and merge it at once,
+  which is not a bypass. Woodpecker needs an admin only to turn the repository on, and the
+  owner's account is an admin.
+- **A writer's token is bounded by `main`'s push restrictions, not by its pull requests.** With
+  `main` restricted to named users (classic branch protection, organisation repositories), a token
+  of an account that is not on the list can neither push to `main` nor merge a pull request into
+  it, and, if it is not an admin, cannot change the restriction. It can still do everything else a
+  writer can: push and delete other branches, push tags (so anything that trusts the existence of
+  a tag or a branch needs its own guard), open pull requests, read the repository, and push `vmw/*`.
+  Required reviews are not used: the sessions author the pull requests from the owner's account
+  and the supervisor merges them from it, so a required approving review would block every merge.
+  A required status check does not help either: the box's own token can post a commit status
+  under any name, and a check from GitHub Actions can be satisfied by a workflow the pull request
+  itself defines.
+- **So the control is on accounts, not on the protection alone:** Woodpecker only ever knows a
+  dedicated bot account with the `write` role, which is not on `main`'s restriction list; the owner
+  accounts that can merge never log in to it (step 3a). `woodpecker-setup.sh` checks this, with a
+  read-only token it is given for the run: it lists the accounts Woodpecker holds a token for
+  (`GET /api/users`), and refuses unless `main` has `enforce_admins`, push restrictions with no
+  team and none of those accounts in them (or in the bypass list), no force pushes and no
+  deletion, and, at the end, none of those accounts is a repository admin (the run that turns
+  the repository on needs an admin, so it only warns).
+- **What stays reachable** from the box even so: every branch other than `main`, tags, the
+  repository's contents, whatever the bot's `github_token` can write, and anything the fleet's own
+  token (a file on this host) can reach; that token's scope is not checked here and should be
+  limited the same way. On Actions a writer reaches only that run's `GITHUB_TOKEN`, not a host.
 
-Activate the repository (the first run of the setup script) from an account that has no bypass of
-`main`'s protection. Woodpecker needs repository admin to activate, so that account is an admin;
-with `enforce_admins` on, an admin has no bypass, which the check above proves. Check the account
-itself: `gh api repos/ZigboxOrg/zigbox/collaborators/<login>/permission --jq .permission` (`admin`
-or `write`), and that it is in no bypass list (`bypass_pull_request_allowances` above is empty, and
-`gh api repos/ZigboxOrg/zigbox/rulesets --jq '.[].name'` lists no ruleset that names it as a bypass
-actor; rulesets are not read by the script, so keep protection classic). Prefer a dedicated
-machine-user account, so that the token the box stores is not a person's.
+The steps that set this up, with every value, are 3a above; they are the owner's.
 
 **Why this is accepted (owner, 2026-11-20).** Anyone with write access to `ZigboxOrg/zigbox`, and
 anyone holding a writer's credentials (a leaked writer token included), can run privileged steps
@@ -171,7 +246,8 @@ A leaked `github_token` secret alone is narrower (it deletes or pushes scratch b
 leaked writer token is not: it can push `vmw/*`. This is accepted because the writers are the
 owner and the owner's sessions, and pull requests from forks, which anyone can open, wait for
 approval (`require_approval: forks`). `all_events` stays off. **If write access ever widens** (a
-collaborator, a team, a bot, an app with `contents: write`), the box must not stay as it is: before
+collaborator, a team, an app with `contents: write`; the bot of 3a is the one writer that is
+meant to be there, and its token lives only on this box), the box must not stay as it is: before
 adding the writer, set `ZBX_CI_APPROVAL=all_events ZBX_CI_APPROVED_USERS=<the owner's logins>` and
 rerun `woodpecker-setup.sh` (next paragraph), or move the server off the agent's host. Treat
 write access to the repository as root on the box until then. Decision:
@@ -194,13 +270,13 @@ that account's credentials (a prompt-injected session included); it stops only o
 other push, and every `vmw/*` push by someone not listed, waits for a click in the UI, which
 defeats `vmw/*` for them. The script does not set it by default, because that changes who can run
 what on the box (the owner decided on 2026-11-20 to keep it off, with the consequence above). The default stays `forks`,
-and `main`'s protection above is the control.
+and the accounts rule above (the bot is not on `main`'s push restrictions) is the control for `main`.
 
 It reads the settings back; the last line must be `ci-setup: OK ZigboxOrg/zigbox (id N): ...`
 with `"require_approval":"forks"` (or what you set) and `github_token secret: yes`. It needs `gh`
-logged in on the box (`gh auth login`) for the protection check, and fails with one line naming what
-to fix if `main` can be bypassed. Run it again at any time: it only
-sets what is not already so.
+on the box (the bootstrap installs it) but no `gh` login: the check token is given to it for the run. It fails
+with one line naming what to fix if `main` could be changed by an account Woodpecker holds a token
+for. Run it again at any time: it only sets what is not already so.
 
 **5. Before approving a fork's pull request.** The repository is Trusted, so a pipeline that runs
 is root on the box: the demo steps are privileged, every step mounts `/var/lib/zigbox-ci`, and the
@@ -285,8 +361,12 @@ Each log line comes back base64-encoded in `.data`. The run's page is
 - **Warm the caches once** before judging a run's time or its demos: a scope's first demo-m4 builds
   `m4-blobs.img` and pulls the registry images (minutes), and every later one restores them. After
   a bootstrap, or when a scope under `/var/lib/zigbox-ci` is new or emptied, run each scope's m4
-  once, alone: push `vmw/m4-warm` for the `vm` scope and open a pull request for `pull_request`
-  (`push` fills on the first push to `main`), wait for it to finish, then run the rest.
+  once, alone, for each of the five scopes: push `vmw/m4-warm` for `vm`; open a pull request for
+  `pull_request`; add the `full-ci` label to a throwaway pull request (or a label change on one
+  that already has it) for `pull_request_metadata`, which runs every demo; start a manual run
+  from the Woodpecker UI (repository -> Run pipeline) for `manual`; `push` fills on the first
+  push to `main`. Wait for each to finish, then run the rest. A first demo-m4 in a scope you
+  have not warmed is expected to miss its 60 s bound.
 - **Disk:** VM images are stored per pinned version under `/var/lib/zigbox-ci/<scope>/vm-entries`
   (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`). Expect, per scope,
   a few GiB per stored key (the Ubuntu image, three guest images, the Alpine rootfs, and the m4
@@ -294,7 +374,9 @@ Each log line comes back base64-encoded in `.data`. The run's page is
   10 to 15 GiB per scope and up to about 75 GiB over the five scopes once all are warm, besides the
   Zig caches (30 GiB each at most). These figures are estimates, not measurements: read the real
   ones with `du -sh /var/lib/zigbox-ci/*/vm-entries/*`. `bootstrap.sh` refuses a box with under
-  100 GiB free. Each stored entry carries the SHA-256 of its files and is checked on every
+  250 GiB free (the steady state of about 225 GiB, with Docker's own on top), and before demo-s2
+  the driver prints `df -h` for the workspace and the VM cache and refuses with one line naming the
+  shortfall (`demo-s2: 12 GiB free under .; it needs 30`) when either has under 30 GiB. Each stored entry carries the SHA-256 of its files and is checked on every
   restore: a file that does not match is not used, and the entry is deleted and stored again from
   a fresh download. A stored entry is also replaced, atomically (the new copy is written under a
   temporary name, the old one renamed aside, the new one renamed in, the old one deleted, all

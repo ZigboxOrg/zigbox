@@ -427,6 +427,7 @@ fn vm_cache_dir(ctx: *Ctx) ?[]const u8 {
 /// cache restored before and saved after when one is set. Returns 1 if any step failed.
 fn run_steps(ctx: *Ctx, steps: []const []const u8) !u8 {
     if (steps.len == 0) return 0;
+    try check_disk(ctx, steps);
     if (std.mem.eql(u8, ctx.args.accel, "kvm")) {
         Io.Dir.cwd().access(ctx.io, "/dev/kvm", .{ .write = true }) catch {
             ctx.say("/dev/kvm is not writable: the demos need KVM (repository Trusted?)", .{});
@@ -462,6 +463,57 @@ fn run_steps(ctx: *Ctx, steps: []const []const u8) !u8 {
         cache_store.save(&cache, &cache_store.entries, options);
     }
     return @intFromBool(failed);
+}
+
+/// Free disk, in GiB, a `demo-s2` run needs under the workspace and under the VM cache: about 6
+/// of registry blobs, a 40G qcow2 overlay that grows by the two 3 GiB images the guest pulls, and
+/// the restored VM images, with room for the other workflows that share the disk.
+const s2_free_gib_min = 30;
+const gib: u64 = 1 << 30;
+
+/// Before demo-s2 (the one demo whose disk use is large): prints `df -h` for the workspace and the
+/// VM cache and fails, with one line naming the shortfall, when either has under
+/// `s2_free_gib_min` free. Other demos are not checked: the box's bootstrap floor covers them.
+fn check_disk(ctx: *Ctx, steps: []const []const u8) !void {
+    var wanted = false;
+    for (steps) |step| wanted = wanted or std.mem.eql(u8, step, "demo-s2");
+    if (!wanted) return;
+    const cache = vm_cache_dir(ctx);
+    const paths: []const []const u8 = if (cache) |path| &.{ ".", path } else &.{"."};
+    for (paths) |path| {
+        wait_ok(ctx, &.{ "df", "-h", path }, .inherit) catch {};
+        const free = free_bytes(ctx, path) orelse continue;
+        if (free >= s2_free_gib_min * gib) continue;
+        ctx.say("demo-s2: {d} GiB free under {s}; it needs {d}", .{
+            free / gib, path, @as(u64, s2_free_gib_min),
+        });
+        return error.Reported;
+    }
+}
+
+/// Free bytes on the file system of `path`, from `df`; null if `df` cannot say (the check then
+/// stays out of the way).
+fn free_bytes(ctx: *Ctx, path: []const u8) ?u64 {
+    const argv: []const []const u8 = &.{ "df", "-B1", "--output=avail", path };
+    const result = std.process.run(ctx.gpa, ctx.io, .{ .argv = argv }) catch return null;
+    return parse_df_avail(result.stdout);
+}
+
+/// The number in `df -B1 --output=avail`'s output: a header line, then the bytes.
+fn parse_df_avail(text: []const u8) ?u64 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    _ = lines.next() orelse return null;
+    const line = std.mem.trim(u8, lines.next() orelse return null, " ");
+    return std.fmt.parseInt(u64, line, 10) catch null;
+}
+
+test "ci: df's available bytes are read, and anything else is no answer" {
+    // Goal: the disk check never invents a shortfall from output it cannot read. Method: the
+    // real shape of `df -B1 --output=avail`, then a missing number and an empty text.
+    try std.testing.expectEqual(@as(?u64, 12345), parse_df_avail("      Avail\n      12345\n"));
+    try std.testing.expectEqual(@as(?u64, null), parse_df_avail("Avail\n"));
+    try std.testing.expectEqual(@as(?u64, null), parse_df_avail("Avail\nnope\n"));
+    try std.testing.expectEqual(@as(?u64, null), parse_df_avail(""));
 }
 
 fn run_step(ctx: *Ctx, step: []const u8) !void {

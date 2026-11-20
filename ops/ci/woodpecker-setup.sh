@@ -10,9 +10,11 @@
 # before any pipeline of a pull request from a fork (or, with ZBX_CI_APPROVAL=all_events and
 # ZBX_CI_APPROVED_USERS, before every pipeline not from the listed logins; see the runbook),
 # cancel-previous for pushes and pull requests, and the 180-minute timeout; and it creates or updates the `github_token` secret that
-# deletes vmw/* branches. It asks for the Woodpecker token (User settings -> CLI & API) and the
-# GitHub token without echo; an empty GitHub token keeps the stored secret. Neither goes on a
-# command line: the header is a 0600 file and the secret's JSON comes from stdin.
+# deletes vmw/* branches. It asks for three tokens, none echoed or put on a command line: the
+# Woodpecker token (User settings -> CLI & API) of a Woodpecker admin, the GitHub token for the
+# secret (empty keeps the stored one), and a read-only GitHub token for its checks (below; it is
+# not stored). Before it changes anything it refuses unless main cannot be changed by any account
+# Woodpecker holds a token for, and at the end it refuses if one of them is a repository admin.
 set -euo pipefail
 
 repo_name="ZigboxOrg/zigbox"
@@ -53,27 +55,53 @@ api() { # api METHOD PATH [curl args...]: the response body on stdout; fails on 
 api GET /user >/dev/null ||
     fail "$server refused the Woodpecker token (log in again and copy a new one)"
 
-# --- main's protection ---------------------------------------------------------------------------
-# Any writer can run a privileged pipeline here (a push to vmw/* or a same-repo pull request needs
-# no approval), and the host holds the Woodpecker database with the activating admin's GitHub
-# token. The one control is that nobody, an admin included, can get past main's protection
-# (ops/ci/README.md, "What a writer can reach"). Needs `gh` logged in as someone who can read it.
-step "checking that nobody can bypass main's protection on $repo_name"
-prot=$(gh api "repos/$repo_name/branches/main/protection" 2>"$work/gh.err") ||
-    fail "cannot read main's protection ($(head -c 200 "$work/gh.err" | tr '\n' ' ')); log in with \
-'gh auth login' as an admin of $repo_name, and set the protection first (ops/ci/README.md)"
+# --- Who Woodpecker holds a token for, and main's protection -------------------------------------
+# Woodpecker keeps the GitHub OAuth token (scope `repo`) of every account that ever logged in, in
+# its database on this host, and any writer can run a privileged step here and read it
+# (ops/ci/README.md, "What a writer can reach"). A token can do what its account can. So the
+# control is on the accounts: none of them may be a repository admin (admins edit main's
+# protection and merge freely), and main may be pushed to, and merged into, only by the owner's
+# accounts, which Woodpecker has never seen. `gh` reads that with a token that is asked for here,
+# kept in this process only (a fine-grained token on this repository, Administration: read and
+# Metadata: read), so no admin credential stays on the box.
+if [ -n "${ZBX_CI_CHECK_TOKEN:-}" ]; then
+    check_token="$ZBX_CI_CHECK_TOKEN"
+else
+    read -rsp "GitHub token that may read this repository's protection and collaborators (not stored): " \
+        check_token </dev/tty
+    echo
+fi
+[ -n "$check_token" ] || fail "no GitHub token for the checks of main's protection"
+gh_read() { GH_TOKEN="$check_token" gh api "$@"; }
+
+step "listing the accounts Woodpecker holds a token for"
+logins=$(api GET /users | jq -r '.[].login') ||
+    fail "cannot list Woodpecker's users: the token must be a Woodpecker admin's (CI_ADMINS)"
+[ -n "$logins" ] || fail "Woodpecker lists no users"
+step "accounts with a stored token: $(paste -sd' ' <<<"$logins")"
+
+step "checking who can change main on $repo_name"
+prot=$(gh_read "repos/$repo_name/branches/main/protection" 2>"$work/gh.err") ||
+    fail "cannot read main's protection ($(head -c 200 "$work/gh.err" | tr '\n' ' ')): it is not \
+set, or the token cannot read it; ops/ci/README.md, 'Owner steps', has the command that sets it"
 jq -e '.enforce_admins.enabled == true' >/dev/null <<<"$prot" ||
-    fail "main's protection lets admins bypass it: set enforce_admins (ops/ci/README.md, \
-'What a writer can reach' has the gh api command)"
-jq -e '.required_pull_request_reviews != null' >/dev/null <<<"$prot" ||
-    fail "main's protection does not require pull requests: set it (ops/ci/README.md)"
-jq -e '(.required_pull_request_reviews.bypass_pull_request_allowances // {}
-        | [.users, .teams, .apps] | map(. // []) | add | length) == 0' >/dev/null <<<"$prot" ||
-    fail "main's protection has bypass_pull_request_allowances: remove every user, team and app \
-from it (ops/ci/README.md)"
+    fail "main's protection lets admins bypass it: set enforce_admins (ops/ci/README.md)"
+jq -e '.restrictions != null' >/dev/null <<<"$prot" ||
+    fail "main's protection does not restrict who can push or merge: set restrictions to the \
+owner's accounts (ops/ci/README.md); without it a writer's token merges its own pull request"
+jq -e '(.restrictions.teams | length) == 0' >/dev/null <<<"$prot" ||
+    fail "main's push restrictions name a team: list users only, so that this check can see who it is"
 jq -e '(.allow_force_pushes.enabled // false) == false and (.allow_deletions.enabled // false) == false' \
     >/dev/null <<<"$prot" ||
     fail "main's protection allows force pushes or deletion: turn both off (ops/ci/README.md)"
+allowed=$(jq -r '[.restrictions.users[].login] + [(.required_pull_request_reviews
+    .bypass_pull_request_allowances.users // [])[].login] | .[]' <<<"$prot")
+for login in $logins; do
+    if grep -qix "$login" <<<"$allowed"; then
+        fail "$login holds a token in Woodpecker and may push, merge or bypass on main: remove it from \
+main's restrictions (ops/ci/README.md); Woodpecker may only know accounts that cannot change main"
+    fi
+done
 
 # --- The repository ------------------------------------------------------------------------------
 repo_id=$(api GET "/repos/lookup/$repo_name" 2>/dev/null | jq -r '.id // empty' || true)
@@ -140,6 +168,22 @@ want='.active == true and .trusted.security == true and .trusted.volumes == true
 jq -e --arg a "$approval" "$want" >/dev/null <<<"$settings" ||
     fail "the settings did not stick: $(jq -c '{active, trusted, require_approval, approval_allowed_users, timeout,
         cancel_previous_pipeline_events}' <<<"$settings")"
+# An admin can edit main's protection with the token Woodpecker stores. The repository can only be
+# turned on by an admin, so the run that turns it on may meet one: it warns and says what to do; every
+# other run refuses.
+admins=""
+for login in $logins; do
+    perm=$(gh_read "repos/$repo_name/collaborators/$login/permission" --jq .permission 2>/dev/null ||
+        echo unknown)
+    [ "$perm" = admin ] && admins="$admins $login"
+done
+if [ -n "$admins" ]; then
+    msg="Woodpecker holds the token of an admin of $repo_name:$admins. Make it write: gh api -X PUT \
+repos/$repo_name/collaborators/LOGIN -f permission=write (ops/ci/README.md, 'Owner steps', step 5)"
+    [ "$active" != true ] || fail "$msg"
+    echo "ci-setup: WARNING $msg; this run turned the repository on, which needs an admin. Do it \
+now and run this script again: it refuses to finish while an admin is known here."
+fi
 has_secret=no
 api GET "/repos/$repo_id/secrets/github_token" >/dev/null 2>&1 && has_secret=yes
 echo "ci-setup: OK $repo_name (id $repo_id): $(jq -c '{trusted, require_approval, approval_allowed_users, timeout,

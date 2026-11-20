@@ -22,8 +22,24 @@ Why it is accepted:
 - `all_events` would hold the owner's own `vmw/*` pushes unless the owner's login is allowed, and the
   sessions push as the owner, so it would add clicks and stop only a second writer, who does not
   exist.
-- `main`'s protection, which nobody can bypass (checked by `woodpecker-setup.sh`), keeps the
-  activating admin's OAuth token from changing `main`.
+- **Correction (2026-11-20, round-4 review).** This bullet used to say that `main`'s protection,
+  which nobody can bypass (checked by `woodpecker-setup.sh`), keeps the activating admin's OAuth
+  token from changing `main`. That was false, and the acceptance above does not rest on it. What
+  is true: the forge is GitHub, and Woodpecker's database holds the OAuth token (scope `repo`) of
+  every account that ever logged in, the activating admin's included. Checked the same day as a
+  repository admin, `main` has no protection and no ruleset at all, so today such a token pushes
+  to `main` or deletes it. The protection the runbook prescribed (pull requests required with zero
+  approvals, no required checks, `enforce_admins`) would not have stopped it either: an admin can
+  edit the protection, and any writer can open and merge its own pull request. Required approvals
+  are ruled out (the supervisor merges from the author's account), and a required status check
+  can be forged or satisfied by the pull request's own workflow. What does hold, and what the
+  repository now carries: Woodpecker knows only a dedicated bot account with the `write` role,
+  `main` accepts pushes and merges only from the owner's accounts (classic branch protection with
+  push restrictions and `enforce_admins`), and the owner's accounts never log in to Woodpecker.
+  `ops/ci/owner-github.sh` sets the GitHub side, `ops/ci/woodpecker-setup.sh` checks it (every
+  stored account, `main`'s restrictions) and refuses while an admin is stored; the owner's steps
+  are `ops/ci/README.md`, 3a. Until the owner has run them, `main` is unprotected and this box
+  holds an admin's token: that is the owner's to close, and the approval choice above is unchanged.
 
 If write access ever widens (a collaborator, a team, a bot, an app with `contents: write`), this
 decision no longer holds. Before the new writer gets access, switch to
@@ -41,11 +57,15 @@ the demo pulling the two Python images on every run.
 `src/testing/vm/cache.zig` now replaces a stored entry, atomically and under the store's existing
 lock, when it is no use:
 
-- its hash list is missing or unreadable (any entry, whether or not the run passed);
+- its hash list is missing or unreadable (any entry, whether or not the run passed, except a
+  `grows` entry, which only a passing run touches);
 - for an entry the demo writes into (`grows`, only the m4 blob image), when a run whose steps all
   passed leaves files that differ by SHA-256 from the stored ones. A failed run does not replace
-  it, since it may leave a half-written image;
-- a copy that fails its hash on restore was already deleted and is stored again by the next save.
+  it, since it may leave a half-written image, and an absent key is stored for it only by a
+  passing run for the same reason;
+- a copy that fails its hash on restore is deleted, and only that copy (restore takes no lock, so
+  the drop checks under the lock that the key still holds the directory it read, by inode, and
+  leaves a copy a save put there since), and is stored again by the next save.
 
 The replacement writes the new entry under a temporary name, renames the old key aside, renames the
 new one to the key and deletes the old one, all while holding the store's lock, so concurrent saves

@@ -122,10 +122,14 @@ addrs=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1)
 grep -qx "$resolved" <<<"$addrs" ||
     fail "$CI_HOST points at $resolved, which is not this box ($(paste -sd' ' <<<"$addrs"))"
 free_gb=$(df -BG --output=avail /var/lib | tail -1 | tr -dc 0-9)
-[ "$free_gb" -ge 100 ] || fail "/var/lib has ${free_gb} GiB free; the VM images and caches need 100"
+# The runbook's steady state (ops/ci/README.md, "Disk"): up to about 75 GiB of VM entries and five
+# Zig caches of 30 GiB each (225 GiB), then Docker workspaces and demo-s2's overlay on top.
+free_min_gb=250
+[ "$free_gb" -ge "$free_min_gb" ] ||
+    fail "/var/lib has ${free_gb} GiB free; the VM images and caches need $free_min_gb"
 
 # --- Packages ------------------------------------------------------------------------------------
-pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl git jq qemu-system-x86
+pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl gh git jq qemu-system-x86
     qemu-utils)
 missing=()
 for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
