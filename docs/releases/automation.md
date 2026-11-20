@@ -21,6 +21,28 @@ Two rules shape the flow:
 - **No release job runs on a person's machine.** Signing and notarization run on GitHub-hosted
   macOS runners, each a fresh virtual machine that is gone when the job ends.
 
+## The extended fuzz run, in shards
+
+A release's fuzz line is every fuzzer at 100 times the per-commit default (`fuzz_iterations_default`,
+10,000), so 1,000,000 iterations each. One process does not finish that inside a session, and one
+lost run cost 0.5.3 about 3.5 hours ([retro](../retros/0.5.3.md)). Cut it into N shards instead,
+N at least 4, each its own job or session, run in parallel:
+
+```
+zig build fuzz -- shard I N 1000000        # for I = 1 .. N
+```
+
+Shard I runs every fuzzer, each with a fresh seed (the `fuzz: <name> seed=.. iterations=..` line
+before it starts names the replay), for its share of the 1,000,000 iterations: the shares differ by
+at most one and add up to exactly 1,000,000, so the slow fuzzers (`provenance`, `lazy_resolver`)
+are cut N ways like every other and no shard is dominated by one. Each shard ends with one line,
+`fuzz: shard I/N ok <fuzzers> fuzzers <share> iterations each`.
+
+To combine: the run passes when the N shards of one commit and one N each printed that line, once
+each (I = 1 .. N, none repeated, none missing). A shard that died is rerun alone with the same
+command; its seeds are fresh, which only adds coverage. Quote in the release PR the commit, N, and
+the N lines; replay a failure with the `fuzz: <name> seed=..` line before it.
+
 ## The flow
 
 One workflow, `release.yml`, one run, a `needs:` chain. `tag.yml` is gone.

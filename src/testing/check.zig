@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
     const porcelain = [_][]const u8{ "git", "status", "--porcelain", "--untracked-files=no" };
     const status = try output(gpa, io, &porcelain);
     const dirty: []const u8 = if (status.len > 0) "+dirty" else "";
-    run_shown(io, &.{ fuzz, "all" }, null, .inherit) catch {
+    run_fuzz_shards(gpa, io, err, fuzz) catch {
         try err.print("check: FAIL {s}{s} (a fuzzer: its seed is the last line above)\n", .{
             commit, dirty,
         });
@@ -127,6 +127,46 @@ pub fn main(init: std.process.Init) !u8 {
         commit, dirty, tail,
     });
     return 0;
+}
+
+/// How many shards `check` cuts the fuzz run into, side by side: the slowest fuzzers
+/// (`provenance`, `lazy_resolver`) are two thirds of an unsharded run, so a shard of every fuzzer
+/// finishes in about a quarter of it.
+const fuzz_shards = 4;
+
+/// Runs `fuzz shard I N` for every I at once, each with its output in a file of its own so one
+/// shard's seed lines are not mixed with another's; shows the log of each shard that failed.
+fn run_fuzz_shards(gpa: std.mem.Allocator, io: Io, err: *Io.Writer, fuzz: []const u8) !void {
+    var children: [fuzz_shards]std.process.Child = undefined;
+    var logs: [fuzz_shards][]const u8 = undefined;
+    var spawned: usize = 0;
+    errdefer for (children[0..spawned]) |*child| child.kill(io);
+    for (0..fuzz_shards) |index| {
+        logs[index] = try std.fmt.allocPrint(gpa, ".zig-cache/check-fuzz-{d}.log", .{index + 1});
+        const log = try Io.Dir.cwd().createFile(io, logs[index], .{});
+        defer log.close(io);
+        const number = try std.fmt.allocPrint(gpa, "{d}", .{index + 1});
+        const count = try std.fmt.allocPrint(gpa, "{d}", .{fuzz_shards});
+        children[index] = try std.process.spawn(io, .{
+            .argv = &.{ fuzz, "shard", number, count },
+            .stdout = .{ .file = log },
+            .stderr = .{ .file = log },
+        });
+        spawned += 1;
+    }
+    var failed = false;
+    for (0..fuzz_shards) |index| {
+        const term = try children[index].wait(io);
+        const ok = switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (ok) continue;
+        failed = true;
+        const text = Io.Dir.cwd().readFileAlloc(io, logs[index], gpa, .limited(1 << 20)) catch "";
+        try err.print("--- fuzz shard {d}/{d}\n{s}\n", .{ index + 1, fuzz_shards, text });
+    }
+    if (failed) return error.CommandFailed;
 }
 
 /// Says so when `.zig-cache/o` is past `cache_note_bytes`. Every rebuild of a changed binary

@@ -1195,7 +1195,7 @@ fn find_fuzzer(name: []const u8) ?*const Fuzzer {
     return null;
 }
 
-const UsageError = error{ NoFuzzer, UnknownFuzzer, BadSeed, BadIterations, TooManyArguments };
+const UsageError = error{ NoFuzzer, UnknownFuzzer, BadSeed, BadIterations, TooManyArguments, BadShard };
 
 fn parse_arguments(arguments: []const []const u8) UsageError!Parsed {
     if (arguments.len == 0) return error.NoFuzzer;
@@ -1245,6 +1245,9 @@ pub fn main(init: std.process.Init) u8 {
             return constants.tool_exit_usage;
         };
         return run_all(init.io, seeds, skip, arguments_storage[2..count]);
+    }
+    if (count >= 1 and std.mem.eql(u8, arguments_storage[0], "shard")) {
+        return run_shard(init.io, seeds, arguments_storage[1..count]);
     }
     const parsed = parse_arguments(arguments_storage[0..count]) catch |err| {
         print_usage(out, err) catch {};
@@ -1325,16 +1328,86 @@ fn run_all(io: std.Io, seeds: Seeds, skip: ?*const Fuzzer, arguments: []const []
     return constants.tool_exit_ok;
 }
 
+/// One shard's share of `total` iterations when `shards` shards split it: the first
+/// `total % shards` shards take one more, so the shares add up to `total` exactly.
+fn shard_share(total: u32, shards: u32, index: u32) u32 {
+    assert(shards > 0);
+    assert(index < shards);
+    const share = total / shards + @intFromBool(index < total % shards);
+    assert(share <= total);
+    return share;
+}
+
+/// `fuzz shard <I> <N> [iterations]` (I from 1 to N): every fuzzer, each with a fresh seed, for
+/// shard I's share of `iterations` (default `fuzz_check_iterations`). The N shards together run
+/// every fuzzer for exactly `iterations` iterations, so a slow fuzzer (`provenance`,
+/// `lazy_resolver`) is cut N ways and no shard is dominated by one: the shards can run in
+/// parallel, as separate jobs or processes, and the run passes only if every shard prints its
+/// `fuzz: shard I/N ok` line. A lost shard is rerun alone with the same command.
+fn run_shard(io: std.Io, seeds: Seeds, arguments: []const []const u8) u8 {
+    assert(fuzzers.len > 0);
+    const out = seeds.out;
+    const bad = constants.tool_exit_usage;
+    if (arguments.len < 2 or arguments.len > 3) {
+        print_usage(out, error.BadShard) catch {};
+        return bad;
+    }
+    const index = std.fmt.parseInt(u32, arguments[0], 10) catch 0;
+    const shards = std.fmt.parseInt(u32, arguments[1], 10) catch 0;
+    var iterations = constants.fuzz_check_iterations;
+    if (arguments.len == 3) iterations = std.fmt.parseInt(u32, arguments[2], 10) catch 0;
+    const shard_ok = shards >= 1 and shards <= constants.fuzz_shards_max;
+    if (!shard_ok or index < 1 or index > shards) {
+        print_usage(out, error.BadShard) catch {};
+        return bad;
+    }
+    if (iterations < shards or iterations > constants.fuzz_iterations_max) {
+        print_usage(out, error.BadIterations) catch {};
+        return bad;
+    }
+    const share = shard_share(iterations, shards, index - 1);
+    assert(share > 0);
+    for (&fuzzers) |*fuzzer| {
+        var entropy: [8]u8 = undefined;
+        io.random(&entropy);
+        const seed = std.mem.readInt(u64, &entropy, .little);
+        seeds.announce(fuzzer.name, seed, share) catch return constants.tool_exit_failed;
+        var splitmix = std.Random.SplitMix64.init(seed);
+        for (0..share) |_| fuzzer.run_iteration(splitmix.next());
+    }
+    out.print("fuzz: shard {d}/{d} ok {d} fuzzers {d} iterations each\n", .{
+        index, shards, fuzzers.len, share,
+    }) catch return constants.tool_exit_failed;
+    out.flush() catch return constants.tool_exit_failed;
+    return constants.tool_exit_ok;
+}
+
 fn print_usage(out: *std.Io.Writer, err: UsageError) !void {
     assert(@errorName(err).len > 0);
     assert(fuzzers.len > 0);
     const usage = "usage: zig build fuzz -- <fuzzer> [seed] [iterations] | all [iterations]" ++
-        " | all-but <fuzzer> [iterations]";
+        " | all-but <fuzzer> [iterations] | shard <I> <N> [iterations]";
     try out.print("fuzz: {s}\n{s}\n", .{ @errorName(err), usage });
     try out.writeAll("fuzzers:");
     for (fuzzers) |fuzzer| try out.print(" {s}", .{fuzzer.name});
     try out.writeAll("\n");
     try out.flush();
+}
+
+test "shard shares add up to the iterations and differ by at most one" {
+    // Goal: N shards together run exactly the iterations asked, for any split.
+    for ([_]u32{ 1, 2, 3, 4, 7, 16 }) |shards| {
+        for ([_]u32{ 16, 2000, 10_001, 1_000_000 }) |total| {
+            var sum: u32 = 0;
+            for (0..shards) |index| {
+                const share = shard_share(total, shards, @intCast(index));
+                try std.testing.expect(share >= total / shards);
+                try std.testing.expect(share <= total / shards + 1);
+                sum += share;
+            }
+            try std.testing.expectEqual(total, sum);
+        }
+    }
 }
 
 test "parse_arguments accepts the documented forms and refuses the rest" {
