@@ -126,7 +126,16 @@ if want key && confirm key "make a NEW Zigbox release key and give it to the rel
         [ -n "$sub" ] || fail "the key $key has no signing subkey"
         echo "The offline backup and the revocation certificate go straight to removable media,"
         echo "never this disk. Plug in a USB stick (later: a second copy, kept elsewhere)."
-        ask media "Directory on that media (e.g. /Volumes/OFFLINE)"
+        [ -d /Volumes ] && echo "Mounted volumes: $(ls /Volumes | tr '\n' ' ')"
+        ask media "Full path of a directory on that media (e.g. /Volumes/OFFLINE/Keys)"
+        case "$media" in
+            /*) ;;
+            *) fail "$media is not a full path: give one from /, e.g. /Volumes/OFFLINE/Keys" ;;
+        esac
+        if [ ! -d "$media" ] && [ -d "$(dirname "$media")" ]; then
+            ask make "$media does not exist. Create it? [y/N]"
+            case "$make" in y | Y) mkdir "$media" ;; esac
+        fi
         [ -d "$media" ] && [ -w "$media" ] || fail "$media is not a writable directory"
         if [ ! -s "$media/zigbox-primary-backup.asc" ]; then
             gpg --armor --export-secret-keys "$key" > "$media/zigbox-primary-backup.asc"
