@@ -112,11 +112,20 @@ const rules = [_]Rule{
     } },
     // demo-m6d's gate on the owner's Google setup runs in its job alone.
     .{ .patterns = &.{".github/actions/m6d-setup/*"}, .only = &.{"m6d"} },
-    // What the harness, the build or CI itself is made of: every demo.
+    // The driver's own tests never reach a demo (before the next rule, which takes src/ci/*).
+    .{ .patterns = &.{"src/ci/*_tests.zig"} },
+    // What the harness, the build or CI itself is made of: every demo. The CI driver
+    // (src/ci_main.zig, src/ci/*) decides which demo runs and how, and cache.zig what a demo's
+    // guest starts from; .woodpecker/* and the step image are the pipelines themselves.
     .{ .patterns = &.{
         "build.zig",
         "build.zig.zon",
         ".github/*",
+        ".woodpecker/*",
+        "ops/ci/image/*",
+        "src/ci_main.zig",
+        "src/ci/*",
+        "src/testing/vm/cache.zig",
         "vm/*",
         "src/testing/vm/lib/*",
         "src/testing/vm/alpine.zon",
@@ -137,7 +146,7 @@ const rules = [_]Rule{
         "src/testing/vm/*m8_packages*",
     }, .kind = .packages },
     // Not part of any CI demo: the Mac build, the weekly top-20 run, the Z7 check, packaging,
-    // docs and the site, and CI's own driver (it never reaches the zbx binary a demo runs).
+    // docs and the site.
     .{ .patterns = &.{
         "src/mac/*",
         "src/macos_main.zig",
@@ -147,9 +156,6 @@ const rules = [_]Rule{
         "src/testing/vm/*z7*",
         "src/testing/vm/*s2_probe*",
         "src/testing/vm/*m2b_probe*",
-        "src/ci_main.zig",
-        "src/ci/*",
-        "src/testing/vm/cache.zig",
         "LICENSE",
         "docs/*",
         "site/*",
@@ -334,6 +340,8 @@ fn label_present(labels: []const u8, wanted: []const u8) bool {
 
 /// True when the event, the branch or the labels ask for everything, whatever the paths say.
 fn runs_everything(inputs: *const Inputs) bool {
+    // Any other event runs everything: a push to main, a manual run, and Woodpecker's
+    // `pull_request_metadata` (a label added, so `full-ci`; it carries no changed paths).
     if (!std.mem.eql(u8, inputs.event, "pull_request")) return true;
     if (std.mem.startsWith(u8, inputs.head_ref, "claude/release-")) return true;
     if (label_present(inputs.labels, "full-ci")) return true;

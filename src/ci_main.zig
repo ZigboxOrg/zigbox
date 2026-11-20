@@ -1,22 +1,26 @@
 //! `ci`: what the self-hosted CI (Woodpecker, `.woodpecker/`) and ci.yml's `changes` job run. It
 //! is the build's, not the YAML's: `zig build ci-changes`, `ci-build`, `ci-tidy`, `ci-test`,
-//! `ci-errors-site`, `ci-fuzz`, `ci-fuzz-provenance`, `ci-dbus-live`, `ci-demos` and `vm-branch`
-//! run this program with the build's own `zig` (docs/decisions/2026-11-19-ci-on-woodpecker.md).
+//! `ci-errors-site`, `ci-fuzz`, `ci-fuzz-provenance`, `ci-dbus-live`, `ci-demos`, `vm-branch` and
+//! `vm-branch-delete` run this program with the build's own `zig`
+//! (docs/decisions/2026-11-19-ci-on-woodpecker.md).
 //!
 //!   ci --zig ZIG changes                 print (and with --output append) the decision
 //!   ci --zig ZIG gate NAME               run one gate if the change touches code
 //!   ci --zig ZIG demos [--demo ID]       run the demos the change can affect, or one if it can
-//!   ci --zig ZIG vm-branch vm/DEMO-SLUG  run that scratch branch's demos, then delete the branch
+//!   ci --zig ZIG vm-branch vm/DEMO-SLUG  run that scratch branch's demos
+//!   ci --zig ZIG delete-branch vm/D-SLUG delete that scratch branch (its own step, which alone
+//!                                        gets `GITHUB_TOKEN`)
 //!
 //! Every command takes the change: `--event`, `--branch`, `--labels`, and the changed paths as
-//! `--files TEXT` (one per line), `--files-json JSON` or `--stdin`; each falls back to Woodpecker's
+//! `--files TEXT` (one per line), `--files-from FILE` (one per line; for long lists, as Linux caps
+//! one argument at 128 KiB), `--files-json JSON` or `--stdin`; each falls back to Woodpecker's
 //! `CI_PIPELINE_EVENT`, `CI_COMMIT_SOURCE_BRANCH`, `CI_COMMIT_PULL_REQUEST_LABELS` and
 //! `CI_PIPELINE_FILES`. The rules are `ci/changes.zig`. Other flags: `--accel` (default kvm),
 //! `--vm-cache DIR` (or `ZBX_VM_CACHE`; testing/vm/cache.zig), `--output FILE`, `--repo OWNER/NAME`
-//! and `--api-url URL` (vm-branch). Environment: `GITHUB_TOKEN` (vm-branch); `ZBX_CI_USER`, when
-//! this runs as root, runs the work as that user with `ZBX_CI_USER_ZIG_CACHE` as its Zig cache
-//! (the box's steps run as root in the workspace; the work runs as an ordinary user, as on GitHub's
-//! runners, and the workspace is handed to that user first).
+//! and `--api-url URL` (delete-branch). Environment: `GITHUB_TOKEN` (delete-branch);
+//! `ZBX_CI_USER`, when this runs as root, runs the work as that user with `ZBX_CI_USER_ZIG_CACHE`
+//! as its Zig cache (the box's steps run as root in the workspace; the work runs as an ordinary
+//! user, as on GitHub's runners, and the workspace is handed to that user first).
 //!
 //! A gate or demo the change cannot affect prints one line saying so and passes. Build-host
 //! tooling: it spawns `zig`, `runuser` and `chown` and never touches the host otherwise.
@@ -36,6 +40,7 @@ const Args = struct {
     labels: ?[]const u8 = null,
     files: ?[]const u8 = null,
     files_json: ?[]const u8 = null,
+    files_from: ?[]const u8 = null,
     stdin: bool = false,
     output: ?[]const u8 = null,
     demo: ?[]const u8 = null,
@@ -59,8 +64,9 @@ const Ctx = struct {
 };
 
 const usage_text =
-    "usage: ci --zig ZIG changes | gate NAME | demos [--demo ID] | vm-branch vm/DEMO-SLUG " ++
-    "[--event E] [--branch B] [--labels L] [--files TEXT | --files-json JSON | --stdin] " ++
+    "usage: ci --zig ZIG changes | gate NAME | demos [--demo ID] | vm-branch vm/DEMO-SLUG | " ++
+    "delete-branch vm/DEMO-SLUG [--event E] [--branch B] [--labels L] " ++
+    "[--files TEXT | --files-from FILE | --files-json JSON | --stdin] " ++
     "[--accel A] [--vm-cache DIR] [--output FILE] [--repo OWNER/NAME] [--api-url URL]\n";
 
 pub fn main(init: std.process.Init) !u8 {
@@ -82,11 +88,25 @@ pub fn main(init: std.process.Init) !u8 {
         .out = &writer.interface,
     };
     const status = run_command(&ctx) catch |err| {
-        ctx.say("{s}: {s}", .{ args.command, @errorName(err) });
+        // `error.Reported`: the line saying what was refused and why is already out.
+        if (err != error.Reported) ctx.say("{s}: {s}", .{ args.command, describe(err) });
         return 1;
     };
     try writer.interface.flush();
     return status;
+}
+
+/// One line for an error nothing below has explained.
+fn describe(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Usage => "missing or unexpected argument (see the usage line)",
+        error.OutOfMemory => "out of memory",
+        error.StreamTooLong, error.FileTooBig => "the list of changed paths is over 1 MiB",
+        error.FileNotFound => "a file it needs is missing",
+        error.AccessDenied, error.PermissionDenied => "permission denied on a file it needs",
+        error.NoSpaceLeft, error.DiskQuota => "no disk space left",
+        else => @errorName(err),
+    };
 }
 
 fn parse_args(arguments: anytype, args: *Args) !void {
@@ -110,12 +130,13 @@ fn parse_args(arguments: anytype, args: *Args) !void {
 
 fn set_flag(args: *Args, flag: []const u8, value: []const u8) !void {
     const names = .{
-        .{ "--zig", "zig" },         .{ "--event", "event" },
-        .{ "--branch", "branch" },   .{ "--labels", "labels" },
-        .{ "--files", "files" },     .{ "--files-json", "files_json" },
-        .{ "--output", "output" },   .{ "--demo", "demo" },
-        .{ "--accel", "accel" },     .{ "--vm-cache", "vm_cache" },
-        .{ "--api-url", "api_url" }, .{ "--repo", "repo" },
+        .{ "--zig", "zig" },               .{ "--event", "event" },
+        .{ "--branch", "branch" },         .{ "--labels", "labels" },
+        .{ "--files", "files" },           .{ "--files-json", "files_json" },
+        .{ "--output", "output" },         .{ "--demo", "demo" },
+        .{ "--accel", "accel" },           .{ "--vm-cache", "vm_cache" },
+        .{ "--api-url", "api_url" },       .{ "--repo", "repo" },
+        .{ "--files-from", "files_from" },
     };
     inline for (names) |pair| {
         if (std.mem.eql(u8, flag, pair[0])) {
@@ -132,6 +153,7 @@ fn run_command(ctx: *Ctx) !u8 {
     if (std.mem.eql(u8, command, "gate")) return cmd_gate(ctx);
     if (std.mem.eql(u8, command, "demos")) return cmd_demos(ctx);
     if (std.mem.eql(u8, command, "vm-branch")) return cmd_vm_branch(ctx);
+    if (std.mem.eql(u8, command, "delete-branch")) return cmd_delete_branch(ctx);
     try ctx.out.writeAll(usage_text);
     return 2;
 }
@@ -160,15 +182,37 @@ fn paths_of_json(gpa: std.mem.Allocator, text: []const u8) ![]const []const u8 {
 fn paths_of_stdin(ctx: *Ctx) ![]const []const u8 {
     var buffer: [4096]u8 = undefined;
     var reader = Io.File.stdin().reader(ctx.io, &buffer);
-    const text = try reader.interface.allocRemaining(ctx.gpa, .limited(1 << 20));
+    const text = try reader.interface.allocRemaining(ctx.gpa, .limited(paths_bytes_max));
     return lines_of(ctx.gpa, text);
 }
 
+/// The bound on a list of changed paths, read from a file or stdin.
+const paths_bytes_max = 1 << 20;
+
 fn change_paths(ctx: *Ctx) ![]const []const u8 {
     if (ctx.args.files) |text| return lines_of(ctx.gpa, text);
-    if (ctx.args.files_json) |text| return paths_of_json(ctx.gpa, text);
+    if (ctx.args.files_from) |path| {
+        const limit: Io.Limit = .limited(paths_bytes_max);
+        const text = Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.gpa, limit) catch |err| {
+            ctx.say("cannot read the changed paths from {s}: {s}", .{ path, describe(err) });
+            return error.Reported;
+        };
+        return lines_of(ctx.gpa, text);
+    }
     if (ctx.args.stdin) return paths_of_stdin(ctx);
-    return paths_of_json(ctx.gpa, ctx.env.get("CI_PIPELINE_FILES") orelse "");
+    var json: []const u8 = ctx.env.get("CI_PIPELINE_FILES") orelse "";
+    var source: []const u8 = "CI_PIPELINE_FILES";
+    if (ctx.args.files_json) |text| {
+        json = text;
+        source = "--files-json";
+    }
+    return paths_of_json(ctx.gpa, json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            ctx.say("{s} is not a JSON array of paths, so nothing is decided", .{source});
+            return error.Reported;
+        },
+    };
 }
 
 fn decide(ctx: *Ctx) !changes.Decision {
@@ -231,18 +275,29 @@ fn append_user_prefix(ctx: *Ctx, full: *std.ArrayList([]const u8), user: []const
     try full.append(gpa, try std.fmt.allocPrint(gpa, "ZIG_LOCAL_CACHE_DIR={s}/local", .{cache}));
 }
 
+/// Runs `argv` and fails, with one line saying so, unless it exits 0.
 fn wait_ok(ctx: *Ctx, argv: []const []const u8, stdout: std.process.SpawnOptions.StdIo) !void {
-    var child = try std.process.spawn(ctx.io, .{
+    var child = std.process.spawn(ctx.io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = stdout,
         .stderr = .inherit,
-    });
-    switch (try child.wait(ctx.io)) {
-        .exited => |code| if (code == 0) return,
-        else => {},
+    }) catch |err| {
+        ctx.say("could not start {s}: {s}", .{ argv[0], describe(err) });
+        return error.Reported;
+    };
+    const term = child.wait(ctx.io) catch |err| {
+        ctx.say("lost {s} while waiting for it: {s}", .{ argv[0], describe(err) });
+        return error.Reported;
+    };
+    switch (term) {
+        .exited => |code| {
+            if (code == 0) return;
+            ctx.say("{s} exited with status {d}", .{ argv[0], code });
+        },
+        else => ctx.say("{s} was ended by a signal", .{argv[0]}),
     }
-    return error.CommandFailed;
+    return error.Reported;
 }
 
 /// Hands the workspace to the work's user (a checkout made by root is not theirs to write).
@@ -366,8 +421,14 @@ fn run_steps(ctx: *Ctx, steps: []const []const u8) !u8 {
     defer if (store) |dir| dir.close(ctx.io);
     var cache: cache_store.Cache = undefined;
     if (vm_cache_dir(ctx)) |path| {
-        try Io.Dir.cwd().createDirPath(ctx.io, path);
-        store = try Io.Dir.cwd().openDir(ctx.io, path, .{});
+        Io.Dir.cwd().createDirPath(ctx.io, path) catch |err| {
+            ctx.say("the VM cache directory {s} cannot be created: {s}", .{ path, describe(err) });
+            return error.Reported;
+        };
+        store = Io.Dir.cwd().openDir(ctx.io, path, .{}) catch |err| {
+            ctx.say("the VM cache directory {s} cannot be opened: {s}", .{ path, describe(err) });
+            return error.Reported;
+        };
         cache = .{ .io = ctx.io, .workspace = Io.Dir.cwd(), .store = store.?, .log = ctx.out };
         cache_store.restore(&cache, &cache_store.entries);
     }
@@ -403,16 +464,25 @@ fn cmd_vm_branch(ctx: *Ctx) !u8 {
     }
     const plan = demos.plan_for_branch(branch["vm/".len..]) orelse {
         ctx.say("branch {s} names no demo (vm/<demo>-<slug>; see ci/demos.zig)", .{branch});
-        delete_branch(ctx, branch);
         return 1;
     };
-    var status: u8 = 0;
     switch (plan) {
-        .run => |steps| status = try run_steps(ctx, steps),
+        .run => |steps| return run_steps(ctx, steps),
         .not_run => |why| ctx.say("{s}: NOT RUN ({s})", .{ branch, why }),
     }
+    return 0;
+}
+
+/// The pipeline's last step, run whatever the demos did: deletes the scratch branch. Only this
+/// step is given `GITHUB_TOKEN`, so the demo steps (privileged) never hold it.
+fn cmd_delete_branch(ctx: *Ctx) !u8 {
+    const branch = ctx.args.positional orelse return error.Usage;
+    if (!std.mem.startsWith(u8, branch, "vm/")) {
+        ctx.say("not deleting {s}: only vm/<demo>-<slug> scratch branches are deleted", .{branch});
+        return 1;
+    }
     delete_branch(ctx, branch);
-    return status;
+    return 0;
 }
 
 /// Deletes `branch` through the GitHub REST API; says what happened and never fails: with no
@@ -428,7 +498,9 @@ fn delete_branch(ctx: *Ctx, branch: []const u8) void {
         return;
     };
     const status = request_delete(ctx, repo, branch, token) catch |err| {
-        ctx.say("could not delete {s}: {s}", .{ branch, @errorName(err) });
+        ctx.say("could not delete {s}: the request to GitHub failed ({s})", .{
+            branch, @errorName(err),
+        });
         return;
     };
     switch (status) {

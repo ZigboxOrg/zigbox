@@ -1,8 +1,8 @@
 //! Tests of ci/changes.zig, which decides what CI runs (it replaced .github/ci-changes.sh, and
-//! these rows are that script's table test, unchanged). Each row names changed paths and the
-//! outputs that must come out true; `decide` runs on those paths as a pull request with no label,
-//! `write_outputs` renders the result, and every output line is checked: true exactly for the
-//! named outputs, false for the rest.
+//! these rows are that script's table test, plus rows for the Zig driver and the Woodpecker
+//! files). Each row names changed paths and the outputs that must come out true; `decide` runs on
+//! those paths as a pull request with no label, `write_outputs` renders the result, and every
+//! output line is checked: true exactly for the named outputs, false for the rest.
 
 const std = @import("std");
 const testing = std.testing;
@@ -148,6 +148,77 @@ const rows = [_]Row{
             "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
             "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
         },
+    },
+    // The CI driver decides which demo runs and how: every demo and the packages demo.
+    .{
+        .paths = &.{"src/ci_main.zig"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    .{
+        .paths = &.{"src/ci/demos.zig"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    .{
+        .paths = &.{"src/ci/changes.zig"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    // The VM image cache decides what each guest starts from.
+    .{
+        .paths = &.{"src/testing/vm/cache.zig"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    // The Woodpecker pipelines and the step image are CI itself.
+    .{
+        .paths = &.{".woodpecker/demos.yaml"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    .{
+        .paths = &.{".woodpecker/check.yaml"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    .{
+        .paths = &.{"ops/ci/image/Dockerfile"},
+        .true_outputs = &.{
+            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+        },
+    },
+    // The driver's own tests reach no demo.
+    .{
+        .paths = &.{"src/ci/changes_tests.zig"},
+        .true_outputs = &.{"code"},
     },
     // The runtime every demo runs on selects every VM demo, not the packages demo.
     .{
