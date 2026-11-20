@@ -479,6 +479,10 @@ pub const scope_keeper_tasks: u32 = 1;
 /// the pipe, so one read that waits for the end of file is the whole life of a keeper; the bound
 /// is for interrupted reads and for a pipe that someone writes to by mistake.
 pub const keeper_reads_max: u32 = 4096;
+/// Interrupted waits for a keeper's process: the keeper's wait for its member, and zbx's reap of
+/// a keeper whose start failed (after a SIGKILL, so it ends at once). One wait normally does; the
+/// bound is for interruptions.
+pub const keeper_waits_max: u32 = 4096;
 /// The stack of the keeper's member (`Host.start_keeper`), the vfork child that runs in the
 /// keeper's memory: it makes a handful of system calls, so a small one is plenty, and an
 /// untouched static array costs zbx nothing.

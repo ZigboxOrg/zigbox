@@ -499,6 +499,10 @@ pub const World = struct {
     /// Faults for the keeper: forking it fails with this errno; it ends by itself (as if
     /// something killed it) the moment its scope has started.
     keeper_fork_errno: ?u16,
+    /// The keeper forked, but its clone of its member failed with this errno (EAGAIN: the
+    /// keeper is two processes of the user's limit, and the second was refused). The real host
+    /// kills and reaps that keeper itself before the start fails, so nothing is left behind.
+    keeper_member_errno: ?u16,
     keeper_dies_early: bool,
     /// The OOM killer, having killed the command, kills again in the same cgroup before zbx
     /// reaps it (a second process of the command was still charging) and picks the scope's
@@ -619,6 +623,7 @@ pub const World = struct {
         world.cgroup_stays = false;
         world.ended_memory_max = null;
         world.keeper_fork_errno = null;
+        world.keeper_member_errno = null;
         world.keeper_dies_early = false;
         world.oom_takes_keeper = false;
         world.keepers_started = 0;

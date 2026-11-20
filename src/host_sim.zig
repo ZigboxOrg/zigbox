@@ -951,6 +951,8 @@ pub const HostSim = struct {
         const sim = from_context(context);
         try sim.begin_call();
         if (sim.world.keeper_fork_errno) |errno| return sim.model_error(errno);
+        // The keeper started and failed; the real host reaps it before it returns.
+        if (sim.world.keeper_member_errno) |errno| return sim.model_error(errno);
         return sim.world.start_keeper(hold) orelse sim.model_error(11);
     }
 

@@ -23,4 +23,10 @@ Rejected:
 - Lowering the keeper's `oom_score_adj`: an unprivileged process cannot.
 - Retrying the read of `memory.events` after the scope is gone: the counters go with the cgroup.
 
-`TasksMax` is unchanged (`--pids` plus one): the scope still has one extra process.
+`TasksMax` is unchanged (`--pids` plus one): the scope still has one extra process. Outside the
+scope, though, the keeper now takes two processes, not one: two of the user's `RLIMIT_NPROC` and
+two of the parent cgroup's `pids.max`. A user one process short of the limit gets zbx's fork of
+the keeper and then a refused clone of its member (EAGAIN). The keeper writes the errno of a
+failed step (its clone, or either process's `PR_SET_PDEATHSIG`) to the pipe zbx reads the
+member's pid from, so that failure is ZBX-E0205 with the process limit as its cause, the same
+line as a refused fork, and zbx kills and reaps the keeper before it reports.
