@@ -76,6 +76,8 @@ const FakeSource = struct {
 const FakeRange = struct {
     short: bool,
     calls: std.atomic.Value(u32),
+    /// The bytes asked for, over every call.
+    asked: std.atomic.Value(u64),
 };
 
 const Fixture = struct {
@@ -127,7 +129,7 @@ fn setup(sizes: []const u32) void {
         };
         source.* = .{ .context = peer, .name = name, .fetch = peer_fetch, .lied = peer_lied };
     }
-    fixture.registry = .{ .short = false, .calls = .init(0) };
+    fixture.registry = .{ .short = false, .calls = .init(0), .asked = .init(0) };
 }
 
 fn make_objects(sizes: []const u32) void {
@@ -266,6 +268,7 @@ fn range_fetch(context: *anyopaque, offset: u64, out: []u8, timeout_ms: u32) laz
     assert(timeout_ms > 0);
     assert(out.len > 0);
     _ = range.calls.fetchAdd(1, .monotonic);
+    _ = range.asked.fetchAdd(out.len, .monotonic);
     if (offset >= fixture.blob_len) return error.Failed;
     const length: usize = @min(out.len, fixture.blob_len - offset);
     @memcpy(out[0..length], fixture.blob[@intCast(offset)..][0..length]);
@@ -856,6 +859,213 @@ test "resolver: a lie on a job that ends after its read's deadline is still name
     for (&resolver.schedule.pending) |*entry| try testing.expect(entry.state == .free);
 }
 
+test "resolver: a source that lied about an object is named so in each later read's E1203" {
+    // Goal: the `unavailable` event of the read that was lied to says `lied`, and that of a
+    // later read of the same object, which never asks the source again, says `lied_before`
+    // rather than `not_tried` ("not asked"); both fail at once, with no deadline passed.
+    // Method: one lying peer and a two-chunk object; read chunk 0 (one job, a lie), then
+    // chunk 1, both at 1 ms; the peer is asked once.
+    setup(&.{2 * chunk_bytes});
+    fixture.peers[0].behaviour = .lying;
+    fixture.peers[0].misbehave_calls = misbehave_always;
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const resolver = &fixture.resolver;
+    var out: [chunk_bytes]u8 = @splat(0);
+    const step = resolver.read_begin(0, 0, &out, 0);
+    try testing.expectEqual(schedule_mod.Result.lied, try one_job());
+    const first = resolver.read_poll(step.wait, &out, 1);
+    try testing.expectEqual(lazy.ReadError.Unavailable, first.failed);
+    const again = resolver.read_begin(0, 1, &out, 1);
+    const later = resolver.read_poll(again.wait, &out, 1);
+    try testing.expectEqual(lazy.ReadError.Unavailable, later.failed);
+    resolver.drain_events();
+    try testing.expectEqual(@as(u32, 1), events_of(.lied, "peer a"));
+    try testing.expectEqual(@as(u32, 2), events_of(.unavailable, ""));
+    const expected = [2]lazy.Outcome{ .lied, .lied_before };
+    var seen: u32 = 0;
+    for (fixture.events[0..fixture.events_count.load(.monotonic)]) |*event| {
+        if (event.kind != .unavailable) continue;
+        try testing.expectEqual(seen, event.chunk);
+        try testing.expectEqual(@as(u8, 1), event.sources_count);
+        try testing.expectEqual(expected[seen], event.outcomes[0]);
+        seen += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), seen);
+    try testing.expectEqual(@as(u32, 1), fixture.peers[0].calls.load(.monotonic));
+}
+
+test "resolver: a read that arrives mid-fill is served before the next fill request" {
+    // Goal: the supervisor's condition on `lazy_fill_idle_ms` (S2 slice 6): the fill takes no
+    // request until no reader has asked for `lazy_fill_idle_ms`; a read that arrives while a fill
+    // request is in flight is taken next, and no fill request starts until the idle time has
+    // passed again since that read.
+    // Method: one peer (no coalescing), the fill on, a fake clock driven by hand: the fill
+    // slot is refused before the idle time, takes one chunk at it, and while that is in flight
+    // a read of a chunk the fill queued arrives.
+    setup(&.{ 4 * chunk_bytes, 4 * chunk_bytes });
+    try open_resolver(1, false, true);
+    defer close_resolver();
+    const resolver = &fixture.resolver;
+    const fill_slot = constants.lazy_fetches_max;
+    const idle = constants.lazy_fill_idle_ms;
+    var work: Work = undefined;
+    try testing.expect(!resolver.slot_take(fill_slot, &work, idle - 1));
+    try testing.expect(resolver.slot_take(fill_slot, &work, idle));
+    try testing.expectEqual(schedule_mod.Purpose.fill, work.purposes[0]);
+    try testing.expect(resolver.schedule.queued_fill() > 0);
+    resolver.slot_fetch(fill_slot, &work);
+    // Mid-fill: a read of object 1's last chunk, which the fill has queued.
+    const arrived = idle + 1;
+    var out: [chunk_bytes]u8 = @splat(0);
+    const step = resolver.read_begin(1, 3, &out, arrived);
+    try testing.expect(step == .wait);
+    resolver.slot_finish(fill_slot, &work, arrived + 1);
+    for (fill_slot..constants.lazy_slots) |slot| {
+        try testing.expect(!resolver.slot_take(@intCast(slot), &work, arrived + 1));
+        try testing.expect(!resolver.slot_take(@intCast(slot), &work, arrived + idle - 1));
+    }
+    var read_work: Work = undefined;
+    try testing.expect(resolver.slot_take(0, &read_work, arrived + 1));
+    try testing.expectEqual(schedule_mod.Purpose.on_demand, read_work.purposes[0]);
+    try testing.expectEqual(@as(lazy.ObjectIndex, 1), read_work.objects[0]);
+    try testing.expectEqual(@as(u32, 3), read_work.chunks[0]);
+    resolver.slot_fetch(0, &read_work);
+    resolver.slot_finish(0, &read_work, arrived + 2);
+    const done = resolver.read_poll(step.wait, &out, arrived + 2);
+    try testing.expect(done == .done);
+    try testing.expectEqualSlices(u8, truth(1, 3), out[0..done.done]);
+    // Idle again since the read: the fill goes on.
+    try testing.expect(resolver.slot_take(fill_slot, &work, arrived + idle));
+    try testing.expectEqual(schedule_mod.Purpose.fill, work.purposes[0]);
+    resolver.slot_fetch(fill_slot, &work);
+    resolver.slot_finish(fill_slot, &work, arrived + idle);
+}
+
+test "resolver: outside the store's namespace, the put that completes an object lands it" {
+    // Goal: in demo-s2 the slots (threads, so in the parent, outside the store's namespace) ran
+    // as a user without `CAP_CHOWN`, and every put that completed an object failed on its
+    // change of owner to container root. Each one-chunk object, and each object's last chunk,
+    // was read only after a round (`lazy_down_fail_ms`), from its partial chunk: the lazy start
+    // took 10.8 s. And the fill never made an object whole.
+    // Method: the store's owners `outside`, the user's own ids 0:0 (the ids `SimFs` creates
+    // files with); the file system refuses every change of owner. One object of one chunk and
+    // one of two are read at one time: each read is served and each object is whole.
+    setup(&.{ 10, 2 * chunk_bytes });
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{ .uid = 0, .gid = 0, .range = null } };
+    try open_resolver(0, true, false);
+    defer close_resolver();
+    try expect_true_read(0, 0, 0);
+    try expect_true_read(1, 0, 0);
+    try expect_true_read(1, 1, 0);
+    for (fixture.objects[0..2]) |*object| {
+        try testing.expect(land_mod.object_is_whole(&fixture.store, &object.wanted));
+    }
+    try testing.expectEqual(@as(u32, 2), fixture.resolver.schedule.report.objects_local);
+    try testing.expectEqual(@as(u32, 3), fixture.registry.calls.load(.monotonic));
+}
+
+test "resolver: rootless, an object owned by a container id is never made whole" {
+    // Goal: pin the accepted gap in
+    // docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md. Outside the namespace and
+    // without `CAP_CHOWN`, an object of 0:42 (Alpine's /etc/shadow) cannot be assembled: the
+    // last put's change of owner is `EPERM`. Its chunks stay held in `partial/`, verified, so
+    // every read is served at once from them, nothing is asked of the source again, and the
+    // source is not blamed; the object is not whole and `objects_local` never counts it. A
+    // `security.capability` object fails the same way in the kernel; `SimFs` has no gate for
+    // it, so it is not tested.
+    // Method: owners `outside` with a subordinate range, so the id is mapped and the owner
+    // gate is what refuses; object 0 (two chunks) is owned by 0:42, object 1 by root. Read
+    // both; read object 0 again.
+    setup(&.{ 2 * chunk_bytes, 2 * chunk_bytes });
+    own_by_shadow(0);
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{
+        .uid = 0,
+        .gid = 0,
+        .range = .{ .uid_start = 100000, .gid_start = 100000 },
+    } };
+    gate_calls = 0;
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const report = &fixture.resolver.schedule.report;
+    try expect_true_read(0, 0, 0);
+    try testing.expectEqual(@as(u32, 0), gate_calls);
+    // Chunk 1's put fails on the owner, at the gate; the read is served in the same round.
+    try expect_true_read(0, 1, 0);
+    try testing.expectEqual(@as(u32, 1), gate_calls);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    try testing.expectEqual(@as(u32, 0), report.objects_local);
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    const round = constants.lazy_down_fail_ms;
+    try expect_true_read(1, 0, round);
+    try expect_true_read(1, 1, round);
+    try testing.expect(land_mod.object_is_whole(&fixture.store, &fixture.objects[1].wanted));
+    try testing.expectEqual(@as(u32, 1), report.objects_local);
+    // The next read of 0:42's chunk is local: no ask, no further put.
+    const calls = fixture.peers[0].calls.load(.monotonic);
+    try expect_true_read(0, 1, round);
+    try testing.expectEqual(calls, fixture.peers[0].calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), gate_calls);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    try testing.expectEqual(@as(u32, 1), report.objects_local);
+}
+
+test "resolver: an owner failure is never the source's failure, over many reads" {
+    // Goal: a put that fails on its owner (rootless, outside the namespace) is not booked
+    // against the source that sent the right bytes. Five one-chunk objects of 0:42 are read
+    // further apart than `lazy_read_deadline_ms` in all; no read fails, the source is never
+    // down, and no E1203 is logged (as the review of PR 8 found with the failure counted: the
+    // fifth read failed `Unavailable` with the peer marked down, its chunk already held).
+    // Method: one honest peer, fill off, a subordinate range so the owner gate refuses; the
+    // objects are read 7.1 s apart, then a root-owned one.
+    setup(&.{ chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes });
+    for (0..5) |index| own_by_shadow(@intCast(index));
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{
+        .uid = 0,
+        .gid = 0,
+        .range = .{ .uid_start = 100000, .gid_start = 100000 },
+    } };
+    gate_calls = 0;
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const step_ms: u64 = 7100;
+    comptime assert(5 * step_ms > constants.lazy_read_deadline_ms);
+    for (0..5) |index| try expect_true_read(@intCast(index), 0, index * step_ms);
+    try testing.expectEqual(@as(u32, 5), gate_calls);
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expect(fixture.resolver.schedule.sources[0].failing_since_ms == null);
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    try expect_true_read(5, 0, 5 * step_ms);
+    try testing.expectEqual(@as(u32, 1), fixture.resolver.schedule.report.objects_local);
+    try testing.expectEqual(@as(u32, 5), gate_calls);
+}
+
+/// Object `index` is owned by 0:42, as Alpine's /etc/shadow is.
+fn own_by_shadow(index: u32) void {
+    const shadow: object_mod.Attrs = .{
+        .mode = 0o640,
+        .uid = 0,
+        .gid = 42,
+        .xattrs = &xattrs.empty,
+    };
+    const owned = &fixture.objects[index].wanted;
+    owned.attrs = shadow;
+    owned.id = object_mod.object_id(owned.content, shadow);
+}
+
+var gate_calls: u32 = 0;
+
+/// `SimFs`'s owner gate for a process outside any new user namespace; counts its calls.
+fn outside(context: *anyopaque) bool {
+    assert(@intFromPtr(context) != 0);
+    gate_calls += 1;
+    return false;
+}
+
 test "resolver: objects_local counts each whole object once and never goes down" {
     // Goal: with the fill off, `objects_local` counts an object whole at init, counts an
     // object once when its last chunk lands, and does not drop when a gc removes an object.
@@ -1090,4 +1300,59 @@ test "resolver: a short answer is a failed fetch, never a lie" {
     try testing.expectEqual(@as(u8, 0), fixture.resolver.objects[0].bad);
     try testing.expectEqual(@as(u32, 0), events_of(.lied, ""));
     try testing.expectEqual(@as(u32, 1), fixture.registry.calls.load(.monotonic));
+}
+
+test "resolver: a range does not fetch again the chunks at its ends that are already local" {
+    // Goal: readahead queues a chunk again after it landed (the schedule does not look in the
+    // store); a range job that begins or ends with such a chunk asks the registry for the
+    // missing chunks alone, so no byte is fetched twice (demo-s2 step 5).
+    // Method: chunk 1 lands; readahead entries for chunks 1, 2 and 3 coalesce into one job;
+    // the registry is asked for chunks 2 and 3 only.
+    setup(&.{4 * chunk_bytes});
+    try open_resolver(0, true, false);
+    defer close_resolver();
+    const resolver = &fixture.resolver;
+    var out: [chunk_bytes]u8 = @splat(0);
+    _ = resolver.read_begin(0, 1, &out, 0);
+    try testing.expectEqual(schedule_mod.Result.landed, try one_job());
+    const first = fixture.locations[fixture.firsts[0] + 1];
+    try testing.expectEqual(@as(u64, first.length), fixture.registry.asked.load(.monotonic));
+    for (1..4) |chunk| {
+        const ask: schedule_mod.Ask = .{ .purpose = .readahead, .began_ms = 0 };
+        try testing.expect(resolver.schedule.request(0, @intCast(chunk), ask, 0) != null);
+    }
+    var work: Work = undefined;
+    try testing.expect(resolver.slot_take(0, &work, 0));
+    try testing.expectEqual(@as(u8, 3), work.job.count);
+    resolver.slot_fetch(0, &work);
+    resolver.slot_finish(0, &work, 0);
+    resolver.drain_events();
+    const results = [_]schedule_mod.Result{ .local, .landed, .landed };
+    try testing.expectEqualSlices(schedule_mod.Result, &results, work.results[0..3]);
+    const second = fixture.locations[fixture.firsts[0] + 2].length;
+    const third = fixture.locations[fixture.firsts[0] + 3].length;
+    const asked = fixture.registry.asked.load(.monotonic);
+    try testing.expectEqual(@as(u64, first.length) + second + third, asked);
+    try testing.expectEqual(@as(u64, second) + third, work.sent);
+}
+
+test "resolver threads: stop waits for the fetches in flight, and the report counts their bytes" {
+    // Goal: `stop` returns only once every fetch in flight has been answered and counted, so a
+    // report made after it holds every byte the sources sent: the summary of a lazy run, made
+    // after `lazy_server`'s `ended` stops the resolver, agrees with the registry's count.
+    // Method: the fill alone over the registry; stop once it has asked, then compare the bytes
+    // the registry was asked for (it answers every ask whole) with the report's.
+    setup(&.{ 4 * chunk_bytes, 4 * chunk_bytes, 3 * chunk_bytes });
+    try open_resolver(0, true, true);
+    try fixture.resolver.start(Scaled.io());
+    var waited: u32 = 0;
+    while (fixture.registry.calls.load(.monotonic) == 0 and waited < wait_real_ms_max) {
+        nap();
+        waited += 1;
+    }
+    fixture.resolver.stop();
+    try testing.expect(fixture.registry.calls.load(.monotonic) > 0);
+    const report = fixture.resolver.report();
+    try testing.expectEqual(fixture.registry.asked.load(.monotonic), report.source_bytes[0]);
+    close_resolver();
 }

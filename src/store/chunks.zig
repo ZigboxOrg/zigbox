@@ -195,9 +195,27 @@ pub fn finish(store: *Store, io: []u8, wanted: *const Wanted, failure: *Failure)
     return assemble_if_whole(store, io, wanted, failure);
 }
 
+/// Whether chunk `index` of the wanted object is held in `partial/` and hashes right: what a
+/// failed put leaves when the failure came after the chunk was kept (the assembly), so the
+/// caller can tell it from one that lost the chunk. A look only: it takes no lock.
+pub fn is_held(store: *const Store, wanted: *const Wanted, index: u32) bool {
+    assert(index < wanted.hashes.len);
+    assert(store.root_len > 1);
+    var path_storage: PathBuf = undefined;
+    const path = partial_chunk(store, &path_storage, wanted.id, index);
+    var failure: Failure = undefined;
+    const hash = wanted.hashes[index];
+    return chunk_is_held(store, path, hash, &failure) catch false;
+}
+
 /// A held chunk file counts only if it still hashes right (a torn or damaged one is replaced).
 /// A file that cannot be read fails the put, with its `failure` filled like every other.
-fn chunk_is_held(store: *Store, path: [:0]const u8, hash: Digest, failure: *Failure) Error!bool {
+fn chunk_is_held(
+    store: *const Store,
+    path: [:0]const u8,
+    hash: Digest,
+    failure: *Failure,
+) Error!bool {
     assert(path.len > 0);
     assert(hash.bytes.len == constants.store_digest_bytes);
     const fs = store.fs;
@@ -391,7 +409,7 @@ fn build_file(
     if (written != wanted.size or !whole.final().eql(wanted.content)) {
         return discard_and_refuse(store, wanted);
     }
-    object.apply(fs, output, wanted.attrs, failure) catch return error.StoreFailed;
+    object.apply(fs, output, wanted.attrs, &store.owners, failure) catch return error.StoreFailed;
 }
 
 fn discard_and_refuse(store: *Store, wanted: *const Wanted) Error {

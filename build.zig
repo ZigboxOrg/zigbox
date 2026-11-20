@@ -20,9 +20,6 @@ pub fn build(b: *std.Build) void {
     const manifest = @import("build.zig.zon");
     const options = b.addOptions();
     options.addOption([]const u8, "version", manifest.version);
-    // 0.5.2 and 0.5.3 ship lazy start (S2) dormant: `--lazy` is refused unless a build turns it on,
-    // which only demo-s2-lazy's zbx does (docs/decisions/2026-11-16-0.5.2-s2-dormant.md).
-    options.addOption(bool, "lazy_start", false);
 
     // LLVM in every mode, not Zig's own x86_64 backend in Debug: that backend writes each
     // `undefined` global into .data as 0xaa bytes, which made a Debug zbx 335 MB and a test
@@ -300,6 +297,7 @@ const roots = [_][]const u8{
     "src/testing/vm/main_m9.zig",
     "src/testing/vm/main_m10.zig",
     "src/testing/vm/main_s2_lazy.zig",
+    "src/testing/vm/main_s2.zig",
     "src/testing/vm/main_s2_probe.zig",
     "src/testing/vm/main_m2b_probe.zig",
     "src/testing/vm/main_m2b.zig",
@@ -342,6 +340,7 @@ const linux_only = [_][]const u8{
     "src/testing/vm/main_m9.zig",
     "src/testing/vm/main_m10.zig",
     "src/testing/vm/main_s2_lazy.zig",
+    "src/testing/vm/main_s2.zig",
     "src/testing/vm/main_s2_probe.zig",
     "src/testing/vm/main_m2b_probe.zig",
     "src/testing/vm/main_m2b.zig",
@@ -626,6 +625,11 @@ const demos = [_]struct { step: []const u8, root: []const u8, help: []const u8 }
         .help = "Run the M10 demo: --device and --gpu with a fake vendor, doctor, refusals",
     },
     .{
+        .step = "demo-s2",
+        .root = "src/testing/vm/main_s2.zig",
+        .help = "Run the S2 demo: lazy start of a 3 GiB image from a throttled registry",
+    },
+    .{
         .step = "demo-s2-lazy",
         .root = "src/testing/vm/main_s2_lazy.zig",
         .help = "Run the S2 slice 4 check: zbx run --lazy serves an image from the store",
@@ -724,8 +728,6 @@ fn add_demo_step(
         if (reuse) run.addArg("--reuse-overlay");
         if (is_packages) {
             add_m8_packages(b, options, run);
-        } else if (std.mem.eql(u8, demo.step, "demo-s2-lazy")) {
-            add_release_binaries(b, lazy_start_options(b), run);
         } else {
             add_release_binaries(b, options, run);
         }
@@ -754,6 +756,27 @@ fn add_harness_imports(
     if (std.mem.eql(u8, step, "demo-c4")) add_c4_supervisor(b, module);
     if (std.mem.eql(u8, step, "demo-m6d")) add_m6d_helper(b, module);
     if (std.mem.eql(u8, step, "demo-s2-lazy")) add_fuse_kernel_test(b, options, module);
+    if (std.mem.eql(u8, step, "demo-s2")) add_s2_tool(b, module);
+}
+
+/// demo-s2's guest tool (`src/testing/vm/tool_s2.zig`): it writes the 3 GiB fixture inside the
+/// guest and relays the guest's loopback registry port to the runner's registry. Static x86_64
+/// with no libc like the guest, embedded in the harness, which serves it.
+fn add_s2_tool(b: *std.Build, harness_module: *std.Build.Module) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const tool = b.addExecutable(.{
+        .name = "tool-s2",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/vm/tool_s2.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+            .link_libc = false,
+        }),
+    });
+    harness_module.addAnonymousImport("tool_s2", .{
+        .root_source_file = tool.getEmittedBin(),
+    });
 }
 
 /// demo-s2-lazy's FUSE kernel test (`src/fuse/kernel_tests.zig`) as a test binary for the guest
@@ -962,6 +985,7 @@ fn old_commit_of(step: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, step, "demo-m7")) return releases.m7_commit;
     if (std.mem.eql(u8, step, "demo-m8")) return releases.m8_tag;
     if (std.mem.eql(u8, step, "demo-m2b")) return releases.m2b_tag;
+    if (std.mem.eql(u8, step, "demo-s2")) return releases.s2_commit;
     return null;
 }
 
@@ -988,16 +1012,6 @@ fn add_release_binaries(
         run.addArg(flag);
         run.addFileArg(exe.getEmittedBin());
     }
-}
-
-/// The options of demo-s2-lazy's zbx: a release's, with lazy start turned on. 0.5.2 ships it
-/// dormant (docs/decisions/2026-11-16-0.5.2-s2-dormant.md); 0.6.0 drops the option.
-fn lazy_start_options(b: *std.Build) *std.Build.Step.Options {
-    const manifest = @import("build.zig.zon");
-    const options = b.addOptions();
-    options.addOption([]const u8, "version", manifest.version);
-    options.addOption(bool, "lazy_start", true);
-    return options;
 }
 
 /// The upgrade test of demo-m3 to demo-m6b: the older zbx, built from a worktree of the
