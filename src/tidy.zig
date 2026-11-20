@@ -34,6 +34,16 @@ const shell_allowlist = [_][]const u8{
     // The owner's one-time ZigboxOrg setup, run on the owner's laptop: glue around `gh`, `gcloud`,
     // `gpg` and `git`, before any Zig exists there; ops/owner/README.md.
     "ops/owner/zigboxorg-setup.sh",
+    // The owner's release plumbing (environments, signing key, App, Mac secrets) and the copy of
+    // the VM build inputs' releases: the same glue, on the same laptop.
+    "ops/owner/release-setup.sh",
+    "ops/owner/copy-vm-releases.sh",
+    // The git backup box (Forgejo on a small VPS): its one-time setup, and the timer's copy job,
+    // glue around `git fetch` and `git push`, with no Zig on that box; ops/backup/README.md.
+    "ops/backup/bootstrap.sh",
+    "ops/backup/sync.sh",
+    // Its test: runs the same file against local bare repositories (src/backup_sync_tests.zig).
+    "ops/backup/sync-test.sh",
     // The release workflow's signing glue around `gpg` and `rpm`, which no Zig code can replace
     // (docs/STYLE.md, "The Linux package release"); its test script runs the same file.
     ".github/release-sign.sh",

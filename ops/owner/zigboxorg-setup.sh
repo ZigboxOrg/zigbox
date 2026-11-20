@@ -18,7 +18,7 @@
 # named files. --dry-run prints what would change and changes nothing (it still reads). --yes
 # answers the per-section questions; it never answers for you where a value is wanted.
 # The release plumbing (environments, App, signing key, Mac secrets, homebrew-tap and website) is
-# NOT here: it is release-setup.sh, which the supervisor gave the owner.
+# NOT here: it is ops/owner/release-setup.sh.
 # The last line is `owner-setup: OK ...` or `owner-setup: FAIL <what to fix>`.
 # Written for bash 3.2 (macOS) and later. ops/owner/README.md is the full guide.
 set -euo pipefail
@@ -433,7 +433,10 @@ EOF
 preflight() {
     local tool login role
     for tool in git gh curl jq; do command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed (see ops/owner/README.md)"; done
-    gh auth status >/dev/null 2>&1 || die "gh is not signed in: gh auth login (scopes repo, workflow, read:org)"
+    # Ask GitHub, not `gh auth status`: that fails when any other account or host gh knows is bad.
+    local err
+    err=$(gh api user --jq .login 2>&1 >/dev/null) ||
+        die "gh cannot call GitHub as you ($(printf '%s' "$err" | head -n 1)): gh auth login (scopes repo, workflow, read:org)"
     login=$(gh api user --jq .login)
     role=$(gh api "user/memberships/orgs/$ORG" --jq .role 2>/dev/null || true)
     [ "$role" = admin ] || die "$login is not an owner of $ORG (role: ${role:-none}); sign in as an owner: gh auth login"

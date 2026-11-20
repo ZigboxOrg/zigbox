@@ -64,7 +64,7 @@ env:
   # Pinned here, in reviewed code, not read from a secret: users trust this fingerprint
   # (docs/releases/packaging.md, "The release key"). `linux` signs with a subkey of it and
   # `prepare` checks the signature on SHA256SUMS is by one.
-  ZIGBOX_SIGNING_FPR: 09991DC39816D3C914E2A22C5AB00BC328B7DBB7
+  ZIGBOX_SIGNING_FPR: 1207CB8600CE25FFDD3CC87ECCBEC141C3348787
 
 # One release run per commit: a run for a later commit of main must never replace a waiting run
 # for the release commit, and the automatic run and a manual dispatch from the same commit
@@ -260,7 +260,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: |
             homebrew-tap
             website
@@ -721,7 +721,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: |
             homebrew-tap
             website
@@ -855,7 +855,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: homebrew-tap
           permission-contents: write
       - name: The tap's formula differs only where it may
@@ -911,7 +911,7 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: Zigbox
+          owner: ZigboxOrg
           repositories: website
           permission-contents: write
           permission-actions: read
