@@ -46,15 +46,45 @@ sudo dnf install zigbox
 
 ### Renewing the keyring
 
+On 2026-11-20 the release key itself was replaced (the old secret key was lost); the new primary
+fingerprint is `1207 CB86 00CE 25FF DD3C C87E CCBE C141 C334 8787`. zigbox.org serves the new key
+from the first release signed with it (planned: 0.6.0); until then it serves the old one, so do not
+re-fetch it yet. If you installed before that release, then once it is out follow the steps in
+[the decision record](../decisions/2026-11-20-release-key-rotated.md), or `apt update` and `dnf`
+refuse the repository.
+
+The apt metadata expires: the served `Release` file says `Valid-Until` 9 December 2026. Until then
+apt works. After that date, and until a release signed with the new key ships, `apt update` reports
+`Release file ... is expired`. Do not turn the expiry check off; wait for the release.
+
 The signing subkey is renewed once a year, and the keyring you fetched above carries its expiry.
 Nothing updates that file, so when a release's notes say the subkey was renewed, fetch the keyring
-again before the date they give, or `apt update` fails with `EXPKEYSIG`:
+again before the date they give, or `apt update` fails with `EXPKEYSIG`. Download to a temporary
+file, check that it holds exactly one key with the expected fingerprint, and only then install it
+(nothing is installed if the check fails):
+
+apt (Debian, Ubuntu):
 
 ```sh
-curl -fsSL https://zigbox.org/zigbox-archive-keyring.gpg | sudo tee /usr/share/keyrings/zigbox.gpg >/dev/null
-sudo rpm --import https://zigbox.org/zigbox-archive-keyring.asc   # dnf systems
+f=$(mktemp) && curl -fsSLo "$f" https://zigbox.org/zigbox-archive-keyring.gpg
+test "$(gpg --show-keys --with-colons "$f" | awk -F: '$1=="pub"{n++;w=1} $1=="fpr"&&w{print $10;w=0} END{if(n!=1)print "BAD"}')" = 1207CB8600CE25FFDD3CC87ECCBEC141C3348787 \
+  && sudo install -m 0644 "$f" /usr/share/keyrings/zigbox.gpg && echo installed
+rm -f "$f"
 ```
 
+dnf (Fedora, Rocky, RHEL):
+
+```sh
+f=$(mktemp) && curl -fsSLo "$f" https://zigbox.org/zigbox-archive-keyring.asc
+test "$(gpg --show-keys --with-colons "$f" | awk -F: '$1=="pub"{n++;w=1} $1=="fpr"&&w{print $10;w=0} END{if(n!=1)print "BAD"}')" = 1207CB8600CE25FFDD3CC87ECCBEC141C3348787 \
+  && sudo rpm --import "$f" && echo imported
+rm -f "$f"
+```
+
+The dnf repository sets `repo_gpgcheck=1`, so dnf may itself offer to import the repository key from
+the `gpgkey=` URL. If it prints a fingerprint prompt, compare it with
+`1207 CB86 00CE 25FF DD3C C87E CCBE C141 C334 8787`, answer yes only if it matches, and do not use
+`-y` for that first import. This prompt has not yet been checked on a dnf 4 host.
 
 The package holds the one `zbx` binary. It recommends `uidmap` (on Fedora, `shadow-utils`) and
 `passt`, which step 2 needs. It does not change `/etc/subuid` or `/etc/subgid`.

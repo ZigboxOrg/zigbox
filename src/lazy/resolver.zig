@@ -252,6 +252,9 @@ pub const Resolver = struct {
         assert(resolver.io == null);
         for (resolver.threads) |thread| assert(thread == null);
         resolver.io = io;
+        // The fill waits `lazy_fill_idle_ms` from the start too: the container's first reads
+        // come right after it.
+        resolver.schedule.demand_ms = now_ms(io);
         errdefer resolver.stop();
         for (&resolver.threads, 0..) |*thread, slot| {
             const slot_index: u32 = @intCast(slot);
@@ -524,7 +527,13 @@ pub const Resolver = struct {
                 // A deadline the tick failed is news to its readers.
                 if (resolver.schedule.settled != settled) resolver.readers.broadcast(io);
                 if (resolver.slot_take(slot, &work, now)) break true;
-                const wait_ms = if (wake) |at|
+                const wake_fill = if (slot < constants.lazy_fetches_max)
+                    wake
+                else if (resolver.schedule.fill_idle_at(now)) |at|
+                    earliest(wake, at)
+                else
+                    wake;
+                const wait_ms = if (wake_fill) |at|
                     @max(at, now + 1) - now
                 else
                     constants.lazy_down_probe_ms;
@@ -554,11 +563,17 @@ pub const Resolver = struct {
     pub fn slot_take(resolver: *Resolver, slot: u32, work: *Work, now: u64) bool {
         assert(slot < slots);
         assert(!resolver.schedule.jobs[slot].active);
+        const fill_slot = slot >= constants.lazy_fetches_max;
+        // The fill yields to readers: no fill request starts until none has asked for
+        // `lazy_fill_idle_ms`, queued fill entries included.
+        if (fill_slot) {
+            if (resolver.schedule.fill_idle_at(now) != null) return false;
+        }
         if (resolver.schedule.next_job(slot, now)) |job| {
             resolver.copy_work(job, work);
             return true;
         }
-        if (slot < constants.lazy_fetches_max) return false;
+        if (!fill_slot) return false;
         if (!resolver.fill_due(now)) return false;
         var plan: FillPlan = undefined;
         plan.cursor = resolver.fill;
@@ -694,9 +709,11 @@ pub const Resolver = struct {
         const range = resolver.options.registry.?;
         assert(work.job.length <= constants.lazy_range_bytes_max);
         assert(work.job.length > 0);
-        const buffer = resolver.memory[slot].range[0..work.job.length];
-        const got = range.fetch(range.context, work.job.offset, buffer, work.job.timeout_ms);
-        defer @memset(resolver.memory[slot].range[0 .. work.job.length + range_trailer_bytes], 0);
+        const span = resolver.missing_span(work);
+        assert(span.length <= work.job.length);
+        const buffer = resolver.memory[slot].range[0..span.length];
+        const got = range.fetch(range.context, span.offset, buffer, work.job.timeout_ms);
+        defer @memset(resolver.memory[slot].range[0 .. span.length + range_trailer_bytes], 0);
         const length = got catch |err| {
             for (work.results[0..work.job.count]) |*slot_result| {
                 if (slot_result.* != .local) slot_result.* = result_of(err);
@@ -705,7 +722,7 @@ pub const Resolver = struct {
         };
         work.sent = @min(length, buffer.len);
         var segment_end: u64 = 0;
-        for (0..work.job.count) |at| {
+        for (span.first..span.end) |at| {
             const object = &resolver.options.catalog.objects[work.objects[at]];
             const location = object.locations[work.chunks[at]];
             const segment_start = segment_end;
@@ -721,6 +738,31 @@ pub const Resolver = struct {
             work.results[at] =
                 resolver.inflate_and_keep(slot, work, @intCast(at), segment_start, stored_length);
         }
+    }
+
+    const Span = struct { first: u32, end: u32, offset: u64, length: u64 };
+
+    /// The part of the job's range that holds its missing chunks: the chunks already local at
+    /// either end are not asked for. A readahead entry is queued again after its chunk landed
+    /// (the schedule does not look in the store), and a range that began with it would fetch
+    /// it a second time (demo-s2 step 5 sent 19.0 MiB for 16 MiB). One local in the middle is
+    /// still fetched: the range is one request.
+    fn missing_span(resolver: *const Resolver, work: *const Work) Span {
+        const count = work.job.count;
+        var span: Span = .{ .first = count, .end = 0, .offset = work.job.offset, .length = 0 };
+        for (work.results[0..count], 0..) |result, at| {
+            if (result == .local) continue;
+            span.first = @min(span.first, @as(u32, @intCast(at)));
+            span.end = @intCast(at + 1);
+        }
+        assert(span.first < span.end); // `slot_fetch` fetches only with a chunk missing.
+        for (0..span.end) |at| {
+            const object = &resolver.options.catalog.objects[work.objects[at]];
+            const location = object.locations[work.chunks[at]];
+            if (at < span.first) span.offset += location.length else span.length += location.length;
+        }
+        assert(span.offset + span.length <= work.job.offset + work.job.length);
+        return span;
     }
 
     /// Inflates the chunk whose compressed bytes are at `offset` in the slot's range buffer.
@@ -790,6 +832,8 @@ pub const Resolver = struct {
             .content_mismatch => .content_mismatch,
             .store_full => .store_full,
             .busy => .busy,
+            // The source's bytes were right and are held: its answer, and a read gets them.
+            .held => .landed,
             .failed => .failed,
         };
     }
@@ -929,6 +973,11 @@ pub const Resolver = struct {
         if (resolver.io) |io| resolver.store_mutex.unlock(io);
     }
 };
+
+fn earliest(current: ?u64, candidate: u64) u64 {
+    assert(candidate < std.math.maxInt(u64));
+    return if (current) |held| @min(held, candidate) else candidate;
+}
 
 fn now_ms(io: Io) u64 {
     const now = Io.Clock.awake.now(io);

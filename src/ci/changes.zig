@@ -24,7 +24,7 @@ const glob = @import("glob.zig");
 /// demo repeats the parts of the earlier ones, which `from` in a rule relies on.
 pub const demo_ids = [_][]const u8{
     "m0",  "m1", "m2", "m2b", "m3", "m4",  "m5", "m6",      "m6b",
-    "m6d", "m7", "m8", "m8b", "m9", "m10", "c4", "s2_lazy",
+    "m6d", "m7", "m8", "m8b", "m9", "m10", "c4", "s2_lazy", "s2",
 };
 
 /// The packages demo's id: selected on its own, after the others.
@@ -34,7 +34,7 @@ pub const packages_id = "m8_packages";
 pub const selectable_count = demo_ids.len + 1;
 
 comptime {
-    assert(selectable_count == 18);
+    assert(selectable_count == 19);
 }
 
 /// The index of `id` among the selectable demos (`packages_id` is the last), or null.
@@ -210,6 +210,8 @@ const rules = [_]Rule{
         .only = &.{"m6d"},
     },
     .{ .patterns = &.{"src/testing/vm/*_s2_lazy.zig"}, .only = &.{"s2_lazy"} },
+    // demo-s2's harness: the disk-backed registry, the fixture generator and the script.
+    .{ .patterns = &.{ "src/testing/vm/*_s2.zig", "src/testing/vm/s2/*" }, .only = &.{"s2"} },
     // fixture_http.zig is the HTTP server demo-m9's fetch step runs in the guest; no other uses it.
     .{
         .patterns = &.{
@@ -249,7 +251,7 @@ const rules = [_]Rule{
     // reach the demos from m4 on as well as S2's.
     .{ .patterns = &.{ "src/fuse/lazy_server.zig", "src/host_real_fuse.zig" }, .kind = .all },
     .{ .patterns = &.{"src/lazy/*"}, .from = "m4" },
-    .{ .patterns = &.{"src/fuse/*"}, .only = &.{"s2_lazy"} },
+    .{ .patterns = &.{"src/fuse/*"}, .only = &.{ "s2_lazy", "s2" } },
     .{ .patterns = &.{ "src/trust/*", "src/push/*" }, .only = &.{"m8"} },
     // Every pull asks the Google credential code whether a reference is Artifact Registry's.
     .{
@@ -433,7 +435,7 @@ test "changes: outputs are code, the demos in order, then the packages demo" {
     const text = writer.buffered();
     const head = "code=true\ndemo_m0=true\ndemo_m1=false\n";
     try std.testing.expect(std.mem.startsWith(u8, text, head));
-    const tail = "demo_s2_lazy=false\ndemo_m8_packages=false\n";
+    const tail = "demo_s2_lazy=false\ndemo_s2=false\ndemo_m8_packages=false\n";
     try std.testing.expect(std.mem.endsWith(u8, text, tail));
     try std.testing.expectEqual(@as(usize, selectable_count + 1), std.mem.count(u8, text, "\n"));
 }

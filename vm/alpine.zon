@@ -11,7 +11,7 @@
 // same file names), then from its `url`. Both are checked against the same SHA-256, and a file
 // that fails the check is refused and the next source tried.
 .{
-    .mirror = "https://github.com/Zigbox/zigbox/releases/download/vm-deps-alpine-3.20",
+    .mirror = "https://github.com/ZigboxOrg/zigbox/releases/download/vm-deps-alpine-3.20",
     .packages = .{
         .{
             .name = "musl",

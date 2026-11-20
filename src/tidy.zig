@@ -39,6 +39,10 @@ const shell_allowlist = [_][]const u8{
     // The repository's settings in that Woodpecker, through its HTTP API with `curl` and `jq`, on
     // the same box and before any Zig is there either; ops/ci/README.md, step 4.
     "ops/ci/woodpecker-setup.sh",
+    // The owner's release plumbing (environments, signing key, App, Mac secrets) and the copy of
+    // the VM build inputs' releases: the same glue, on the same laptop.
+    "ops/owner/release-setup.sh",
+    "ops/owner/copy-vm-releases.sh",
     // The git backup box (Forgejo on a small VPS): its one-time setup, and the timer's copy job,
     // glue around `git fetch` and `git push`, with no Zig on that box; ops/backup/README.md.
     "ops/backup/bootstrap.sh",

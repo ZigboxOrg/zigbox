@@ -275,7 +275,7 @@ Each log line comes back base64-encoded in `.data`. The run's page is
   pipeline's `image:` line together.
 - **Logs:** `docker compose -f /opt/zigbox-ci/compose.yaml logs -f woodpecker-agent`.
 - **Load:** `CI_MAX_WORKFLOWS` (3) workflows at once, box-wide: the agent starts no fourth, so at
-  most three VM demos run together (a pipeline's 18 demo workflows queue behind them; Woodpecker
+  most three VM demos run together (a pipeline's 19 demo workflows queue behind them; Woodpecker
   has no per-file limit, and a YAML-side cap would only restate this one). Why 3: the box has 8
   cores (16 threads), 64 GiB and a network link shared with the simulation fleet; a demo boots a
   guest of about 2 vCPUs and 4 GiB, so three guests are 6 vCPUs and 12 GiB, leaving the rest for

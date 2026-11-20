@@ -126,6 +126,7 @@ pub const HostReal = struct {
         .channel = channel,
         .listen_loopback = listen_loopback,
         .mount_fuse = mount_fuse,
+        .open_fuse_device = open_fuse_device,
         .tcp4_socket = tcp4_socket,
         .send_handle = send_handle,
         .receive_handle = receive_handle,
@@ -799,6 +800,17 @@ pub const HostReal = struct {
         }
         self.open_count += 1;
         return @intCast(descriptor);
+    }
+
+    /// The same `open` as `mount_fuse`'s, closed at once: the device is only asked whether this
+    /// user may open it.
+    fn open_fuse_device(context: *anyopaque) host.Error!void {
+        _ = from_context(context);
+        const opened = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        try check(opened);
+        const descriptor: i32 = @intCast(opened);
+        assert(descriptor >= 0);
+        _ = linux.close(descriptor);
     }
 
     fn close_failed(descriptor: i32, err: host.Error) host.Error {
@@ -3003,7 +3015,8 @@ fn no_children_left() bool {
 test "probe child outcomes map from exit status, signal and timeout, and are all reaped" {
     // Goal: every way a probe child can end becomes the right outcome and leaves no zombie.
     // Method: replace the child body with hooks (so the answer does not depend on this
-    // kernel), use a short timeout for the hanging child.
+    // kernel), use a short timeout only for the hanging child: a child that must exit gets a
+    // generous one, so a loaded machine cannot turn its exit into a timeout.
     const Case = struct {
         hook: *const fn () noreturn,
         kind: host.ProbeKind,
@@ -3021,7 +3034,8 @@ test "probe child outcomes map from exit status, signal and timeout, and are all
         .{ .hook = hook_sleep_forever, .kind = .userns, .expected = .timed_out },
     };
     for (cases) |case| {
-        var real: HostReal = .{ .child_hook = case.hook, .probe_timeout_ms = 50 };
+        const timeout_ms: u32 = if (case.expected == .timed_out) 50 else 10_000;
+        var real: HostReal = .{ .child_hook = case.hook, .probe_timeout_ms = timeout_ms };
         const outcome = try real.interface().probe(case.kind);
         try std.testing.expectEqual(case.expected, outcome);
         try std.testing.expect(no_children_left());
@@ -3042,7 +3056,7 @@ test "the id-mapped mount probe maps its child's exit to an outcome and reaps it
         .{ .hook = hook_exit_other, .expected = .failed },
     };
     for (cases) |case| {
-        var real: HostReal = .{ .child_hook = case.hook, .probe_timeout_ms = 50 };
+        var real: HostReal = .{ .child_hook = case.hook, .probe_timeout_ms = 10_000 };
         const outcome = try real.interface().probe_idmap("/");
         try std.testing.expectEqual(case.expected, outcome);
         try std.testing.expect(no_children_left());

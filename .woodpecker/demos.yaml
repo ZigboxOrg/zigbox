@@ -47,6 +47,7 @@ matrix:
     - DEMO: m10
     - DEMO: c4
     - DEMO: s2_lazy
+    - DEMO: s2
 
 clone:
   - name: clone

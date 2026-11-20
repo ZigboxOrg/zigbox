@@ -8,11 +8,11 @@ const std = @import("std");
 const testing = std.testing;
 const changes = @import("changes.zig");
 
-/// Every output the decision writes: `code`, the seventeen demos and the packages demo.
+/// Every output the decision writes: `code`, the eighteen demos and the packages demo.
 const all_outputs = [_][]const u8{
-    "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b",         "demo_m3", "demo_m4",
-    "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",          "demo_m8", "demo_m8b",
-    "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_m8_packages",
+    "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3",          "demo_m4",
+    "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8",          "demo_m8b",
+    "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
 };
 
 const Row = struct {
@@ -69,7 +69,7 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",     "demo_m2b", "demo_m3",      "demo_m4", "demo_m5",  "demo_m6",
             "demo_m6b", "demo_m6d", "demo_m7",      "demo_m8", "demo_m8b", "demo_m9",
-            "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
@@ -77,21 +77,21 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",     "demo_m2b",     "demo_m4", "demo_m5",  "demo_m6", "demo_m6b",
             "demo_m6d", "demo_m7",      "demo_m8", "demo_m8b", "demo_m9", "demo_m10",
-            "demo_c4",  "demo_s2_lazy",
+            "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
         .paths = &.{"src/testing/vm/checks_upgrade_m5.zig"},
         .true_outputs = &.{
             "code",    "demo_m2b", "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",
-            "demo_m8", "demo_m8b", "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m8", "demo_m8b", "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
         .paths = &.{"src/testing/vm/checks_upgrade_m6b.zig"},
         .true_outputs = &.{
             "code",     "demo_m2b", "demo_m6b", "demo_m6d", "demo_m7",      "demo_m8",
-            "demo_m8b", "demo_m9",  "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m8b", "demo_m9",  "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     // The M2b knobs (the policy files, the plan, the child, doctor) reach every VM demo,
@@ -101,7 +101,7 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3", "demo_m4",
             "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8", "demo_m8b",
-            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
@@ -109,7 +109,7 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3", "demo_m4",
             "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8", "demo_m8b",
-            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
@@ -117,7 +117,7 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3", "demo_m4",
             "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8", "demo_m8b",
-            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     // The release workflow, its own actions and its signing script run after a push to main and
@@ -152,76 +152,76 @@ const rows = [_]Row{
     .{
         .paths = &.{".github/workflows/ci.yml"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     // The CI driver decides which demo runs and how: every demo and the packages demo.
     .{
         .paths = &.{"src/ci_main.zig"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     .{
         .paths = &.{"src/ci/demos.zig"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     .{
         .paths = &.{"src/ci/changes.zig"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     // The VM image cache decides what each guest starts from.
     .{
         .paths = &.{"src/testing/vm/cache.zig"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     // The Woodpecker pipelines and the step image are CI itself.
     .{
         .paths = &.{".woodpecker/demos.yaml"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     .{
         .paths = &.{".woodpecker/check.yaml"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     .{
         .paths = &.{"ops/ci/image/Dockerfile"},
         .true_outputs = &.{
-            "code",     "demo_m0", "demo_m1",      "demo_m2",          "demo_m2b",
-            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",          "demo_m6b",
-            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b",         "demo_m9",
-            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_m8_packages",
+            "code",     "demo_m0", "demo_m1",      "demo_m2",  "demo_m2b",
+            "demo_m3",  "demo_m4", "demo_m5",      "demo_m6",  "demo_m6b",
+            "demo_m6d", "demo_m7", "demo_m8",      "demo_m8b", "demo_m9",
+            "demo_m10", "demo_c4", "demo_s2_lazy", "demo_s2",  "demo_m8_packages",
         },
     },
     // The driver's own tests reach no demo.
@@ -235,7 +235,7 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3", "demo_m4",
             "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8", "demo_m8b",
-            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     // The C4 demo: its harness files select demo_c4 alone.
@@ -268,13 +268,13 @@ const rows = [_]Row{
         .paths = &.{"src/google/credentials.zig"},
         .true_outputs = &.{
             "code",    "demo_m4",  "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",
-            "demo_m8", "demo_m8b", "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m8", "demo_m8b", "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     // The S2 lazy check: its harness file and the FUSE server's files select demo_s2_lazy alone.
     .{
         .paths = &.{"src/fuse/ops.zig"},
-        .true_outputs = &.{ "code", "demo_s2_lazy" },
+        .true_outputs = &.{ "code", "demo_s2_lazy", "demo_s2" },
     },
     // What every zbx start links (the lazy server's setup, the FUSE host) selects every VM demo,
     // and the lazy index, which pull, pack and export use, the demos from m4 on (release review
@@ -284,7 +284,7 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3", "demo_m4",
             "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8", "demo_m8b",
-            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
@@ -292,19 +292,27 @@ const rows = [_]Row{
         .true_outputs = &.{
             "code",    "demo_m0",  "demo_m1",  "demo_m2",      "demo_m2b", "demo_m3", "demo_m4",
             "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",  "demo_m8", "demo_m8b",
-            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
         .paths = &.{"src/lazy/index.zig"},
         .true_outputs = &.{
             "code",    "demo_m4",  "demo_m5", "demo_m6",  "demo_m6b", "demo_m6d",     "demo_m7",
-            "demo_m8", "demo_m8b", "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy",
+            "demo_m8", "demo_m8b", "demo_m9", "demo_m10", "demo_c4",  "demo_s2_lazy", "demo_s2",
         },
     },
     .{
         .paths = &.{"src/testing/vm/main_s2_lazy.zig"},
         .true_outputs = &.{ "code", "demo_s2_lazy" },
+    },
+    .{
+        .paths = &.{"src/testing/vm/main_s2.zig"},
+        .true_outputs = &.{ "code", "demo_s2" },
+    },
+    .{
+        .paths = &.{"src/testing/vm/s2/registry.zig"},
+        .true_outputs = &.{ "code", "demo_s2" },
     },
     // The FUSE kernel test is a test file, but the guest runs it.
     .{

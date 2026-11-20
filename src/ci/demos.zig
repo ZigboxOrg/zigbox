@@ -20,9 +20,10 @@ const ghcr_reason = "the GHCR push needs GitHub's own token; not ported";
 /// The step of each id `changes.zig` selects, in `changes.demo_ids` order and then the packages
 /// demo. An empty step is a demo that cannot run here (`not_run`).
 const steps = [_][]const u8{
-    "demo-m0",  "demo-m1", "demo-m2",  "demo-m2b", "demo-m3",      "demo-m4",
-    "demo-m5",  "demo-m6", "demo-m6b", "",         "demo-m7",      "demo-m8",
-    "demo-m8b", "demo-m9", "demo-m10", "demo-c4",  "demo-s2-lazy", "demo-m8-packages",
+    "demo-m0",          "demo-m1", "demo-m2",  "demo-m2b", "demo-m3",      "demo-m4",
+    "demo-m5",          "demo-m6", "demo-m6b", "",         "demo-m7",      "demo-m8",
+    "demo-m8b",         "demo-m9", "demo-m10", "demo-c4",  "demo-s2-lazy", "demo-s2",
+    "demo-m8-packages",
 };
 
 comptime {
@@ -44,7 +45,8 @@ pub fn step_for_index(index: usize) []const u8 {
 const all_steps = [_][]const u8{
     "demo-m0", "demo-m1",  "demo-m2",  "demo-m2b",      "demo-m3",      "demo-m4",
     "demo-m5", "demo-m6",  "demo-m6b", "demo-m7",       "demo-m8",      "demo-m8b",
-    "demo-m9", "demo-m10", "demo-c4",  "demo-s2-probe", "demo-s2-lazy", "demo-z7",
+    "demo-m9", "demo-m10", "demo-c4",  "demo-s2-probe", "demo-s2-lazy", "demo-s2",
+    "demo-z7",
 };
 const m8_steps = [_][]const u8{ "demo-m8", "demo-m8-packages" };
 
@@ -56,7 +58,8 @@ pub fn plan_for_branch(name: []const u8) ?Plan {
     if (std.mem.eql(u8, demo, "all")) return .{ .run = &all_steps };
     if (std.mem.eql(u8, demo, "m8")) return .{ .run = &m8_steps };
     if (std.mem.eql(u8, demo, "m6d")) return .{ .not_run = google_reason };
-    if (std.mem.eql(u8, demo, "s2")) return .{ .run = &.{"demo-s2-probe"} };
+    if (std.mem.eql(u8, demo, "s2")) return .{ .run = &.{"demo-s2"} };
+    if (std.mem.eql(u8, demo, "s2probe")) return .{ .run = &.{"demo-s2-probe"} };
     if (std.mem.eql(u8, demo, "s2lazy")) return .{ .run = &.{"demo-s2-lazy"} };
     if (std.mem.eql(u8, demo, "m2bprobe")) return .{ .run = &.{"demo-m2b-probe"} };
     if (std.mem.eql(u8, demo, "z7")) return .{ .run = &.{"demo-z7"} };
@@ -111,14 +114,15 @@ test "demos: scratch branch names map as vm.yml does" {
     try expect("demo-m6b", plan_for_branch("m6b-x").?.run[0]);
     try expect("demo-m2b", plan_for_branch("m2b").?.run[0]);
     try expect("demo-m2b-probe", plan_for_branch("m2bprobe-a-b").?.run[0]);
-    try expect("demo-s2-probe", plan_for_branch("s2-1").?.run[0]);
+    try expect("demo-s2", plan_for_branch("s2-1").?.run[0]);
+    try expect("demo-s2-probe", plan_for_branch("s2probe-1").?.run[0]);
     try expect("demo-s2-lazy", plan_for_branch("s2lazy-1").?.run[0]);
     try expect("demo-z7", plan_for_branch("z7-1").?.run[0]);
     try expect("demo-m8b", plan_for_branch("m8b-1").?.run[0]);
     const m8 = plan_for_branch("m8-1").?.run;
     try std.testing.expectEqual(@as(usize, 2), m8.len);
     try expect("demo-m8-packages", m8[1]);
-    try std.testing.expectEqual(@as(usize, 18), plan_for_branch("all-x").?.run.len);
+    try std.testing.expectEqual(@as(usize, 19), plan_for_branch("all-x").?.run.len);
     try std.testing.expect(plan_for_branch("m6d-x").? == .not_run);
     try std.testing.expect(plan_for_branch("m8-push-ghcr").? == .not_run);
     try std.testing.expectEqual(@as(?Plan, null), plan_for_branch("m11-x"));

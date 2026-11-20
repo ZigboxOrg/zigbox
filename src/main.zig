@@ -169,6 +169,7 @@ test {
 test {
     _ = @import("fuzz_fuse.zig");
     _ = @import("fuse/abi.zig");
+    _ = @import("fuse/diagnose.zig");
     _ = @import("fuse/nodes.zig");
     _ = @import("fuse/ops.zig");
     _ = @import("fuse/cache.zig");
@@ -460,6 +461,7 @@ test {
     _ = @import("build/glob.zig");
     _ = @import("fuzz_dockerignore.zig");
     _ = @import("fuzz_dockerfile.zig");
+    _ = @import("fuzz_vm.zig");
 }
 
 test {
