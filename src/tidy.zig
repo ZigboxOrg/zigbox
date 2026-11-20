@@ -39,6 +39,9 @@ const shell_allowlist = [_][]const u8{
     // The repository's settings in that Woodpecker, through its HTTP API with `curl` and `jq`, on
     // the same box and before any Zig is there either; ops/ci/README.md, step 4.
     "ops/ci/woodpecker-setup.sh",
+    // The owner's GitHub side of that setup (the bot account, `main`'s protection), run on the
+    // owner's laptop: glue around `gh` and `jq`; ops/ci/README.md, step 3a.
+    "ops/ci/owner-github.sh",
     // The owner's release plumbing (environments, signing key, App, Mac secrets) and the copy of
     // the VM build inputs' releases: the same glue, on the same laptop.
     "ops/owner/release-setup.sh",
