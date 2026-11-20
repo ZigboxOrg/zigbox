@@ -91,7 +91,7 @@ unique size (`null` if the tree cannot be read; the text shows `?`). `size_uniqu
 
 ## Reporting a problem
 
-Open an issue at <https://github.com/Zigbox/zigbox/issues/new> with:
+Open an issue at <https://github.com/ZigboxOrg/zigbox/issues/new> with:
 
 1. what you ran, and the full error, including its code (`ZBX-E....`, `ZBX-W....` or
    `ZBX-B....`);

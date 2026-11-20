@@ -1,6 +1,6 @@
 # Diagnostics standard
 
-Shared by Zigbox and Zigcube. The canonical copy lives in `Zigbox/zigbox`; `Zigbox/zigcube` carries an identical copy. Change both together.
+Shared by Zigbox and Zigcube. The canonical copy lives in `ZigboxOrg/zigbox`; `ZigboxOrg/zigcube` carries an identical copy. Change both together.
 
 When something goes wrong, the user should see a short, designed explanation: what failed, why, and what to do next. More detail is available on request, and a complete evidence bundle can be produced when needed. A stack trace is never what a user sees for a problem they caused or can fix.
 
@@ -47,7 +47,7 @@ An internal bug (an invariant we broke, an unexpected error from our own code, a
 bug[ZBX-B0001]: zbx hit an internal error while committing a container
   this is a bug in zbx, not something you did
   saved  diagnostic bundle: /home/alex/.local/state/zbx/bundles/2026-10-23T22-41-07Z.tar.gz
-  report https://github.com/Zigbox/zigbox/issues/new (attach the bundle after reviewing it)
+  report https://github.com/ZigboxOrg/zigbox/issues/new (attach the bundle after reviewing it)
 ```
 
 A bug's internal message (the panic text or the broken invariant) means nothing to the user, so the default output leaves it out. `--verbose` shows it as the bug's `cause` line, and JSON carries it in `causes`.

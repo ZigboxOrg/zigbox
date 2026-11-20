@@ -24,7 +24,7 @@ This is the handoff for the Zigbox **supervisor** session: the agent that writes
   - Decisions are in `docs/decisions/`, one file each.
   - Review is `REVIEW.md` and style is `docs/STYLE.md`.
   - Diagnostics are `DIAGNOSTICS.md`. Zigbox's copy is canonical; Zigcube carries a copy.
-- **Zigcube** is the orchestrator, repo `Zigbox/zigcube`, run by its own session. Its restart orders are `docs/restart.md`, in its PR #21. They:
+- **Zigcube** is the orchestrator, repo `ZigboxOrg/zigcube`, run by its own session. Its restart orders are `docs/restart.md`, in its PR #21. They:
   - re-pin Zigbox at M6b's merge;
   - send the revised `Runtime` contract to the owner for review;
   - set R2, C0 on real Zigbox, as the next step;

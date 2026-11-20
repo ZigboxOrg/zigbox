@@ -108,7 +108,10 @@ grep -q 'missing from the repository' "$work/log" || { cat "$work/log" >&2; die 
 echo "ok: refused: no keyring in the repository"
 
 d=$(fresh)
-if env "ZIGBOX_SIGNING_FPR=${fpr:0:39}A" "$check" "$d" "$version" "$tag" "$repository" "$keyring" \
+# A last digit that differs from the real one (the throwaway key's fingerprint ends in A one run in 16).
+wrong_last=A
+[ "${fpr: -1}" != A ] || wrong_last=B
+if env "ZIGBOX_SIGNING_FPR=${fpr:0:39}$wrong_last" "$check" "$d" "$version" "$tag" "$repository" "$keyring" \
   > "$work/log" 2>&1; then die "accepted: a wrong pin"; fi
 grep -q 'not the pinned release key' "$work/log" || { cat "$work/log" >&2; die "wrong reason: wrong pin"; }
 echo "ok: refused: a wrong pinned fingerprint"
