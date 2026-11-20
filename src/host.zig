@@ -512,6 +512,9 @@ pub const VTable = struct {
         entry: ChildEntry,
         entry_context: *anyopaque,
     ) Error!Pid,
+    /// How the keeper that the most recent `start_keeper` found ended without saying why: null
+    /// unless that call failed with no errno because the keeper had exited (`Host.keeper_exit`).
+    keeper_exit: *const fn (context: *anyopaque) ?ExitStatus,
     /// Forks the scope's keeper (see `Host.start_keeper`).
     start_keeper: *const fn (context: *anyopaque, hold: Handle) Error!Keeper,
     /// Starts a program that outlives the call (see `Host.start_program`).
@@ -1046,6 +1049,12 @@ pub const Host = struct {
         assert(keeper.member > 1);
         assert(keeper.member != keeper.pid);
         return keeper;
+    }
+
+    /// How the keeper ended, after a `start_keeper` that failed with `errno` 0 because the
+    /// keeper had exited before saying why; null otherwise. The diagnostic names it.
+    pub fn keeper_exit(host: Host) ?ExitStatus {
+        return host.vtable.keeper_exit(host.context);
     }
 
     /// Starts `request` as a child of this process that goes on running: pasta. It has a session
