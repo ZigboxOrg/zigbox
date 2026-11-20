@@ -64,9 +64,41 @@ fn check_settings(random: std.Random) void {
     var damaged: [settings.record_bytes_max * 2]u8 = undefined;
     @memcpy(damaged[0..text.len], text);
     const length = damage(random, &damaged, text.len);
-    const parsed = settings.parse(damaged[0..length]) catch return;
+    check_settings_accepted(damaged[0..length]);
+}
+
+/// Whatever `settings.parse` accepts is a record `render` writes, or a version 1 record, which
+/// is read and never written: the same lines under the version 1 header, with no `disk_bytes`
+/// line, and the default disk.
+fn check_settings_accepted(text: []const u8) void {
+    const parsed = settings.parse(text) catch return;
     var again: [settings.record_bytes_max]u8 = undefined;
-    assert(std.mem.eql(u8, damaged[0..length], settings.render(&again, parsed)));
+    const rendered = settings.render(&again, parsed);
+    if (std.mem.startsWith(u8, text, settings.header_v1)) {
+        assert(parsed.disk_bytes == constants.vm_disk_bytes_default);
+        const disk_at = std.mem.indexOf(u8, rendered, "disk_bytes=").?;
+        var old: [settings.record_bytes_max]u8 = undefined;
+        const tail = rendered[settings.header.len..disk_at];
+        @memcpy(old[0..settings.header_v1.len], settings.header_v1);
+        @memcpy(old[settings.header_v1.len..][0..tail.len], tail);
+        assert(std.mem.eql(u8, text, old[0 .. settings.header_v1.len + tail.len]));
+    } else {
+        assert(std.mem.eql(u8, text, rendered));
+    }
+}
+
+test "a version 1 settings record is read, not rendered back (seed 2562722272451060721)" {
+    // Goal: the oracle knows version 1 is read and never written. Method: the record the seed
+    // produced (header /1, no disk line), and a /2 record that must still match render exactly.
+    check_settings_accepted("zbx-vm-settings/1\ncpus=11\nmemory_bytes=245210546176\n");
+    check_settings_accepted("zbx-vm-settings/2\ncpus=2\nmemory_bytes=2147483648\n" ++
+        "disk_bytes=68719476736\n");
+    check_settings_accepted("zbx-vm-settings/1\ncpus=2\n"); // Refused: nothing to check.
+}
+
+test "fuzz_vm holds on fixed seeds, the seed that broke the oracle's iteration among them" {
+    // Goal: the fuzzer's properties run under `zig build test`. Method: a few seeds.
+    for (1..40) |seed| fuzz_vm(seed);
 }
 
 fn check_status(random: std.Random) void {
