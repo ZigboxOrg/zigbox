@@ -503,7 +503,9 @@ test "vm cache: a stored file that fails its hash is not restored, and the entry
 
 test "vm cache: save keeps at most keys_per_entry_max keys of an entry" {
     // Goal: a store that never grows past a bound as pins move. Method: save under four pins in
-    // turn; the store must then hold the last two keys and nothing older.
+    // turn; the store must then hold the last two keys and nothing older. Each save's hash list is
+    // dated a second after the last: saves this close share an mtime on a coarse clock (the CI box
+    // ties them), and a tie would keep an arbitrary key rather than the newer one.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -521,12 +523,18 @@ test "vm cache: save keeps at most keys_per_entry_max keys of an entry" {
     which[0].dir = "dl";
     const pins = [_][]const u8{ "pin 1", "pin 2", "pin 3", "pin 4" };
     var keys: [pins.len][key_bytes_max]u8 = undefined;
+    const key_len = which[0].key_prefix.len + 1 + 2 * key_digest_bytes;
+    var path: [key_bytes_max + sums_name.len + 1]u8 = undefined;
     for (pins, 0..) |pin, index| {
         try workspace.writeFile(io, .{ .sub_path = "pin.zon", .data = pin });
         _ = key_of(&cache, &which[0], &keys[index]).?;
         save(&cache, &which);
+        const key = keys[index][0..key_len];
+        const sums = try std.fmt.bufPrint(&path, "{s}/{s}", .{ key, sums_name });
+        const second: i96 = std.time.ns_per_s * @as(i96, @intCast(index + 1));
+        const dated: Io.Timestamp = .fromNanoseconds(second);
+        try store.setTimestamps(io, sums, .{ .modify_timestamp = .{ .new = dated } });
     }
-    const key_len = which[0].key_prefix.len + 1 + 2 * key_digest_bytes;
     var count: u32 = 0;
     var it = store.iterate();
     while (try it.next(io)) |item| {
