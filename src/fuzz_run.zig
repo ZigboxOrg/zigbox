@@ -464,7 +464,7 @@ fn random_cgroup(random: std.Random, scenario: *Scenario) void {
     scenario.keeper_ended = null;
     if (scenario.keeper_fork_fails and random.boolean()) {
         scenario.keeper_ended = if (random.boolean())
-            .{ .exited = random.uintLessThan(u8, 256) }
+            .{ .exited = random.int(u8) }
         else
             .{ .signaled = random.intRangeAtMost(u8, 1, 64) };
     }
