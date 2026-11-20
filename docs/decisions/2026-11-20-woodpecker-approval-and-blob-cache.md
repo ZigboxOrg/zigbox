@@ -47,6 +47,17 @@ decision no longer holds. Before the new writer gets access, switch to
 or run the Woodpecker server on a different host from the agent (not built). Until then, write
 access is root on the box.
 
+**Proposed amendment (needs the owner's sign-off; not yet decided).** The paragraph above reads
+as if the bot of `ops/ci/README.md` 3a already widened write access, because it is a bot with
+write access. Proposed wording, to replace "(a collaborator, a team, a bot, an app with
+`contents: write`)" with "(a collaborator, a team, an app with `contents: write`, or a second
+bot)", and to add this sentence after it: "The one exception is the Woodpecker bot of
+`ops/ci/README.md` 3a: a single machine account with the `write` role on `ZigboxOrg/zigbox` only,
+added as an outside collaborator (never an organisation member), not on `main`'s push
+restrictions, whose token lives only on this box; it widens nothing because it is the account
+Woodpecker acts as, and `woodpecker-setup.sh` refuses while it, or any other account Woodpecker
+holds, can change `main` or is a repository admin."
+
 ## 2. The 60 s bound of demo-m4 stays; its VM cache entry is replaceable
 
 demo-m4's 60 s bound for its pulls does not move. The cause of the misses was the cache: a key, once

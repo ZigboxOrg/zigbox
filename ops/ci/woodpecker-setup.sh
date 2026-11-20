@@ -5,7 +5,9 @@
 #
 #   bash /opt/zigbox-ci/src/ops/ci/woodpecker-setup.sh
 #
-# It turns ZigboxOrg/zigbox on (Woodpecker adds the webhook on GitHub), then sets: Trusted
+# It turns ZigboxOrg/zigbox on (Woodpecker adds the webhook on GitHub), makes the token's own
+# account (the bot) the repository's owner in Woodpecker (POST /api/repos/ID/chown) and checks that
+# in Woodpecker's database, then sets: Trusted
 # (security and volumes: the demo steps' /dev/kvm and the /var/lib/zigbox-ci mount), approval
 # before any pipeline of a pull request from a fork (or, with ZBX_CI_APPROVAL=all_events and
 # ZBX_CI_APPROVED_USERS, before every pipeline not from the listed logins; see the runbook),
@@ -13,8 +15,15 @@
 # deletes vmw/* branches. It asks for three tokens, none echoed or put on a command line: the
 # Woodpecker token (User settings -> CLI & API) of a Woodpecker admin, the GitHub token for the
 # secret (empty keeps the stored one), and a read-only GitHub token for its checks (below; it is
-# not stored). Before it changes anything it refuses unless main cannot be changed by any account
-# Woodpecker holds a token for, and at the end it refuses if one of them is a repository admin.
+# not stored). Before it changes anything it refuses unless main's protection is as the runbook
+# sets it and the token's own account cannot change main; it ends by refusing if another account
+# Woodpecker holds a token for can change main (it names the one to delete, and by then the bot owns
+# the repository, so deleting it is safe), or if any of them is a repository admin.
+#
+# Why the owner matters: Woodpecker looks the repository's owner user up on every webhook, and
+# deleting that user leaves the repository pointing at a row that is gone, so every push and pull
+# request then answers 404 and no pipeline runs, with no error anywhere. The API does not show the
+# owner (user_id is not in its JSON), so the check reads the database file on this host (sqlite3).
 set -euo pipefail
 
 repo_name="ZigboxOrg/zigbox"
@@ -26,6 +35,8 @@ step() { echo "ci-setup: $*"; }
 [ "$(id -u)" = 0 ] || fail "run it as root on the CI box"
 command -v jq >/dev/null || fail "jq is missing; rerun the bootstrap (it installs jq)"
 command -v gh >/dev/null || fail "gh is missing (the check of main's protection needs it)"
+command -v sqlite3 >/dev/null || fail "sqlite3 is missing; rerun the bootstrap (it installs sqlite3)"
+command -v docker >/dev/null || fail "docker is missing; run the bootstrap first"
 [ -r "$etc/ci.env" ] || fail "$etc/ci.env is missing; run the bootstrap first"
 CI_HOST=$(sed -n 's/^CI_HOST=//p' "$etc/ci.env")
 [ -n "$CI_HOST" ] || fail "$etc/ci.env has no CI_HOST"
@@ -52,8 +63,10 @@ api() { # api METHOD PATH [curl args...]: the response body on stdout; fails on 
         "$server/api$path" "$@"
 }
 
-api GET /user >/dev/null ||
+me=$(api GET /user) ||
     fail "$server refused the Woodpecker token (log in again and copy a new one)"
+me_login=$(jq -r '.login // empty' <<<"$me")
+[ -n "$me_login" ] || fail "Woodpecker did not say whose token that is"
 
 # --- Who Woodpecker holds a token for, and main's protection -------------------------------------
 # Woodpecker keeps the GitHub OAuth token (scope `repo`) of every account that ever logged in, in
@@ -96,10 +109,16 @@ jq -e '(.allow_force_pushes.enabled // false) == false and (.allow_deletions.ena
     fail "main's protection allows force pushes or deletion: turn both off (ops/ci/README.md)"
 allowed=$(jq -r '[.restrictions.users[].login] + [(.required_pull_request_reviews
     .bypass_pull_request_allowances.users // [])[].login] | .[]' <<<"$prot")
+# The token's own account becomes the repository's owner below, so it must never be one that can
+# change main. Any other stored account that can is refused at the end, once the bot owns the
+# repository and deleting that account cannot orphan it.
+stale=""
 for login in $logins; do
     if grep -qix "$login" <<<"$allowed"; then
-        fail "$login holds a token in Woodpecker and may push, merge or bypass on main: remove it from \
-main's restrictions (ops/ci/README.md); Woodpecker may only know accounts that cannot change main"
+        [ "$login" != "$me_login" ] ||
+            fail "this Woodpecker token is $login's, and $login may push, merge or bypass on main: log \
+in to Woodpecker as the bot (ops/ci/README.md, step 3a) and use its token"
+        stale="$stale $login"
     fi
 done
 
@@ -118,6 +137,33 @@ if [ "$active" != true ]; then
     repo_id=$(api POST "/repos?forge_remote_id=$remote_id" | jq -r '.id')
 fi
 [ -n "$repo_id" ] || fail "could not turn on $repo_name"
+[[ "$repo_id" =~ ^[0-9]+$ ]] || fail "Woodpecker gave a repository id that is not a number: $repo_id"
+
+# --- The repository's owner ----------------------------------------------------------------------
+# chown makes the token's account the owner (Woodpecker 3.20.1, server/api/repo.go ChownRepo). The
+# owner is whoever turned the repository on, unless this is changed, and Woodpecker uses that
+# account's stored GitHub token for the clone, statuses and webhook.
+step "making $me_login the owner of $repo_name in Woodpecker"
+api POST "/repos/$repo_id/chown" >/dev/null || fail "Woodpecker refused to change the owner of \
+$repo_name to $me_login (the token must be a Woodpecker admin's: CI_ADMINS in $etc/ci.env)"
+volume=zigbox-ci_woodpecker-data
+db_dir=$(docker volume inspect "$volume" --format '{{.Mountpoint}}' 2>/dev/null) ||
+    fail "cannot find Docker's volume $volume; run the bootstrap first"
+db="$db_dir/woodpecker.sqlite"
+[ -r "$db" ] || fail "Woodpecker's database $db is not readable"
+sql() { sqlite3 -readonly -batch "$db" "$1"; }
+owner_login=$(sql "select u.login from repos r join users u on u.id = r.user_id where r.id = $repo_id") ||
+    fail "cannot read the owner of $repo_name from $db"
+[ -n "$owner_login" ] ||
+    fail "$repo_name has no owner user in Woodpecker's database: every webhook would answer 404 and \
+no pipeline would run; this script's chown should have set it, so report it"
+[ "$owner_login" = "$me_login" ] ||
+    fail "$repo_name is owned by $owner_login in Woodpecker, not by $me_login"
+orphans=$(sql "select r.full_name from repos r left join users u on u.id = r.user_id \
+    where u.id is null") || fail "cannot read Woodpecker's repositories from $db"
+[ -z "$orphans" ] ||
+    fail "Woodpecker holds a repository whose owner user is gone, so its webhooks answer 404: \
+$(paste -sd' ' <<<"$orphans"); run this script as the bot to take it over, or deactivate it"
 
 # Approval (Woodpecker 3.20.1, server/pipeline/gated.go): "forks" (the default) holds only pull
 # requests from forks; "all_events" holds every pipeline except cron and manual, unless its author
@@ -170,19 +216,29 @@ jq -e --arg a "$approval" "$want" >/dev/null <<<"$settings" ||
         cancel_previous_pipeline_events}' <<<"$settings")"
 # An admin can edit main's protection with the token Woodpecker stores. The repository can only be
 # turned on by an admin, so the run that turns it on may meet one: it warns and says what to do; every
-# other run refuses.
+# other run refuses. A permission that cannot be read is a failure, never "not an admin".
 admins=""
 for login in $logins; do
-    perm=$(gh_read "repos/$repo_name/collaborators/$login/permission" --jq .permission 2>/dev/null ||
-        echo unknown)
-    [ "$perm" = admin ] && admins="$admins $login"
+    perm=$(gh_read "repos/$repo_name/collaborators/$login/permission" --jq .permission 2>"$work/gh.err") ||
+        fail "cannot read $login's permission on $repo_name ($(head -c 200 "$work/gh.err" | tr '\n' ' ')): \
+the check token needs Administration: read, and $login must still exist on GitHub"
+    case "$perm" in
+        admin) admins="$admins $login" ;;
+        none | read | triage | write | maintain) ;;
+        *) fail "GitHub gave '$perm' as $login's permission on $repo_name, which this script does not know" ;;
+    esac
 done
 if [ -n "$admins" ]; then
     msg="Woodpecker holds the token of an admin of $repo_name:$admins. Make it write: gh api -X PUT \
-repos/$repo_name/collaborators/LOGIN -f permission=write (ops/ci/README.md, 'Owner steps', step 5)"
+repos/$repo_name/collaborators/LOGIN -f permission=write (ops/ci/README.md, step 3a, 'demote')"
     [ "$active" != true ] || fail "$msg"
     echo "ci-setup: WARNING $msg; this run turned the repository on, which needs an admin. Do it \
 now and run this script again: it refuses to finish while an admin is known here."
+fi
+if [ -n "$stale" ]; then
+    fail "Woodpecker still holds a token for$stale, which may push, merge or bypass on main. $repo_name \
+is owned by $me_login now, so deleting it is safe: for each login, curl -fsS -X DELETE -H @AUTH_FILE \
+$server/api/users/LOGIN (ops/ci/README.md, step 3a), and revoke its grant on GitHub, then run this again"
 fi
 has_secret=no
 api GET "/repos/$repo_id/secrets/github_token" >/dev/null 2>&1 && has_secret=yes

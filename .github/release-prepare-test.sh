@@ -70,6 +70,20 @@ d=$(fresh); tgz=$(ls "$d"/zbx-*-linux-x86_64.tar.gz); printf 'x' >> "$tgz"
 (cd "$d" && grep -v -F "${tgz##*/}" SHA256SUMS > s; sha256sum "${tgz##*/}" >> s; mv s SHA256SUMS)
 refuse "an edited SHA256SUMS" 'gpg refused SHA256SUMS.asc' "$d"
 
+# The Mac files, which the signed sums do not cover: the formula and the zip must still agree, and
+# the formula must name this release's zip (what the tap job re-checks on a published release).
+d=$(fresh); sed -i 's|releases/download/|releases/download/x|' "$d/zigbox.rb"
+refuse "a formula with another url" "formula's url is not" "$d"
+
+d=$(fresh); sed -i 's|^  sha256 ".*|  sha256 "0000000000000000000000000000000000000000000000000000000000000000"|' "$d/zigbox.rb"
+refuse "a formula with another sha256" "formula's sha256 is not" "$d"
+
+d=$(fresh); (cd "$work" && printf 'x' > evil && python3 -I -c \
+  'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); z.write("zbx"); z.write("evil"); z.close()' "$d/$zip")
+(cd "$d" && sha256sum "$zip" > "$zip.sha256" && cp "$zip.sha256" SHA256SUMS.macos &&
+  sed -i "s|^  sha256 .*|  sha256 \"$(cut -d ' ' -f 1 "$zip.sha256")\"|" zigbox.rb)
+refuse "a zip that holds more than zbx" "holds more than zbx" "$d"
+
 d=$(fresh); rpms=("$d"/*.rpm); rm "${rpms[0]}"
 refuse "a missing file" 'not exactly' "$d"
 

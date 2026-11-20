@@ -124,12 +124,19 @@ grep -qx "$resolved" <<<"$addrs" ||
 free_gb=$(df -BG --output=avail /var/lib | tail -1 | tr -dc 0-9)
 # The runbook's steady state (ops/ci/README.md, "Disk"): up to about 75 GiB of VM entries and five
 # Zig caches of 30 GiB each (225 GiB), then Docker workspaces and demo-s2's overlay on top.
+# A warm box already holds its caches, so a rerun counts what they use as available: the floor is
+# for space the caches can have, not for space that is free now (a box at its steady state would
+# fail it on every rerun). `du` is slow on tens of GiB, so it runs only when free space is short.
 free_min_gb=250
+if [ "$free_gb" -lt "$free_min_gb" ] && [ -d /var/lib/zigbox-ci ]; then
+    cached_kb=$(du -sk /var/lib/zigbox-ci 2>/dev/null | cut -f1 || true)
+    free_gb=$((free_gb + ${cached_kb:-0} / 1048576))
+fi
 [ "$free_gb" -ge "$free_min_gb" ] ||
-    fail "/var/lib has ${free_gb} GiB free; the VM images and caches need $free_min_gb"
+    fail "/var/lib has ${free_gb} GiB free, counting what /var/lib/zigbox-ci already uses; the VM images and caches need $free_min_gb"
 
 # --- Packages ------------------------------------------------------------------------------------
-pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl gh git jq qemu-system-x86
+pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl gh git jq sqlite3 qemu-system-x86
     qemu-utils)
 missing=()
 for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done

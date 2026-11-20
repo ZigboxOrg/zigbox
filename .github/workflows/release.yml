@@ -734,6 +734,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         with:
           formula: ${{ runner.temp }}/assets/zigbox.rb
+          url: https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
 
   # The one step that makes a release public, and so makes the tag (at the release commit, by
   # the draft's target). GITHUB_TOKEN with contents: write is enough; no App is involved.
@@ -815,7 +816,11 @@ jobs:
       || (needs.publish.result == 'skipped' && needs.plan.outputs.published == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: release-publish
+    # A release that is already published has assets a write token can replace, and this job
+    # commits what they say to the tap, which every Homebrew user installs from. So a run on an
+    # already published release (a re-dispatch) waits for the owner, as `linux` and `mac` do; the
+    # run that has just published it needs no second approval.
+    environment: ${{ needs.plan.outputs.published == 'true' && 'release' || 'release-publish' }}
     permissions:
       contents: read
     env:
@@ -837,18 +842,22 @@ jobs:
           sparse-checkout: /.github/actions/
           sparse-checkout-cone-mode: false
       - uses: ./.release-tools/.github/actions/setup-gh
-      - name: Download the published formula and zip, and check the hash
+      # The published assets get the check the draft got: the Linux files against SHA256SUMS and its
+      # signature by the pinned key (the repository's key, never the release's), and the formula's
+      # url, version and sha256 against the zip, which must hold only zbx. The Mac zip is not in the
+      # signed sums, so a changed zip with a matching formula passes this; the approval above is
+      # what stops that (ops/ci/README.md, "What stays reachable").
+      - name: Download the published assets and check them as the draft was
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
-          zip="zbx-$VERSION-macos-universal.zip"
-          "$GH" release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$zip" --pattern zigbox.rb
-          sha=$(sed -n 's/^ *sha256 "\([0-9a-f]\{64\}\)"$/\1/p' zigbox.rb)
-          [ -n "$sha" ] || { echo "release: the formula has no sha256" >&2; exit 1; }
-          echo "$sha  $zip" | sha256sum -c -
+          "$GH" release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          cd "$GITHUB_WORKSPACE"
+          .github/release-prepare-check.sh "$RUNNER_TEMP/assets" "$VERSION" "$TAG" \
+            "$GITHUB_REPOSITORY" docs/releases/zigbox-release-key.asc
       - name: Mint the App token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -865,6 +874,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         with:
           formula: ${{ runner.temp }}/assets/zigbox.rb
+          url: https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
       - name: Commit the formula
         if: ${{ steps.diff.outputs.changed == 'true' }}
         env:
@@ -1035,7 +1045,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q rpm shellcheck
       - name: ShellCheck
-        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/package-refresh.sh .github/package-refresh-test.sh
+        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/package-refresh.sh .github/package-refresh-test.sh
       - name: Every local action loads from the workflow's commit
         run: |
           # A release commit predates later tooling fixes, so `./.github/actions/...` (resolved in
@@ -1062,6 +1072,8 @@ jobs:
         run: .github/release-sign-test.sh "$RUNNER_TEMP/out"
       - name: The draft check passes the honest draft and refuses tampered ones
         run: .github/release-prepare-test.sh "$RUNNER_TEMP/out"
+      - name: The tap check refuses a formula whose url is not the release's zip
+        run: .github/tap-formula-test.sh
       - name: Refresh and refuse with a throwaway key
         run: .github/package-refresh-test.sh "$RUNNER_TEMP/refresh"
       - name: The archive holds what packaging.md says and nothing secret

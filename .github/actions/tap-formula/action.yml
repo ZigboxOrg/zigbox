@@ -8,6 +8,9 @@ inputs:
   formula:
     description: Path of the generated formula.
     required: true
+  url:
+    description: The one url the formula may name, the release's own zip download.
+    required: true
 outputs:
   changed:
     description: '"true" when the formula differs from the tap''s, else "false".'
@@ -23,8 +26,12 @@ runs:
       shell: bash --noprofile --norc -euo pipefail {0}
       env:
         FORMULA: ${{ inputs.formula }}
+        WANT_URL: ${{ inputs.url }}
         TAP: ZigboxOrg/homebrew-tap
       run: |
+        # Before anything is fetched: the formula names exactly one url, and it is the release's zip.
+        # The line filter below allows any url line, so this is the check on the value.
+        "$GITHUB_ACTION_PATH/check-url.sh" "$FORMULA" "$WANT_URL"
         current="${RUNNER_TEMP}/tap-current.rb"
         info=$(gh api "repos/$TAP/contents/Formula/zigbox.rb?ref=main" --jq '.sha')
         gh api -H 'Accept: application/vnd.github.raw' "repos/$TAP/contents/Formula/zigbox.rb?ref=main" > "$current"

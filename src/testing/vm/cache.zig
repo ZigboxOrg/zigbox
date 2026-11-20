@@ -150,7 +150,7 @@ pub fn restore(cache: *const Cache, which: []const Entry) void {
     for (which) |*entry| {
         var buffer: [key_bytes_max]u8 = undefined;
         const key = key_of(cache, entry, &buffer) orelse continue;
-        var seen: ?Io.File.INode = null;
+        var seen: ?Seen = null;
         restore_one(cache, entry, key, &seen) catch |err| {
             const name = @errorName(err);
             cache.log.print("cache: {s}: miss ({s}: {s})\n", .{ entry.name, key, name }) catch {};
@@ -171,24 +171,32 @@ fn is_bad_entry(err: anyerror) bool {
     };
 }
 
+/// The identity of the stored copy restore read: its directory's inode, and the SHA-256 of its
+/// `.sha256` bytes (null when the list was missing). An inode alone can come back after two
+/// replacements, so `drop_entry` compares the list too.
+const Seen = struct { inode: Io.File.INode, sums_digest: ?Digest };
+
 /// Copies the files the entry's list names and checks each copy's SHA-256 against it. A copy
 /// that does not match is deleted from the workspace (`error.HashMismatch`). `seen` is set to the
-/// inode of the stored directory that was read, the identity `drop_entry` checks.
+/// identity of the stored directory that was read, which `drop_entry` checks.
 fn restore_one(
     cache: *const Cache,
     entry: *const Entry,
     key: []const u8,
-    seen: *?Io.File.INode,
+    seen: *?Seen,
 ) !void {
     const io = cache.io;
     var source = try cache.store.openDir(io, key, .{});
     defer source.close(io);
-    seen.* = (try source.stat(io)).inode;
+    seen.* = .{ .inode = (try source.stat(io)).inode, .sums_digest = null };
     var sums_buffer: [sums_bytes_max]u8 = undefined;
     const sums = source.readFile(io, sums_name, &sums_buffer) catch |err| switch (err) {
         error.FileNotFound => return error.NoHashList,
         else => return err,
     };
+    var sums_digest: Digest = undefined;
+    Sha256.hash(sums, &sums_digest, .{});
+    seen.*.?.sums_digest = sums_digest;
     try cache.workspace.createDirPath(io, entry.dir);
     var target = try cache.workspace.openDir(io, entry.dir, .{});
     defer target.close(io);
@@ -210,18 +218,33 @@ fn restore_one(
 
 /// Deletes the stored copy that failed its check, under the store's lock, and only that copy:
 /// restore takes no lock, so a save may have replaced `key` since it was read, and the new copy
-/// is good. The copy's identity is the inode of its directory (`seen`); a replacement is written
-/// as a new directory while the old one still exists, so the two differ. No identity, or a key
-/// that is gone or has another inode, drops nothing.
-fn drop_entry(cache: *const Cache, key: []const u8, seen: ?Io.File.INode) void {
+/// is good. The copy's identity is the inode of its directory and the bytes of its `.sha256`
+/// (`seen`); a replacement is written as a new directory while the old one still exists, so the
+/// two differ, and the list covers an inode that the file system hands out again. No identity, or
+/// a key that is gone, has another inode or another list, drops nothing.
+fn drop_entry(cache: *const Cache, key: []const u8, seen: ?Seen) void {
     const io = cache.io;
-    const inode = seen orelse return;
+    const identity = seen orelse return;
     const lock_options: Io.Dir.CreateFileOptions = .{ .truncate = false, .lock = .exclusive };
     const lock = cache.store.createFile(io, ".lock", lock_options) catch return;
     defer lock.close(io);
     const now = cache.store.statFile(io, key, .{}) catch return;
-    if (now.inode != inode) return;
+    if (now.inode != identity.inode) return;
+    if (!same_list(cache, key, identity.sums_digest)) return;
     cache.store.deleteTree(io, key) catch {};
+}
+
+/// Whether the list stored at `key` is the one restore read: the same bytes, or, when restore
+/// found none (`want` null), still none that can be read.
+fn same_list(cache: *const Cache, key: []const u8, want: ?Digest) bool {
+    var buffer: [key_bytes_max + sums_name.len + 1]u8 = undefined;
+    const path = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ key, sums_name }) catch return false;
+    var sums_buffer: [sums_bytes_max]u8 = undefined;
+    const sums = cache.store.readFile(cache.io, path, &sums_buffer) catch return want == null;
+    const expected = want orelse return false;
+    var digest: Digest = undefined;
+    Sha256.hash(sums, &digest, .{});
+    return std.mem.eql(u8, &digest, &expected);
 }
 
 const SumLine = struct { digest: Digest, name: []const u8 };
@@ -902,6 +925,13 @@ test "vm cache: a growing entry is not stored by a failed run, and a damaged one
     try expect_stored(rig.store, "whole");
 }
 
+fn seen_of(rig: *Rig, io: Io) !Seen {
+    var sums: [sums_bytes_max]u8 = undefined;
+    var digest: Digest = undefined;
+    Sha256.hash(try rig.store.readFile(io, test_key ++ "/" ++ sums_name, &sums), &digest, .{});
+    return .{ .inode = (try rig.store.statFile(io, test_key, .{})).inode, .sums_digest = digest };
+}
+
 test "vm cache: dropping a bad entry leaves a copy that replaced it" {
     // Goal: restore reads without the lock, so by the time it drops what it judged bad, a save
     // may have put a good copy at the key. Method: read the stored copy's identity, replace the
@@ -914,7 +944,7 @@ test "vm cache: dropping a bad entry leaves a copy that replaced it" {
     const which = growing_entries();
     try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "cold" });
     save(&cache, &which, .{ .replace_changed = true });
-    const old = (try rig.store.statFile(io, test_key, .{})).inode;
+    const old = try seen_of(&rig, io);
     try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "warm" });
     save(&cache, &which, .{ .replace_changed = true });
     try testing.expect(std.mem.indexOf(u8, rig.log.buffered(), "replaced") != null);
@@ -922,8 +952,13 @@ test "vm cache: dropping a bad entry leaves a copy that replaced it" {
     try expect_stored(rig.store, "warm");
     drop_entry(&cache, test_key, null);
     try expect_stored(rig.store, "warm");
-    const current = (try rig.store.statFile(io, test_key, .{})).inode;
-    try testing.expect(current != old);
+    const current = try seen_of(&rig, io);
+    try testing.expect(current.inode != old.inode);
+    // The same directory with another list is another copy, as when an inode comes back.
+    var other = current;
+    other.sums_digest.?[0] ^= 1;
+    drop_entry(&cache, test_key, other);
+    try expect_stored(rig.store, "warm");
     drop_entry(&cache, test_key, current);
     try testing.expectError(error.FileNotFound, rig.store.access(io, test_key, .{}));
 }

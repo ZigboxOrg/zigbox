@@ -105,62 +105,108 @@ on your own machine, never on the box. Values you supply:
   `gh pr view <a recent pull request> --json author --jq .author.login` to see the first.
 - The fine-grained check token (below) and the bot's own tokens, which you make in the browser.
 
+Run these in this order. On a fresh box that is all there is. On a box whose repository is
+already turned on in Woodpecker, and which an owner's own login owns (the first setup of this
+runbook did that), the order is what keeps CI working: the repository is handed to the bot (step
+6) **before** the owner's login is deleted (step 8), because Woodpecker looks the repository's
+owner up on every webhook, and a repository whose owner is deleted answers every push with a 404
+and runs nothing, with no error anywhere.
+
 1. **Make the account** (browser: GitHub has no API to create an account or to enrol two-factor
    authentication): sign up as `BOT_LOGIN`, turn on two-factor authentication, and keep its
-   password and recovery codes with the owner. Never give it a role in the organisation beyond
-   member.
-2. **Invite it, give it admin for the activation, and set `main`'s protection** (needs `gh`, `jq`;
-   log in with `gh auth login` as an owner of `ZigboxOrg`):
+   password and recovery codes with the owner. It is never an organisation member: step 2 adds it
+   to `ZigboxOrg/zigbox` alone, as an outside collaborator.
+2. **Add it to the repository and set `main`'s protection** (needs `gh`, `jq`; log in with
+   `gh auth login` as an owner of `ZigboxOrg`). The role is `admin` on a fresh box, where the bot
+   turns the repository on (GitHub lets only an admin do that), and `write` when the repository is
+   already on in Woodpecker:
 
    ```bash
    export BOT_LOGIN=zigbox-ci-bot OWNER_LOGINS=zvozin   # your values
-   bash ops/ci/owner-github.sh admin
+   bash ops/ci/owner-github.sh admin    # or: write, on a box whose repository is already on
    ```
 
-   The first run invites the bot to `ZigboxOrg` and stops. Log in as the bot in a private browser
-   window, accept at <https://github.com/ZigboxOrg> (or `gh api -X PATCH
-   user/memberships/orgs/ZigboxOrg -f state=active` with the bot's own `gh` login), and run the
-   same command again. It then makes the bot a collaborator with `admin` on `ZigboxOrg/zigbox`
-   (GitHub lets only an admin turn a repository on in Woodpecker) and replaces `main`'s protection
-   with: pull requests required (**no approving review**, so the supervisor's merges still work),
-   `enforce_admins`, force pushes and deletion off, and **pushes and merges restricted to
-   `OWNER_LOGINS`**. It reads everything back and ends in `owner-github: OK ...`. Before you run
-   it, check that no workflow pushes to `main` with a token of its own: `grep -n 'git push'
-   .github/workflows/*.yml` (none does today besides tags); if one does, pass its GitHub App's slug
-   in `ALLOW_APPS=slug` to the command.
+   The first run invites the bot to `ZigboxOrg/zigbox` and stops. Log in as the bot in a private
+   browser window, accept at <https://github.com/ZigboxOrg/zigbox/invitations> (or `gh api -X
+   PATCH user/repository_invitations/ID` with the bot's own `gh` login; the command printed the
+   id), and run the same command again. It then replaces `main`'s protection (**the whole
+   protection: anything set by hand and not listed here is gone**) with: pull requests required
+   (**no approving review**, so the supervisor's merges still work), `enforce_admins`, force pushes
+   and deletion off, and **pushes and merges restricted to `OWNER_LOGINS`**. It refuses if the bot
+   is an organisation member while `ZigboxOrg`'s default repository permission is more than
+   `read`. It reads everything back (the restrictions are exactly `OWNER_LOGINS` and `ALLOW_APPS`,
+   reviews are required) and ends in `owner-github: OK ...`. Before you run it, check that no
+   workflow pushes to `main` with a token of its own: `grep -n 'git push' .github/workflows/*.yml`
+   (none does today besides tags); if one does, pass its GitHub App's slug in `ALLOW_APPS=slug`.
 3. **Make the two read tokens** (browser: GitHub has no API for fine-grained tokens), at
    <https://github.com/settings/personal-access-tokens/new>. As the **owner**: `ZigboxOrg/zigbox`
-   only, **Administration: Read** and **Metadata: Read**, expiry 30 days; step 4's script asks for
+   only, **Administration: Read** and **Metadata: Read**, expiry 30 days; step 6's script asks for
    it, uses it for its checks and does not store it. As the **bot** (logged in as the bot):
-   `ZigboxOrg/zigbox` only, **Contents: Read and write**, for the branch deletion (step 4).
-4. Step 3 of this runbook must ask for `BOT_LOGIN` as the Woodpecker admin; to change it later,
-   edit `CI_ADMINS` in `/etc/zigbox-ci/ci.env` and run the bootstrap command again.
-5. **After step 4's first run, take the admin role away and run the script again:**
+   `ZigboxOrg/zigbox` only, **Contents: Read and write**, for the branch deletion (step 6).
+4. **Make the bot the Woodpecker admin** (on a fresh box the bootstrap asked for it). On the box,
+   as root: set `CI_ADMINS=BOT_LOGIN` in `/etc/zigbox-ci/ci.env`, then run the bootstrap command of
+   step 3 again. It installs `sqlite3`, which step 6 uses to check the repository's owner.
+5. **Log in to Woodpecker as the bot** (browser, a private window, <https://ci.zigbox.org>, grant
+   access to `ZigboxOrg`) and copy its token from **User settings → CLI & API**.
+6. **Set the repository up: this makes the bot its owner.** As root on the box (step 4 below has
+   the details):
+
+   ```bash
+   bash /opt/zigbox-ci/src/ops/ci/woodpecker-setup.sh
+   ```
+
+   Run as the bot, it calls `POST /api/repos/ID/chown`, then reads Woodpecker's own database file
+   (`sqlite3 -readonly`, because the API does not show a repository's owner) and refuses unless
+   the repository's owner is the bot and **no repository has an owner whose user is gone**. On a
+   box that still has the owner's login in Woodpecker, this first run does its work and then ends
+   in a refusal that names the accounts to delete: that is step 8, then run it again (step 9).
+7. **Take the admin role away, if step 2 gave it:**
 
    ```bash
    bash ops/ci/owner-github.sh write
    ```
 
-   then, on the box, rerun `woodpecker-setup.sh` (step 4): it refuses to finish while any account
-   Woodpecker holds a token for is an admin of the repository, or may push or merge into `main`.
    Woodpecker keeps working with `write`: it clones, posts statuses and receives webhooks with it.
    If a pipeline later fails with a 403 from GitHub that names the webhook, repeat `admin`, let
    Woodpecker repair it, and go back to `write`.
-6. **Remove accounts Woodpecker should not know.** If you (or anyone else) ever logged in to
+8. **Remove every other account Woodpecker knows.** If you (or anyone else) ever logged in to
    Woodpecker, the box holds that account's GitHub token. Delete it from Woodpecker with the bot's
-   Woodpecker token (step 4), then revoke the grant on GitHub, which only the account itself can
-   do in the browser (the API needs the token that is stored): <https://github.com/settings/applications>
-   → Authorized OAuth Apps → Zigbox CI → Revoke.
+   token, then revoke the grant on GitHub, which only the account itself can do in the browser
+   (the API needs the token that is stored): <https://github.com/settings/applications> → Authorized
+   OAuth Apps → Zigbox CI → Revoke. `WOODPECKER_TOKEN` is the value you copied in step 5. The
+   token stays off the command line (it would show in `ps` and the shell history): it goes in a
+   file only you can read, which `curl -H @file` reads.
 
    ```bash
-   curl -fsS -X DELETE -H "Authorization: Bearer $WOODPECKER_TOKEN" https://ci.zigbox.org/api/users/OWNER_LOGIN
-   curl -fsS -H "Authorization: Bearer $WOODPECKER_TOKEN" https://ci.zigbox.org/api/users | jq -r '.[].login'
+   umask 077; auth=$(mktemp)
+   read -rsp 'Woodpecker token: ' WOODPECKER_TOKEN; echo
+   printf 'Authorization: Bearer %s\n' "$WOODPECKER_TOKEN" > "$auth"; unset WOODPECKER_TOKEN
+   curl -fsS -H @"$auth" https://ci.zigbox.org/api/users | jq -r '.[].login'
+   curl -fsS -X DELETE -H @"$auth" https://ci.zigbox.org/api/users/OWNER_LOGIN   # each one but the bot
+   curl -fsS -H @"$auth" https://ci.zigbox.org/api/users | jq -r '.[].login'     # only the bot now
+   rm -f "$auth"
    ```
 
-   The list must show only the bot. Approving a fork's pull request (step 5 of the runbook) then
-   means logging in to Woodpecker as the bot, in a private window.
+   Approving a fork's pull request (step 5 of the runbook) then means logging in to Woodpecker as
+   the bot, in a private window.
+9. **Run `woodpecker-setup.sh` again** (step 6's command). It must end `ci-setup: OK`: it refuses
+   while any account Woodpecker holds a token for is an admin of the repository, or may push or
+   merge into `main`, or if a permission cannot be read.
+10. **Check that a webhook is delivered and runs.** Deleting the wrong account breaks this
+    silently, so look at GitHub's side. Push a scratch branch and read the delivery:
 
-**4. Log in as the bot, then set the repository up.** Logging in is GitHub's OAuth consent, so it is a
+    ```bash
+    git push origin HEAD:refs/heads/vmw/m0-ci-check
+    gh api repos/ZigboxOrg/zigbox/hooks --jq '.[] | select(.config.url | test("ci.zigbox.org")) | .id'
+    gh api repos/ZigboxOrg/zigbox/hooks/HOOK_ID/deliveries --jq '.[0] | "\(.event) \(.status_code)"'
+    ```
+
+    The last line must be `push 200` (a `404` means the repository's owner is gone: run step 6 as
+    the bot), and the pipeline must appear in the public API
+    (`curl -fsS https://ci.zigbox.org/api/repos/lookup/ZigboxOrg/zigbox` then its `/pipelines`).
+    Delete the scratch branch afterwards.
+
+**4. Details of step 3a.6, the repository's set-up.** Logging in is GitHub's OAuth consent, so it is a
 browser step: in a private window open <https://ci.zigbox.org>, log in with GitHub as the bot of 3a and grant access to `ZigboxOrg`.
 Then copy your personal token from **User settings → CLI & API** (Woodpecker makes its API tokens
 only for a logged-in browser session; there is no API call that mints the first one).
@@ -224,6 +270,16 @@ which is false):
   A required status check does not help either: the box's own token can post a commit status
   under any name, and a check from GitHub Actions can be satisfied by a workflow the pull request
   itself defines.
+- **Releases and the Homebrew tap.** A writer's token can also edit a *published* release's assets
+  and re-dispatch `release.yml`, whose `tap` job commits the release's formula to
+  `ZigboxOrg/homebrew-tap`, which Homebrew users install from. Three things stop that: a run on an
+  already published release waits for the owner's approval of the `release` environment; the job
+  re-runs the draft's check on the published assets (the Linux files against `SHA256SUMS` and its
+  signature by the pinned key, the formula's url, version and sha256 against the zip, which must
+  hold only `zbx`); and `tap-formula` refuses a formula whose url is not the release's own zip. What
+  is **not** covered: the Mac zip and the formula are outside the signed `SHA256SUMS`, so a writer
+  who replaces both consistently passes the check and only the approval stops it. Closing that
+  needs the Mac zip's hash in a signed file (a decision for the owner: `docs/releases/`).
 - **So the control is on accounts, not on the protection alone:** Woodpecker only ever knows a
   dedicated bot account with the `write` role, which is not on `main`'s restriction list; the owner
   accounts that can merge never log in to it (step 3a). `woodpecker-setup.sh` checks this, with a
@@ -374,7 +430,7 @@ Each log line comes back base64-encoded in `.data`. The run's page is
   10 to 15 GiB per scope and up to about 75 GiB over the five scopes once all are warm, besides the
   Zig caches (30 GiB each at most). These figures are estimates, not measurements: read the real
   ones with `du -sh /var/lib/zigbox-ci/*/vm-entries/*`. `bootstrap.sh` refuses a box with under
-  250 GiB free (the steady state of about 225 GiB, with Docker's own on top), and before demo-s2
+  250 GiB free, counting what `/var/lib/zigbox-ci` already uses, so a rerun on a warm box passes (the steady state of about 225 GiB, with Docker's own on top), and before demo-s2
   the driver prints `df -h` for the workspace and the VM cache and refuses with one line naming the
   shortfall (`demo-s2: 12 GiB free under .; it needs 30`) when either has under 30 GiB. Each stored entry carries the SHA-256 of its files and is checked on every
   restore: a file that does not match is not used, and the entry is deleted and stored again from
