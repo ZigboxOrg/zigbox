@@ -795,7 +795,8 @@ pub fn fuzzer_missing_from(fuzz_source: []const u8, workflow: []const u8) ?[]con
 const fuzz_step = "run: zig build fuzz -- ";
 
 /// True if a line of `workflow` runs fuzzer `name`: a matrix item `- name`, or a step
-/// `zig build fuzz -- name ...`, `-- all ...`, or `-- all-but <other> ...` (every fuzzer but
+/// `zig build fuzz -- name ...`, `-- all ...`, `-- shard I N ...` (every fuzzer, one slice of
+/// its iterations: the job must run all N shards), or `-- all-but <other> ...` (every fuzzer but
 /// `<other>`).
 fn workflow_lists(workflow: []const u8, name: []const u8) bool {
     assert(name.len > 0);
@@ -809,6 +810,7 @@ fn workflow_lists(workflow: []const u8, name: []const u8) bool {
         var words = std.mem.tokenizeScalar(u8, item[fuzz_step.len..], ' ');
         const first = words.next() orelse continue;
         if (std.mem.eql(u8, first, "all")) return true;
+        if (std.mem.eql(u8, first, "shard")) return true;
         if (std.mem.eql(u8, first, name)) return true;
         if (std.mem.eql(u8, first, "all-but")) {
             const excluded = words.next() orelse continue;
@@ -1115,6 +1117,8 @@ test "a fuzzer missing from the CI matrix is found" {
     const prefix = all_but ++ "        run: zig build fuzz -- diagnostic 1 10000\n";
     try testing.expectEqualStrings("diag", fuzzer_missing_from(source, prefix).?);
     try testing.expect(fuzzer_missing_from(source, "run: zig build fuzz -- all-but\n") != null);
+    const shard = "run: zig build fuzz -- shard ${{ matrix.shard }} 4 10000\n";
+    try testing.expect(fuzzer_missing_from(source, shard) == null);
 }
 
 test "line length: 100 columns pass, 101 fail, multibyte counts as one column" {
