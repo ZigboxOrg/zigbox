@@ -39,35 +39,81 @@ and publish that where users look for keys). Until then the old public key stays
 keyrings. That is harmless while nobody can sign with it, and it is why users must replace the file
 rather than add to it.
 
-## What existing users do
+## When the new key is served
 
-Packages and repository metadata signed from now on are by the new key. A machine that holds only the
-old keyring refuses them: apt fails `apt update` with `NO_PUBKEY 4A1D7E3AD844177A496A072EC07B2441C39645B7`
-(or `EXPKEYSIG` / `BADSIG`), and dnf or rpm refuses the signature. Check the fingerprint printed below
-against the one in this file before trusting it.
+The weekly refresh cannot switch the keyring. `.github/package-refresh.sh` checks the newest
+release's `SHA256SUMS.asc`, `Release.gpg` and `InRelease`, and the `InRelease` zigbox.org serves,
+against the *current* subkey of `ZIGBOX_SIGNING_FPR` ("is not by a subkey of ZIGBOX_SIGNING_FPR",
+"no valid signature"). The newest release carrying `zigbox-repos.tar.gz` is 0.5.x, signed by the old
+subkey, so until a release is signed with the new key:
+
+- the weekly `package-refresh` fails every Monday (the schedule stays on; its failure is expected,
+  and nothing about it needs the owner);
+- the served apt `Release` passes its `Valid-Until` (21 days after its last signing,
+  `apt_valid_seconds` in `src/constants.zig`) and stays expired: every apt user, whatever keyring
+  they hold, sees `Release file ... is expired` (apt refuses it, or warns, depending on the
+  version) and cannot install or upgrade until 0.6.0;
+- the keyring at `https://zigbox.org/zigbox-archive-keyring.gpg` and `.asc` stays the old one.
+
+So the served keyring changes only with 0.6.0, the first release signed by the new key. Before
+announcing, the owner fetches both URLs and checks that `gpg --show-keys` prints
+`1207 CB86 00CE 25FF DD3C  C87E CCBE C141 C334 8787`, and that the served `InRelease` verifies against it.
+
+## What existing users do (from 0.6.0 on)
+
+Do not run these before 0.6.0 is out: the served keyring is the old one until then, and the
+fingerprint check below will fail. Packages and repository metadata signed from then on are by the
+new key. A machine that holds only the old keyring refuses them: apt fails `apt update` with
+`NO_PUBKEY C07B2441C39645B7` (the long id of the new signing subkey; it may also say `EXPKEYSIG` or
+`BADSIG`), and dnf or rpm refuses the signature. Each step below downloads to a temporary file,
+checks the fingerprint, and only then installs it. If the check does not show
+`1207 CB86 00CE 25FF DD3C  C87E CCBE C141 C334 8787`, stop and delete the file.
 
 apt (Debian, Ubuntu), replacing the file the install guide wrote:
 
 ```sh
-curl -fsSL https://zigbox.org/zigbox-archive-keyring.gpg | sudo tee /usr/share/keyrings/zigbox.gpg >/dev/null
-gpg --show-keys --with-fingerprint /usr/share/keyrings/zigbox.gpg   # must show 1207 CB86 00CE 25FF DD3C  C87E CCBE C141 C334 8787
+curl -fsSLo /tmp/zigbox-new.gpg https://zigbox.org/zigbox-archive-keyring.gpg
+```
+
+```sh
+gpg --show-keys --with-fingerprint /tmp/zigbox-new.gpg
+```
+
+```sh
+sudo install -m 0644 /tmp/zigbox-new.gpg /usr/share/keyrings/zigbox.gpg
+```
+
+```sh
 sudo apt update
 ```
 
 dnf (Fedora, Rocky, RHEL):
 
 ```sh
-sudo rpm --import https://zigbox.org/zigbox-archive-keyring.asc
+curl -fsSLo /tmp/zigbox-new.asc https://zigbox.org/zigbox-archive-keyring.asc
+```
+
+```sh
+gpg --show-keys --with-fingerprint /tmp/zigbox-new.asc
+```
+
+```sh
+sudo rpm --import /tmp/zigbox-new.asc
+```
+
+```sh
+sudo rpm -e gpg-pubkey-28b7dbb7
+```
+
+```sh
 sudo dnf clean metadata && sudo dnf makecache
 ```
 
-The old key's `gpg-pubkey` entry stays in rpm's database; it is harmless, and
-`rpm -qa gpg-pubkey*` lists it (`gpg-pubkey-28b7dbb7-*`) if the user wants to `sudo rpm -e` it.
+`rpm -qa 'gpg-pubkey*'` lists the old key's entry as `gpg-pubkey-28b7dbb7-*`; the `rpm -e` removes it
+(use the full name that listing prints if rpm says the short one is ambiguous). Skipping it is
+harmless, but the old key then stays trusted by rpm. Delete the temporary files afterwards.
 
-Because the repository trees are replaced by the weekly refresh and the next release, the keyring
-served at `https://zigbox.org/zigbox-archive-keyring.gpg` carries the new key only after the first
-refresh or release signed with it; the owner checks that URL's fingerprint before announcing. The
-`zigbox-archive-keyring` package of
+The `zigbox-archive-keyring` package of
 [2026-11-13-keyring-renewal-needs-refetch.md](2026-11-13-keyring-renewal-needs-refetch.md) would have
 made this automatic; it is still a follow-up.
 
