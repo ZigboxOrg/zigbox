@@ -308,3 +308,49 @@ test "put_chunk waits for a gc's exclusive lock, gives up with Busy, and then wo
     try testing.expectEqual(@as(u32, 1), progress.have);
     try testing.expectEqual(@as(u32, 0), files.open_count());
 }
+
+fn outside_the_namespace(context: *anyopaque) bool {
+    assert(@intFromPtr(context) != 0);
+    return false;
+}
+
+test "outside the namespace an object of a container id but root is held, not made, until finished inside" {
+    // Goal: pin the gap in docs/decisions/2026-11-18-s2-lazy-owner-outside.md. The lazy
+    // resolver's threads put chunks outside the store's namespace, where a user without
+    // `CAP_CHOWN` cannot give a file any owner but their own. Rootless, so an object of 0:42
+    // (Alpine's /etc/shadow) cannot be assembled there. Method: owners `outside`, with a
+    // subordinate range and without, and the file system refusing a change of owner; every
+    // chunk is put. The last put fails and no object exists, but every chunk is still held,
+    // verified. The same chunks then finish with `owners` `.inside` and the gate open (the
+    // namespace child), so a completion in the namespace needs nothing fetched again. An id
+    // the map does not reach fails the same way, before a change of owner is tried.
+    const ranges = [_]?@import("owners.zig").Range{
+        .{ .uid_start = 100000, .gid_start = 100000 },
+        null,
+    };
+    for (ranges) |range| {
+        start();
+        var wanted = wanted_for(long);
+        wanted.attrs = .{ .mode = 0o640, .uid = 0, .gid = 42, .xattrs = &xattrs.empty };
+        wanted.id = object.object_id(wanted.content, wanted.attrs);
+        files.faults.owner_gate = .{
+            .context = &files,
+            .in_new_user_namespace = outside_the_namespace,
+        };
+        store.owners = .{ .outside = .{ .uid = 1000, .gid = 1000, .range = range } };
+        const total: u32 = @intCast(wanted.hashes.len);
+        for (0..total - 1) |index| _ = try put(&wanted, long, @intCast(index));
+        try testing.expectError(error.StoreFailed, put(&wanted, long, total - 1));
+        const object_path = object_file(&wanted);
+        const path = std.mem.sliceTo(&object_path, 0);
+        try testing.expect(files.content_of(path) == null);
+        // Every chunk is still held: a later, inside, completion needs no fetch.
+        files.faults.owner_gate = null;
+        store.owners = .inside;
+        var failure: chunks.Failure = undefined;
+        const done = try chunks.finish(&store, &io, &wanted, &failure);
+        try testing.expect(done.complete);
+        try testing.expect(!done.duplicate);
+        try testing.expectEqual(@as(u32, 42), files.stat_of(path).?.gid);
+    }
+}
