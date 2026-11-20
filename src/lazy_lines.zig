@@ -102,6 +102,12 @@ pub fn describe(diag: *Diag, given: *const lazy.Event) void {
             const why = unavailable_why(given);
             lazy_diagnose.chunk_unavailable(diag, given.id, given.chunk, why, tried);
         },
+        .not_kept => lazy_diagnose.chunk_not_kept(
+            diag,
+            given.id,
+            given.chunk,
+            &given.store_failure,
+        ),
         .store_full => lazy_diagnose.store_full(diag, given.id, given.chunk),
     }
     assert(diag.code != null);

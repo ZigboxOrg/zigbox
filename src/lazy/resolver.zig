@@ -18,6 +18,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
 const flate = std.compress.flate;
+const chunks = @import("../store/chunks.zig");
 const constants = @import("../constants.zig");
 const layout = @import("../store/layout.zig");
 const lazy = @import("lazy.zig");
@@ -73,6 +74,10 @@ pub const Work = struct {
     refetch: [job_chunks_max]bool,
     /// The chunk's put made its object whole.
     whole: [job_chunks_max]bool,
+    /// The chunk is held but its object could not be made, for a reason `land.owner_refused`
+    /// does not name: shown once per object (`Schedule.not_kept`). Valid where `unkept`.
+    unkept: [job_chunks_max]bool,
+    unkept_failures: [job_chunks_max]chunks.Failure,
     sent: u64,
 };
 
@@ -622,6 +627,7 @@ pub const Resolver = struct {
             work.chunks[at] = entry.chunk;
             work.refetch[at] = entry.refetch;
             work.whole[at] = false;
+            work.unkept[at] = false;
             work.results[at] = .failed;
         }
     }
@@ -636,6 +642,10 @@ pub const Resolver = struct {
                 resolver.fill.paused_until_ms = now + constants.lazy_down_probe_ms;
             }
             if (work.whole[at]) resolver.schedule.mark_whole(work.objects[at]);
+            if (work.unkept[at]) {
+                const failure = work.unkept_failures[at];
+                resolver.schedule.not_kept(work.objects[at], work.chunks[at], failure);
+            }
         }
         resolver.schedule.job_done(slot, work.results[0..count], work.sent, now);
     }
@@ -821,7 +831,16 @@ pub const Resolver = struct {
         const put = resolver.memory[slot].put;
         const store = resolver.options.store;
         const chunk = work.chunks[at];
-        const landed = land_mod.land(store, put, &object.wanted, object.chaining, chunk, bytes);
+        var failure: chunks.Failure = undefined;
+        const landed = land_mod.land(
+            store,
+            put,
+            &object.wanted,
+            object.chaining,
+            chunk,
+            bytes,
+            &failure,
+        );
         return switch (landed) {
             .landed => .landed,
             .whole => whole: {
@@ -833,7 +852,12 @@ pub const Resolver = struct {
             .store_full => .store_full,
             .busy => .busy,
             // The source's bytes were right and are held: its answer, and a read gets them.
-            .held => .landed,
+            // The rootless owner gap is known and silent; any other cause is shown.
+            .held => held: {
+                work.unkept[at] = !land_mod.owner_refused(&failure);
+                work.unkept_failures[at] = failure;
+                break :held .landed;
+            },
             .failed => .failed,
         };
     }

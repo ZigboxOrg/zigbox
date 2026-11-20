@@ -10,6 +10,7 @@ const Diag = @import("../diag/diag.zig").Diag;
 const Digest = @import("../store/digest.zig").Digest;
 const errors = @import("../diag/errors.zig");
 const host_mod = @import("../host.zig");
+const Failure = @import("../store/fs.zig").Failure;
 
 /// What is wrong with a library caller's lazy sources (`StartOptions.lazy_sources`).
 pub const SourcesProblem = enum { no_lazy, no_peers_hook, too_many };
@@ -293,6 +294,20 @@ pub fn store_full(diag: *Diag, object: Digest, chunk: u32) void {
     );
     diag.context("object", "{s}", .{object.text()});
     diag.fix(.{ .sentence = "free space on the disk that holds the store, then read it again" });
+}
+
+/// ZBX-E0417 for a chunk the store holds but could not make an object of: the reads are served
+/// from the held chunks, so no read failed; the object stays unmade while the cause lasts.
+pub fn chunk_not_kept(diag: *Diag, object: Digest, chunk: u32, failure: *const Failure) void {
+    assert(diag.code == null);
+    assert(failure.errno < 4096);
+    diag.raise(.E0417);
+    diag.while_("keeping a fetched chunk of a lazily started image", .{});
+    errors.cause_host_error(diag, "writing the store", failure.err, failure.errno);
+    diag.context("object", "{s}", .{object.text()});
+    diag.context("chunk", "{d}", .{chunk});
+    diag.fix(.{ .sentence = "check that you can write to the store directory, and the disk" });
+    assert(diag.code == .E0417);
 }
 
 test "E1201 names which of the host's lacks keeps a lazy run from FUSE" {

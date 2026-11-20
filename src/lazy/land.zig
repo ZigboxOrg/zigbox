@@ -208,10 +208,13 @@ pub const Landed = enum {
     /// The store lock is held by a gc or a restore; try again later.
     busy,
     /// The chunk is held in `partial/`, verified, but the put failed after keeping it: the
-    /// object could not be assembled (rootless, outside the namespace, an owner the user may
-    /// not give: docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md). The source's
-    /// bytes were right and a read is served from the held chunk; this is not the source's
-    /// failure.
+    /// object could not be assembled. The source's bytes were right and a read is served from
+    /// the held chunk; this is not the source's failure. The caller tells the causes apart by
+    /// the failure `land` fills in: `owner_refused` is the rootless gap, a known and accepted
+    /// cost (docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md); any other cause (the
+    /// generation bump, an `objects/` that cannot be written, EIO on the rename or the sync,
+    /// the lock file) leaves the object unmade for as long as it lasts, and is shown once per
+    /// object (`Event.Kind.not_kept`).
     held,
     /// Another failure of the store.
     failed,
@@ -230,9 +233,22 @@ pub fn anchored(chaining: []const Digest, index: u32, chunk_bytes: u32, bytes: [
     return chaining_mod.run_value(bytes, index, chunk_bytes).eql(chaining[index]);
 }
 
+/// True if `failure` is the refusal of an owner the user may not give, outside the namespace
+/// (`object.apply_owner`): an id the map cannot show (`AccessDenied`, no errno) or a `fchown`
+/// the kernel refused (EPERM). EACCES, the denial of a directory that cannot be written, is
+/// not it.
+pub fn owner_refused(failure: *const chunks.Failure) bool {
+    assert(failure.errno < 4096);
+    if (failure.err != error.AccessDenied) return false;
+    return failure.errno == 0 or failure.errno == errno_perm;
+}
+
+const errno_perm = 1;
+
 /// Checks `bytes` against chunk `index` and keeps them with `put_chunk`. `io` is the put's copy
 /// buffer. The caller holds no lock of the resolver's but serialises calls on one `store`
-/// (its temporary names and counters are not shared safely between threads).
+/// (its temporary names and counters are not shared safely between threads). `failure` is
+/// filled when the result is `.held`, `.failed` or `.store_full`.
 pub fn land(
     store: *Store,
     io: []u8,
@@ -240,21 +256,24 @@ pub fn land(
     chaining: []const Digest,
     index: u32,
     bytes: []const u8,
+    failure: *chunks.Failure,
 ) Landed {
     assert(index < wanted.hashes.len);
     assert(io.len >= 4096);
+    assert(@intFromPtr(failure) != 0);
+    // Some failures of the put (the listing of `partial/`) name no cause; this is what they read.
+    failure.* = .{ .err = error.IoFailed, .errno = 0 };
     if (bytes.len != chunks.chunk_length(store, wanted.size, index)) return .lied;
     if (!Digest.of(bytes).eql(wanted.hashes[index])) return .lied;
     if (!anchored(chaining, index, store.chunk_bytes, bytes)) return .lied;
-    var failure: chunks.Failure = undefined;
-    const progress = chunks.put_chunk(store, io, wanted, index, bytes, &failure) catch |err| {
+    const progress = chunks.put_chunk(store, io, wanted, index, bytes, failure) catch |err| {
         return switch (err) {
             // Checked just above: `put_chunk` agreeing is the pair of that check.
             error.WrongLength, error.HashMismatch, error.IndexOutOfRange => unreachable,
             error.BadWanted => .failed,
             error.ContentMismatch => .content_mismatch,
             error.Busy => .busy,
-            error.StoreFailed => if (failure_is_full(&failure))
+            error.StoreFailed => if (failure_is_full(failure))
                 .store_full
             else if (chunks.is_held(store, wanted, index))
                 .held
@@ -274,7 +293,7 @@ pub fn land(
 pub fn land_empty(store: *Store, io: []u8, wanted: *const Wanted) Landed {
     assert(wanted.size == 0);
     assert(wanted.hashes.len == 0);
-    var failure: chunks.Failure = undefined;
+    var failure: chunks.Failure = .{ .err = error.IoFailed, .errno = 0 };
     const progress = chunks.finish(store, io, wanted, &failure) catch |err| {
         return switch (err) {
             error.Busy => .busy,

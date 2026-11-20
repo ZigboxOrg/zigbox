@@ -213,6 +213,35 @@ test "a held chunk that was damaged is replaced, not trusted" {
     try expect_object(&wanted, long);
 }
 
+test "is_held is true only for a chunk that is there and hashes right" {
+    // Goal: `land` answers `.held` from `is_held` (a put that failed after keeping its chunk),
+    // so it must not be a look at the name: a damaged or missing chunk is not held. Method:
+    // put two chunks of a five-chunk object; check chunk 0 held, then flip a byte of it (held
+    // no more), then remove chunk 1 (not held), and chunk 2, never put (not held). Then the
+    // damaged chunk is put again and is held.
+    start();
+    const wanted = wanted_for(long);
+    _ = try put(&wanted, long, 0);
+    _ = try put(&wanted, long, 1);
+    try testing.expect(chunks.is_held(&store, &wanted, 0));
+    try testing.expect(chunks.is_held(&store, &wanted, 1));
+    try testing.expect(!chunks.is_held(&store, &wanted, 2));
+    var held: [constants.sim_fs_path_bytes_max]u8 = undefined;
+    const hex = wanted.id.hex();
+    const format = root_path ++ "/partial/{s}/{d}";
+    const path = std.fmt.bufPrint(&held, format, .{ hex, 0 }) catch unreachable; // Short.
+    files.flip_byte(path, 2);
+    try testing.expect(!chunks.is_held(&store, &wanted, 0));
+    try testing.expect(chunks.is_held(&store, &wanted, 1));
+    var removed: [constants.sim_fs_path_bytes_max]u8 = undefined;
+    const second = std.fmt.bufPrintSentinel(&removed, format, .{ hex, 1 }, 0) catch
+        unreachable; // Short.
+    try store.fs.unlink(second);
+    try testing.expect(!chunks.is_held(&store, &wanted, 1));
+    _ = try put(&wanted, long, 0);
+    try testing.expect(chunks.is_held(&store, &wanted, 0));
+}
+
 test "a wanted that lies is refused: its id, its count, its one-chunk hash" {
     start();
     const wanted = wanted_for(long);
