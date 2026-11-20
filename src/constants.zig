@@ -1283,6 +1283,8 @@ pub const fuzz_iterations_default: u32 = 10_000;
 pub const fuzz_iterations_max: u32 = 100_000_000;
 /// Each fuzzer's share of `zig build check`, with a fresh seed: a quick look, not the soak.
 pub const fuzz_check_iterations: u32 = 2_000;
+/// The most shards `fuzz shard <I> <N>` accepts: a typo'd count is refused.
+pub const fuzz_shards_max: u32 = 64;
 
 // The macOS VM (milestone M4b). One VM per user, started by the first command that needs it.
 /// The vsock port the guest's init listens on.
