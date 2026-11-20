@@ -12,6 +12,6 @@
     // Where `zig build vm-kernel-fetch` gets that Image, for a machine with neither the toolchain
     // nor Docker (a CI runner): the asset `Image` of this repository's release. The download is
     // checked against `image_sha256`, so the release is trusted for nothing else.
-    .release_url = "https://github.com/ZigboxOrg/zigbox/releases/download/vm-kernel-6.18.59/Image",
+    .release_url = "https://github.com/Zigbox/zigbox/releases/download/vm-kernel-6.18.59/Image",
     .toolchain = "ubuntu:24.04 arm64, gcc 13.3.0-6ubuntu2~24.04.1, binutils 2.42",
 }
