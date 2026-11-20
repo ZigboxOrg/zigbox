@@ -114,14 +114,14 @@ pub const sample: model.Package = .{
     .architecture = .x86_64,
     .summary = "A small sample package",
     .description = "First line of the description.\n\nSecond paragraph.",
-    .license = "Apache-2.0",
+    .license = "MIT",
     .homepage = "https://example.invalid/sample",
     .maintainer = "Sample Maintainer <sample@example.invalid>",
     .recommends_deb = &.{ "uidmap", "passt" },
     .recommends_rpm = &.{ "shadow-utils", "passt" },
     .files = &.{
         .{ .path = "/usr/bin/sample", .mode = 0o755, .bytes = "#!/bin/sh\necho sample\n" },
-        .{ .path = "/usr/share/doc/sample/copyright", .mode = 0o644, .bytes = "Apache-2.0\n" },
+        .{ .path = "/usr/share/doc/sample/copyright", .mode = 0o644, .bytes = "MIT licence\n" },
     },
 };
 
