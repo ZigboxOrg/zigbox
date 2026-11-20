@@ -18,7 +18,7 @@
 # named files. --dry-run prints what would change and changes nothing (it still reads). --yes
 # answers the per-section questions; it never answers for you where a value is wanted.
 # The release plumbing (environments, App, signing key, Mac secrets, homebrew-tap and website) is
-# NOT here: it is release-setup.sh, which the supervisor gave the owner.
+# NOT here: it is ops/owner/release-setup.sh.
 # The last line is `owner-setup: OK ...` or `owner-setup: FAIL <what to fix>`.
 # Written for bash 3.2 (macOS) and later. ops/owner/README.md is the full guide.
 set -euo pipefail
