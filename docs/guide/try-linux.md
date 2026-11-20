@@ -46,6 +46,12 @@ sudo dnf install zigbox
 
 ### Renewing the keyring
 
+On 2026-11-20 the release key itself was replaced (the old secret key was lost); the new primary
+fingerprint is `1207CB8600CE25FFDD3CC87ECCBEC141C3348787`. If you installed before then, run the two
+commands below once (apt: then check that `gpg --show-keys /usr/share/keyrings/zigbox.gpg` shows that
+fingerprint), or `apt update` and `dnf` refuse the repository
+([decision](../decisions/2026-11-20-release-key-rotated.md)).
+
 The signing subkey is renewed once a year, and the keyring you fetched above carries its expiry.
 Nothing updates that file, so when a release's notes say the subkey was renewed, fetch the keyring
 again before the date they give, or `apt update` fails with `EXPKEYSIG`:

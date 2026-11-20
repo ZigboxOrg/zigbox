@@ -68,7 +68,7 @@ jobs:
           ZIGBOX_SIGNING_KEY: ${{ secrets.ZIGBOX_SIGNING_KEY }}
           ZIGBOX_SIGNING_PASSPHRASE: ${{ secrets.ZIGBOX_SIGNING_PASSPHRASE }}
           # The same pinned primary fingerprint as release.yml (docs/releases/packaging.md).
-          ZIGBOX_SIGNING_FPR: 09991DC39816D3C914E2A22C5AB00BC328B7DBB7
+          ZIGBOX_SIGNING_FPR: 1207CB8600CE25FFDD3CC87ECCBEC141C3348787
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
