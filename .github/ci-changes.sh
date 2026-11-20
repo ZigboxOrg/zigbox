@@ -71,8 +71,9 @@ classify() {
       src/testing/check.zig) want_everything; return ;;
   esac
   case "$p" in
-    # Not part of any CI demo: the Mac build, the weekly top-20 run, the Z7 check, packaging, docs
-    # and the site, and tests of the code (they never reach the zbx binary a demo runs).
+    # Not part of any CI demo: the scripts under ops/ (the owner's setup, the backup box), the Mac
+    # build, the weekly top-20 run, the Z7 check, packaging, docs and the site,
+    # and tests of the code (they never reach the zbx binary a demo runs).
     docs/demos/m*.md | docs/demos/c4.md)
       suffix=${p#docs/demos/}; suffix=${suffix%.md}
       case "$suffix" in m0 | m1 | m2 | m2b | m3 | m4 | m5 | m6 | m6b | m6d | m7 | m8 | m8b | m9 | m10 | c4) want_one "$suffix" ;; esac
@@ -85,7 +86,7 @@ classify() {
     src/mac/* | src/macos_main.zig | src/mac_release.zig | src/testing/mac* | \
       src/testing/vm/*top20* | src/testing/vm/*z7* | \
       src/testing/vm/*s2_probe* | src/testing/vm/*m2b_probe* | \
-      LICENSE | docs/* | site/* | *.md) return ;;
+      ops/* | LICENSE | docs/* | site/* | *.md) return ;;
     # The FUSE kernel test runs in demo-s2-lazy's guest, unlike other tests.
     src/fuse/kernel_tests.zig | src/fuse_kernel_test_root.zig) want_one s2_lazy; return ;;
     src/*_tests.zig | src/*/*_tests.zig | src/fuzz*.zig | src/tidy.zig | src/errors_site.zig | \

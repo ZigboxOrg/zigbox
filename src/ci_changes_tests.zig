@@ -140,6 +140,15 @@ const rows = [_]Row{
         .paths = &.{".github/release-sign-test.sh"},
         .true_outputs = &.{"code"},
     },
+    // The scripts under ops/ run on the owner's machines and the backup box, never in a demo.
+    .{
+        .paths = &.{
+            "ops/backup/sync.sh",
+            "ops/backup/bootstrap.sh",
+            "ops/owner/zigboxorg-setup.sh",
+        },
+        .true_outputs = &.{"code"},
+    },
     // The other workflows are CI itself: every demo and the packages demo.
     .{
         .paths = &.{".github/workflows/ci.yml"},

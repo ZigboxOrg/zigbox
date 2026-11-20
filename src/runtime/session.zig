@@ -65,10 +65,12 @@ pub const Cleanup = union(enum) {
     failed,
 };
 
-/// The process that keeps the container's scope alive (`Host.start_keeper`), and the write end
-/// of the pipe it waits on: closing that ends it.
+/// The process that keeps the container's scope alive (`Host.start_keeper`): zbx's child
+/// (`pid`, signalled and reaped), the member that goes in the scope (`member`), and the write
+/// end of the pipe the member waits on: closing that ends both.
 const Keeper = struct {
     pid: host_mod.Pid,
+    member: host_mod.Pid,
     hold: host_mod.Handle,
 };
 
@@ -521,14 +523,15 @@ pub const Session = struct {
         assert(session.plan.scoped);
         assert(session.keeper == null);
         const hold = try host.pipe();
-        const pid = host.start_keeper(hold.read) catch |err| {
+        const keeper = host.start_keeper(hold.read) catch |err| {
             host.close(hold.read);
             host.close(hold.write);
             return err;
         };
         host.close(hold.read); // The keeper has its own copy; ours would keep it from seeing EOF.
-        session.keeper = .{ .pid = pid, .hold = hold.write };
-        assert(pid != session.pid.?);
+        session.keeper = .{ .pid = keeper.pid, .member = keeper.member, .hold = hold.write };
+        assert(keeper.pid != session.pid.?);
+        assert(keeper.member != session.pid.?);
     }
 
     /// Lets the keeper go and reaps it: its pipe is closed, which is its end of file. The scope
@@ -664,7 +667,8 @@ pub const Session = struct {
         assert(session.scope_problem == null);
         var problem: scope_mod.Problem = undefined;
         const pid = session.pid.?;
-        const keeper_pid = session.keeper.?.pid;
+        // The member, not the keeper: the OOM killer never picks it (`Host.start_keeper`).
+        const keeper_pid = session.keeper.?.member;
         const started = scope_mod.start(
             session.host,
             session.plan,

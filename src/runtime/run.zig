@@ -31,8 +31,10 @@
 //! it is empty, so a container whose PID 1 exits right after the OOM killer ran would take its
 //! counters with it; a scope therefore has a second process, the keeper (`Host.start_keeper`),
 //! forked before the scope is requested, put in `PIDs` beside the container's, and released by
-//! `wait` after the counters are read. The keeper takes one pid of the scope's `TasksMax`, which
-//! is `--pids` plus one, so the container has exactly the pids it asked for. The thread that
+//! `wait` after the counters are read. What goes in the scope is the keeper's member, a vfork
+//! child the OOM killer never picks, so a second OOM kill cannot empty the scope either. It takes
+//! one pid of the scope's `TasksMax`, which is `--pids` plus one, so the container has exactly
+//! the pids it asked for. The thread that
 //! calls `start` must be the one that calls `wait`: the kernel ends the keeper when that thread
 //! ends.
 

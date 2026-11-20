@@ -957,10 +957,12 @@ pub const HostSim = struct {
         return sim.world.spawn(flags, entry, entry_context) orelse sim.model_error(11);
     }
 
-    fn start_keeper(context: *anyopaque, hold: host.Handle) host.Error!host.Pid {
+    fn start_keeper(context: *anyopaque, hold: host.Handle) host.Error!host.Keeper {
         const sim = from_context(context);
         try sim.begin_call();
         if (sim.world.keeper_fork_errno) |errno| return sim.model_error(errno);
+        // The keeper started and failed; the real host reaps it before it returns.
+        if (sim.world.keeper_member_errno) |errno| return sim.model_error(errno);
         return sim.world.start_keeper(hold) orelse sim.model_error(11);
     }
 
