@@ -1,12 +1,13 @@
 # The Woodpecker server, one agent and Caddy (TLS) on the fleet box (ops/ci/README.md).
 # bootstrap.sh copies this to /opt/zigbox-ci/ and runs it; values come from /etc/zigbox-ci/ci.env
 # and the secret files beside it. Only Caddy publishes ports (80, 443). The agent reaches the
-# server's gRPC port on the compose network, never on the host's interfaces.
+# server's gRPC port on the compose network, never on the host's interfaces. Every image is pinned
+# by digest (the tag is for the reader); to move one, pull the new tag and copy its digest here.
 name: zigbox-ci
 
 services:
   caddy:
-    image: docker.io/library/caddy:2.10.2
+    image: docker.io/library/caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
     restart: unless-stopped
     ports:
       - "80:80"
@@ -19,7 +20,7 @@ services:
       - caddy-config:/config
 
   woodpecker-server:
-    image: docker.io/woodpeckerci/woodpecker-server:v3.20.1
+    image: docker.io/woodpeckerci/woodpecker-server:v3.20.1@sha256:0f31560e29d67ec4a06d6eeee4bac38d2a2697a6a741b8a0db3998180f3a3517
     restart: unless-stopped
     environment:
       WOODPECKER_HOST: https://${CI_HOST}
@@ -38,7 +39,7 @@ services:
       - /etc/zigbox-ci/agent-secret:/run/secrets/agent-secret:ro
 
   woodpecker-agent:
-    image: docker.io/woodpeckerci/woodpecker-agent:v3.20.1
+    image: docker.io/woodpeckerci/woodpecker-agent:v3.20.1@sha256:a7d7299a13add0b3936fa0ac9ed23507fe283a7fc7d9596c4289d7e8206541eb
     restart: unless-stopped
     depends_on:
       - woodpecker-server

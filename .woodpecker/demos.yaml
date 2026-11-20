@@ -6,8 +6,16 @@
 # VM downloads restored from and saved to /cache (src/testing/vm/cache.zig). demo-m6d says NOT RUN
 # until the owner's Google setup is here. Needs the repository marked Trusted (privileged for
 # /dev/kvm, the /cache mount).
+# The /cache mount is per event (/var/lib/zigbox-ci/<event>): a push here is only ever to main, so
+# main reads and writes /var/lib/zigbox-ci/push and never a directory a pull request wrote.
 when:
   - event: pull_request
+  # A label added to an open pull request: `full-ci` runs everything now, without a new push
+  # (the event has no changed paths, so src/ci/changes.zig runs every gate and demo). If the
+  # forge does not pass the labels with this event, nothing runs here and the next push picks
+  # the label up.
+  - event: pull_request_metadata
+    evaluate: 'CI_PIPELINE_EVENT_REASON == "label_updated" && CI_COMMIT_PULL_REQUEST_LABELS contains "full-ci"'
   - event: push
     branch: main
   - event: manual
@@ -37,7 +45,7 @@ matrix:
 
 clone:
   - name: clone
-    image: woodpeckerci/plugin-git
+    image: docker.io/woodpeckerci/plugin-git:2.12.1@sha256:b8d2401997be68ec25d62bd753fe5d30236e029fe007a5e823177e0e485ae205
     settings:
       # The whole history: demo-m3 and later build an older release for the upgrade test.
       depth: 0
@@ -48,7 +56,7 @@ steps:
     image: zigbox-ci:0.17.0
     privileged: true
     volumes:
-      - /var/lib/zigbox-ci:/cache
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
     environment:
       # As check.yaml: the work runs as tester; the root build keeps its own caches.
       ZBX_CI_USER: tester

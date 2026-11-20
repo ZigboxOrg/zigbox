@@ -1,18 +1,19 @@
-# VM runs on demand, as .github/workflows/vm.yml: a push to vm/<demo>-<anything> runs that demo in a
-# KVM guest on the fleet box (ops/ci/README.md), then deletes the scratch branch through the GitHub
-# API (the github_token secret; without it the branch stays and the run still passes). <demo> is
-# any name vm.yml takes, or all (src/ci/demos.zig). vm/top20-* is not run here. A newer push to
-# the same branch cancels the older run when the repository's "Cancel previous pipelines" setting
-# is on. The step is `zig build vm-branch`; the rest is CI-only.
+# VM runs on demand: a push to vm/<demo>-<anything> runs that demo in a KVM guest on the fleet box
+# (ops/ci/README.md), then deletes the scratch branch through the GitHub API. <demo> is any name
+# src/ci/demos.zig takes, or all. Woodpecker owns vm/*; .github/workflows/vm.yml runs only the
+# three it cannot (vm/top20-*, vm/m6d-*, vm/m8-push-ghcr: they need GitHub's own credentials) and,
+# by hand, any other when the box is down. A newer push to the same branch cancels the older run
+# (the repository's cancel-previous setting, ops/ci/woodpecker-setup.sh). The steps are
+# `zig build vm-branch` and `zig build vm-branch-delete`; the rest is CI-only.
 when:
   - event: push
     branch:
       include: vm/**
-      exclude: vm/top20-**
+      exclude: [vm/top20-**, vm/m6d-**, vm/m8-push-ghcr]
 
 clone:
   - name: clone
-    image: woodpeckerci/plugin-git
+    image: docker.io/woodpeckerci/plugin-git:2.12.1@sha256:b8d2401997be68ec25d62bd753fe5d30236e029fe007a5e823177e0e485ae205
     settings:
       depth: 0
       partial: false
@@ -22,7 +23,8 @@ steps:
     image: zigbox-ci:0.17.0
     privileged: true
     volumes:
-      - /var/lib/zigbox-ci:/cache
+      # Its own cache scope: only people who can push to the repository start this pipeline.
+      - /var/lib/zigbox-ci/vm:/cache
     environment:
       # As check.yaml: the work runs as tester; the root build keeps its own caches.
       ZBX_CI_USER: tester
@@ -30,7 +32,22 @@ steps:
       ZIG_GLOBAL_CACHE_DIR: /cache/zig-root
       ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
       ZBX_VM_CACHE: /cache/vm-entries
+    commands:
+      - zig build vm-branch -- "$CI_COMMIT_BRANCH"
+
+  # Runs whatever the demo did, and alone holds the token (the github_token secret; without it the
+  # branch stays and the step still passes). Not privileged.
+  - name: delete-branch
+    image: zigbox-ci:0.17.0
+    depends_on: [demo]
+    when:
+      - status: [success, failure]
+    volumes:
+      - /var/lib/zigbox-ci/vm:/cache
+    environment:
+      ZIG_GLOBAL_CACHE_DIR: /cache/zig-root
+      ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
       GITHUB_TOKEN:
         from_secret: github_token
     commands:
-      - zig build vm-branch -- "$CI_COMMIT_BRANCH"
+      - zig build vm-branch-delete -- "$CI_COMMIT_BRANCH"

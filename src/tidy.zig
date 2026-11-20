@@ -36,6 +36,9 @@ const shell_allowlist = [_][]const u8{
     // containers, the secrets). It runs before any Zig exists there and touches the machine, not
     // the repository; ops/ci/README.md.
     "ops/ci/bootstrap.sh",
+    // The repository's settings in that Woodpecker, through its HTTP API with `curl` and `jq`, on
+    // the same box and before any Zig is there either; ops/ci/README.md, step 4.
+    "ops/ci/woodpecker-setup.sh",
     // The release workflow's signing glue around `gpg` and `rpm`, which no Zig code can replace
     // (docs/STYLE.md, "The Linux package release"); its test script runs the same file.
     ".github/release-sign.sh",

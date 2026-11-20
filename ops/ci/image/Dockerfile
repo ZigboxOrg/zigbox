@@ -4,8 +4,9 @@
 #
 # `tester` (uid 1001) is the ordinary user: `zig build check` run as root re-runs the tests as it,
 # and the VM demos run as it. KVM_GID is the box's `kvm` group id, so `tester` may open /dev/kvm
-# in a privileged step without anyone changing the device's mode on the host.
-FROM ubuntu:24.04
+# in a privileged step without anyone changing the device's mode on the host. The base is pinned
+# by digest; the apt packages follow the archive, as on GitHub's runners.
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
 
 ARG ZIG_VERSION=0.17.0
 ARG ZIG_SHA256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026

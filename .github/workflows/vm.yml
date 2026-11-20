@@ -6,9 +6,16 @@
 # A newer push to the same branch cancels the run it supersedes. See AGENTS.md, "Git".
 name: vm
 
+# Woodpecker on the fleet box owns vm/* (.woodpecker/vm.yaml, docs/decisions/
+# 2026-11-19-ci-on-woodpecker.md). A push runs here only for the two that need GitHub's own
+# credentials: vm/m6d-* (the OIDC token Google's STS exchanges) and vm/m8-push-ghcr (the run's
+# GITHUB_TOKEN pushes to GHCR); Woodpecker skips those. Any other vm/* branch runs here only by
+# hand, when the box is down: `gh workflow run vm.yml --ref vm/<demo>-<slug>`. Each branch then
+# has one run, so one deleter.
 on:
   push:
-    branches: ['vm/**', '!vm/top20-**']
+    branches: ['vm/m6d-**', 'vm/m8-push-ghcr']
+  workflow_dispatch:
 
 concurrency:
   group: vm-${{ github.ref }}

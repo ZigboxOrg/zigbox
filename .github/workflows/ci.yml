@@ -67,13 +67,16 @@ jobs:
           EVENT: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+        # The paths go in a file, not an argument: Linux caps one argument at 128 KiB, which a
+        # large pull request's list can pass.
         run: |
-          files=""
+          files="$RUNNER_TEMP/changed-paths"
+          : > "$files"
           if [ "$EVENT" = pull_request ]; then
-            files="$(git diff --name-only HEAD^1 HEAD)"
+            git diff --name-only HEAD^1 HEAD > "$files"
           fi
           zig build ci-changes -- --output "$GITHUB_OUTPUT" --event "$EVENT" \
-            --branch "$HEAD_REF" --labels "$LABELS" --files "$files"
+            --branch "$HEAD_REF" --labels "$LABELS" --files-from "$files"
 
   build:
     name: build (both targets, size gate)

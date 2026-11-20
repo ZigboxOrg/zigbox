@@ -125,7 +125,8 @@ free_gb=$(df -BG --output=avail /var/lib | tail -1 | tr -dc 0-9)
 [ "$free_gb" -ge 100 ] || fail "/var/lib has ${free_gb} GiB free; the VM images and caches need 100"
 
 # --- Packages ------------------------------------------------------------------------------------
-pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl git qemu-system-x86 qemu-utils)
+pkgs=(docker.io docker-buildx docker-compose-v2 ca-certificates curl git jq qemu-system-x86
+    qemu-utils)
 missing=()
 for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -145,8 +146,50 @@ install -d -m 0755 "$opt"
 install -m 0644 "$here/compose.yaml" "$here/Caddyfile" "$opt/"
 install -m 0644 "$etc/ci.env" "$opt/.env"
 
-# Caches the pipelines mount at /cache (src/testing/vm/cache.zig). tester is uid 1001 in the image.
-install -d -m 0755 -o 1001 -g 1001 "$cache" "$cache/zig" "$cache/vm-entries"
+# Caches the pipelines mount at /cache, one scope per event (.woodpecker/*.yaml mount
+# $cache/<event>; vm.yaml mounts $cache/vm): main's (push) never holds what a pull request wrote.
+# tester is uid 1001 in the image.
+install -d -m 0755 -o 1001 -g 1001 "$cache"
+for scope in push pull_request pull_request_metadata manual vm; do
+    install -d -m 0755 -o 1001 -g 1001 "$cache/$scope" "$cache/$scope/zig" \
+        "$cache/$scope/zig-root" "$cache/$scope/vm-entries"
+done
+
+# The bound on the Zig caches: hourly, a scope whose Zig caches pass 30 GiB is emptied, but only
+# while no step runs (a step's build would lose files under it). The VM entries bound themselves
+# (src/testing/vm/cache.zig keeps two keys per entry and scope).
+cat > /usr/local/sbin/zigbox-ci-prune <<'PRUNE'
+#!/bin/bash
+# Empties each /var/lib/zigbox-ci/<scope>/zig* over 30 GiB while no step container runs.
+set -euo pipefail
+limit_kib=$((30 * 1024 * 1024))
+if docker ps --format '{{.Image}}' | grep -q '^zigbox-ci:'; then exit 0; fi
+for scope in /var/lib/zigbox-ci/*/; do
+    used=$(du -sk "$scope"zig "$scope"zig-root 2>/dev/null | awk '{s += $1} END {print s + 0}')
+    [ "$used" -le "$limit_kib" ] && continue
+    echo "zigbox-ci-prune: $scope Zig caches use $((used / 1024 / 1024)) GiB; emptying them"
+    find "$scope"zig "$scope"zig-root -mindepth 1 -delete
+done
+PRUNE
+chmod 0755 /usr/local/sbin/zigbox-ci-prune
+cat > /etc/systemd/system/zigbox-ci-prune.service <<'UNIT'
+[Unit]
+Description=Bound the Zigbox CI Zig caches (ops/ci/README.md)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zigbox-ci-prune
+UNIT
+cat > /etc/systemd/system/zigbox-ci-prune.timer <<'UNIT'
+[Unit]
+Description=Bound the Zigbox CI Zig caches every hour
+[Timer]
+OnCalendar=hourly
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now zigbox-ci-prune.timer >/dev/null
 
 # --- The step image ------------------------------------------------------------------------------
 zig_version=$(sed -n 's/^ *ARG ZIG_VERSION=//p' "$here/image/Dockerfile")
