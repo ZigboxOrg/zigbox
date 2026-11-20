@@ -81,14 +81,14 @@ const help_text =
     \\usage: zbx [options] <command>
     \\
     \\commands:
-    \\  run             run a command in a container whose root is a tree or a directory (see below)
+    \\  run             run a command in a container rooted at a tree or a directory (see below)
     \\  bundle          collect a redacted diagnostic bundle for a run (see below)
     \\  doctor          check that this host can run zbx (--output json: zbx schema doctor)
     \\  ps              list the containers (--all: the ones that ended too)
     \\  stop <name>     stop a container: SIGTERM, then SIGKILL after --grace
     \\  logs <name>     show what a container wrote to its output and error (see below)
     \\  exec <name>     run a command inside a running container (see below)
-    \\  commit <name>   turn what a stopped container changed into a new tree and print its digest
+    \\  commit <name>   turn a stopped container's changes into a tree and print its digest
     \\  store <cmd>     the content-addressed store: import, ls, du, rm, diff, export, verify,
     \\                  gc, restore
     \\  state <cmd>     volumes that outlive containers: ls, rm, export, restore (see below)
@@ -102,9 +102,9 @@ const help_text =
     \\  pull <ref>      pull an image from a registry into the store (see below)
     \\  push <source> <ref>   pack a build result, an image or a tree and put it in a registry
     \\                  (see below)
-    \\  build --graph   check the project's zbx.build.zon and print its steps in order (see below)
+    \\  build --graph   check zbx.build.zon and print its steps in order (see below)
     \\  import          write a zbx.build.zon from a Dockerfile, running nothing (see below)
-    \\  inspect <id>    print a build result: its tree and the config it runs with
+    \\  inspect <id>    print a build result: its tree and run config
     \\  schema <cmd>    print the JSON schema of a command's output
     \\  explain <code>  explain a diagnostic code offline, as E0001 (zbx schema explain)
     \\  help            show this text
@@ -141,6 +141,7 @@ const help_text =
     \\                  =<value> that value, without it zbx's own (an error if unset there).
     \\                  A value is never stored or printed, only its name
     \\  -d, --detach    start the container and return; zbx ps and zbx stop find it again
+    \\  --lazy          fetch files as read (needs FUSE)
     \\  --timeout <ms>  stop the container after this long (SIGTERM, then SIGKILL)
     \\  --grace <ms>    time between SIGTERM and SIGKILL (default 10000)
     \\  --state <name>:<path>[:ro]   the state volume <name> at <path> (repeatable, up to
@@ -203,7 +204,7 @@ const help_text =
     \\  zbx store export --oci <source> <dir>   write the image of a build result, an image
     \\                           or a tree as an OCI layout (dir must be new or empty);
     \\                           --output json prints zbx.export/1
-    \\  zbx store verify         rehash everything; name each damaged file and the paths it breaks
+    \\  zbx store verify         rehash everything; name each damaged file and what it breaks
     \\  zbx store gc             plan a collection of what no root reaches (changes nothing)
     \\  zbx store gc --confirm <hash>   do that plan: move it to the trash, kept 7 days
     \\  zbx store gc --trash     list the trash
@@ -221,7 +222,7 @@ const help_text =
     \\  volumes live in $XDG_DATA_HOME/zbx/state; only state rm removes one
     \\
     \\key:
-    \\  zbx key new <name>       make an Ed25519 signing key, its secret sealed under a passphrase
+    \\  zbx key new <name>       make an Ed25519 signing key, sealed under a passphrase
     \\                          ; asked twice on a terminal, or the first line of
     \\                           --passphrase-file <file>, which only you can read
     \\  zbx key new <name> --no-passphrase   keep the secret in the clear, mode 0600
