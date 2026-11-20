@@ -59,12 +59,26 @@ fn check_settings(random: std.Random) void {
         ) << 20,
     };
     var buffer: [settings.record_bytes_max]u8 = undefined;
-    const text = settings.render(&buffer, values);
-    assert(std.meta.eql(values, settings.parse(text) catch unreachable)); // Render reads back.
+    const rendered = settings.render(&buffer, values);
+    assert(std.meta.eql(values, settings.parse(rendered) catch unreachable)); // Render reads back.
+    // A quarter of the runs start from the version 1 form, so it is damaged as often as /2.
+    var old: [settings.record_bytes_max]u8 = undefined;
+    const text = if (random.uintLessThan(u8, 4) == 0) render_v1(&old, rendered) else rendered;
+    check_settings_accepted(text); // Undamaged: a version 1 record is accepted and checked.
     var damaged: [settings.record_bytes_max * 2]u8 = undefined;
     @memcpy(damaged[0..text.len], text);
     const length = damage(random, &damaged, text.len);
     check_settings_accepted(damaged[0..length]);
+}
+
+/// The version 1 record for a rendered current one: the version 1 header, the same cpus and
+/// memory lines, no `disk_bytes` line.
+fn render_v1(buffer: []u8, rendered: []const u8) []const u8 {
+    const disk_at = std.mem.indexOf(u8, rendered, "disk_bytes=").?;
+    const tail = rendered[settings.header.len..disk_at];
+    @memcpy(buffer[0..settings.header_v1.len], settings.header_v1);
+    @memcpy(buffer[settings.header_v1.len..][0..tail.len], tail);
+    return buffer[0 .. settings.header_v1.len + tail.len];
 }
 
 /// Whatever `settings.parse` accepts is a record `render` writes, or a version 1 record, which
@@ -76,27 +90,30 @@ fn check_settings_accepted(text: []const u8) void {
     const rendered = settings.render(&again, parsed);
     if (std.mem.startsWith(u8, text, settings.header_v1)) {
         assert(parsed.disk_bytes == constants.vm_disk_bytes_default);
-        const disk_at = std.mem.indexOf(u8, rendered, "disk_bytes=").?;
         var old: [settings.record_bytes_max]u8 = undefined;
-        const tail = rendered[settings.header.len..disk_at];
-        @memcpy(old[0..settings.header_v1.len], settings.header_v1);
-        @memcpy(old[settings.header_v1.len..][0..tail.len], tail);
-        assert(std.mem.eql(u8, text, old[0 .. settings.header_v1.len + tail.len]));
+        assert(std.mem.eql(u8, text, render_v1(&old, rendered)));
     } else {
         assert(std.mem.eql(u8, text, rendered));
     }
 }
 
-test "a version 1 settings record is read, not rendered back (seed 2562722272451060721)" {
+test "a version 1 settings record is read, not rendered back (the seed 2562722272451060721 case)" {
     // Goal: the oracle knows version 1 is read and never written. Method: the record the seed
     // produced (header /1, no disk line), and a /2 record that must still match render exactly.
-    check_settings_accepted("zbx-vm-settings/1\ncpus=11\nmemory_bytes=245210546176\n");
-    check_settings_accepted("zbx-vm-settings/2\ncpus=2\nmemory_bytes=2147483648\n" ++
-        "disk_bytes=68719476736\n");
-    check_settings_accepted("zbx-vm-settings/1\ncpus=2\n"); // Refused: nothing to check.
+    // Each outcome is asserted first, so a parse change cannot turn the checks into no-ops.
+    const v1 = "zbx-vm-settings/1\ncpus=11\nmemory_bytes=245210546176\n";
+    const v2 = "zbx-vm-settings/2\ncpus=2\nmemory_bytes=2147483648\n" ++
+        "disk_bytes=68719476736\n";
+    const refused = "zbx-vm-settings/1\ncpus=2\n";
+    _ = try settings.parse(v1);
+    _ = try settings.parse(v2);
+    try std.testing.expectError(error.Malformed, settings.parse(refused));
+    check_settings_accepted(v1);
+    check_settings_accepted(v2);
+    check_settings_accepted(refused);
 }
 
-test "fuzz_vm holds on fixed seeds, the seed that broke the oracle's iteration among them" {
+test "fuzz_vm holds on seeds 1 to 39" {
     // Goal: the fuzzer's properties run under `zig build test`. Method: a few seeds.
     for (1..40) |seed| fuzz_vm(seed);
 }
