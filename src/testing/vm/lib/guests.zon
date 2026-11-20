@@ -19,9 +19,9 @@
         .file_name = "Fedora-Cloud-Base-Generic-45-1.4.x86_64.qcow2",
     },
     .rocky_9 = .{
-        // Rocky-9-GenericCloud-Base-9.8-20260525.0.x86_64.qcow2.CHECKSUM, beside the image.
-        .url = "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.8-20260525.0.x86_64.qcow2",
-        .sha256 = "92c206cc6f790c61583247eefe87890f8828420662c17cacf247cec78ab4eec8",
-        .file_name = "Rocky-9-GenericCloud-Base-9.8-20260525.0.x86_64.qcow2",
+        // Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2.CHECKSUM, beside the image.
+        .url = "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2",
+        .sha256 = "4f88f4209de50813d8054ab97309e7169a580206a0c4ea04f375d36c4846d50e",
+        .file_name = "Rocky-9-GenericCloud-Base-9.9-20261112.0.x86_64.qcow2",
     },
 }

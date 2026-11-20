@@ -78,7 +78,7 @@ fn validate(inputs: *const Inputs) Error!void {
     for (inputs.zbx) |bytes| {
         if (bytes.len > constants.package_file_bytes_max) return error.FileTooLarge;
     }
-    if (inputs.license.len > constants.package_description_bytes_max) return error.FileTooLarge;
+    if (inputs.license.len > constants.package_license_bytes_max) return error.FileTooLarge;
 }
 
 pub fn tarball_name(memory: Allocator, version: []const u8, index: usize) Error![]u8 {
@@ -299,8 +299,8 @@ const sbom_tail =
 const sample: Inputs = .{
     .version = "1.2.3",
     .zbx = .{ "x86 binary", "arm binary" },
-    .license = "MIT License\n",
-    .license_id = "MIT",
+    .license = "Apache License 2.0\n",
+    .license_id = "Apache-2.0",
     .zig_version = "0.17.0",
     .source_date_epoch = 1_794_148_734,
 };
@@ -364,7 +364,7 @@ test "the sbom is valid JSON that says what is in the build and that nothing els
     try std.testing.expectEqualStrings("pkg:github/zigbox/zigbox@v1.2.3", purl);
     try std.testing.expectEqualStrings("1.2.3", main.get("version").?.string);
     const id = main.get("licenses").?.array.items[0].object.get("license").?.object.get("id");
-    try std.testing.expectEqualStrings("MIT", id.?.string);
+    try std.testing.expectEqualStrings("Apache-2.0", id.?.string);
     const tools = root.get("metadata").?.object.get("tools").?.object.get("components").?;
     const zig = tools.array.items[0].object.get("version").?.string;
     try std.testing.expectEqualStrings("0.17.0", zig);
@@ -422,4 +422,18 @@ test "a bad version, toolchain, licence id or date is refused" {
     bad = sample;
     bad.source_date_epoch = constants.apt_signed_at_max + 1;
     try std.testing.expectError(error.BadTime, sbom(memory, &bad));
+}
+
+test "a licence of the full bound is packed and one byte more is refused" {
+    // Goal: the licence has its own bound (Apache-2.0 is about 11.3 KB); over it, the usual error.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    const text = try memory.alloc(u8, constants.package_license_bytes_max + 1);
+    @memset(text, 'a');
+    var inputs = sample;
+    inputs.license = text[0..constants.package_license_bytes_max];
+    _ = try tarball(memory, &inputs, 0);
+    inputs.license = text;
+    try std.testing.expectError(error.FileTooLarge, tarball(memory, &inputs, 0));
 }

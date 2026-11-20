@@ -293,7 +293,7 @@ test "validate refuses what the writers cannot describe" {
         .architecture = .x86_64,
         .summary = "s",
         .description = "d\nmore",
-        .license = "MIT",
+        .license = "Apache-2.0",
         .homepage = "https://zigbox.org",
         .maintainer = "Zigbox <x@zigbox.org>",
         .files = &.{.{ .path = "/usr/bin/zbx", .mode = 0o755, .bytes = "x" }},

@@ -167,7 +167,7 @@ fn run_assets(io: Io, memory: Allocator, arguments: *const Arguments, log: *Io.W
     for (arguments.zbx, 0..) |path, index| {
         inputs.zbx[index] = try read_file(io, memory, log, path, constants.package_file_bytes_max);
     }
-    const license_max = constants.package_description_bytes_max;
+    const license_max = constants.package_license_bytes_max;
     inputs.license = try read_file(io, memory, log, arguments.license, license_max);
     const dir = Io.Dir.cwd();
     dir.deleteTree(io, arguments.out) catch |err|
@@ -282,7 +282,7 @@ test "arguments: a full assets line parses; each missing piece or conflict is re
     const full = [_][]const u8{
         "assets",        "--version",     "1.2.3",     "--zbx-x86_64", "a",
         "--zbx-aarch64", "b",             "--license", "L",            "--license-id",
-        "MIT",           "--zig-version", "0.17.0",    "--out",        "out",
+        "Apache-2.0",    "--zig-version", "0.17.0",    "--out",        "out",
         "--no-packages",
     };
     var iterator: TestIterator = .{ .words = &full };

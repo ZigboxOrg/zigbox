@@ -212,7 +212,7 @@ fn add_release_assets_step(
     b.step("release-sums", sums_help).dependOn(&sums.step);
 }
 
-const license_id = "MIT";
+const license_id = "Apache-2.0";
 
 fn package_tool(b: *std.Build) *std.Build.Step.Compile {
     return b.addExecutable(.{
@@ -315,6 +315,7 @@ const roots = [_][]const u8{
     "src/tidy.zig",
     "src/fuzz.zig",
     "src/size_check.zig",
+    "src/release_evidence.zig",
     "src/errors_site.zig",
     "src/vm_image/kernel_fetch.zig",
     "src/mac_release.zig",
