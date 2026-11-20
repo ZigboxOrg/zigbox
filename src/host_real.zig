@@ -1837,7 +1837,10 @@ fn keeper_reap(pid: host.Pid, kill: bool) ?host.ExitStatus {
         if (linux.errno(result) == .INTR) continue;
         if (linux.errno(result) != .SUCCESS) return null;
         const raw: u32 = @bitCast(status);
-        if (linux.W.IFSIGNALED(raw)) return .{ .signaled = @intCast(@backingInt(linux.W.TERMSIG(raw))) };
+        if (linux.W.IFSIGNALED(raw)) {
+            const signal: u32 = @backingInt(linux.W.TERMSIG(raw));
+            return .{ .signaled = @intCast(signal) };
+        }
         if (linux.W.IFEXITED(raw)) return .{ .exited = linux.W.EXITSTATUS(raw) };
         return null;
     }
