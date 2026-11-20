@@ -2074,7 +2074,12 @@ test "a signal caught before the wait ends the wait at once, not when the child 
     var real: HostReal = .{};
     const subject = real.interface();
     var unused: u8 = 0;
-    const pid = try subject.fork_child(false, sleeping_child, &unused);
+    // A container's default seccomp profile (Docker's, the CI box's unprivileged steps) answers
+    // clone3 with ENOSYS: there is nothing to test, and zbx itself cannot run there either.
+    const pid = subject.fork_child(false, sleeping_child, &unused) catch |err| switch (err) {
+        error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
     subject.catch_interrupts(true);
     defer subject.catch_interrupts(false);
     const sent = linux.tgkill(linux.getpid(), linux.gettid(), .INT);

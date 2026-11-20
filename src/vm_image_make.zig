@@ -390,6 +390,9 @@ test "read_pinned returns the pinned file and removes any other" {
     const arena = arena_state.allocator();
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
+    // A fresh checkout whose build cache lives elsewhere (ZIG_LOCAL_CACHE_DIR, as on the CI box)
+    // has no .zig-cache yet.
+    try Io.Dir.cwd().createDirPath(io, ".zig-cache");
     const path = ".zig-cache/zbx-read-pinned-test";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "pinned bytes" });
     var digest: [32]u8 = undefined;
