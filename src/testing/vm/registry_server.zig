@@ -292,7 +292,7 @@ fn status_only(status: u16) []const u8 {
     return "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 }
 
-fn reason(status: u16) []const u8 {
+pub fn reason(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
         206 => "Partial Content",
@@ -310,7 +310,7 @@ fn reason(status: u16) []const u8 {
     };
 }
 
-fn write_all(client: i32, bytes: []const u8) void {
+pub fn write_all(client: i32, bytes: []const u8) void {
     var at: usize = 0;
     while (at < bytes.len) {
         const rest = bytes[at..];
@@ -322,7 +322,7 @@ fn write_all(client: i32, bytes: []const u8) void {
 
 /// Reads until the blank line that ends a request head; its length, or null on a timeout, a
 /// close or an oversize head.
-fn read_head(
+pub fn read_head(
     client: i32,
     buffer: []u8,
     filled: *usize,
@@ -351,7 +351,7 @@ fn read_head(
 }
 
 /// Fills `buffer` from the client; false on a timeout, a close or a stop.
-fn read_exact(client: i32, buffer: []u8, stopping: *const std.atomic.Value(bool)) bool {
+pub fn read_exact(client: i32, buffer: []u8, stopping: *const std.atomic.Value(bool)) bool {
     var at: usize = 0;
     var waited: u32 = 0;
     while (at < buffer.len) {
@@ -372,10 +372,10 @@ fn read_exact(client: i32, buffer: []u8, stopping: *const std.atomic.Value(bool)
     return true;
 }
 
-const RequestLine = struct { method: push_fixture.Method, target: []const u8 };
+pub const RequestLine = struct { method: push_fixture.Method, target: []const u8 };
 
 /// `<METHOD> <target> HTTP/1.x`, for the five methods an upload uses; null for any other.
-fn request_line(line: []const u8) ?RequestLine {
+pub fn request_line(line: []const u8) ?RequestLine {
     const space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
     const methods = [_]struct { name: []const u8, method: push_fixture.Method }{
         .{ .name = "GET", .method = .get },
@@ -395,7 +395,7 @@ fn request_line(line: []const u8) ?RequestLine {
 }
 
 /// The value of the header `name` (lower case) in a request head, or null.
-fn header_value(head: []const u8, name: []const u8) ?[]const u8 {
+pub fn header_value(head: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     _ = lines.next(); // The request line.
     while (lines.next()) |line| {

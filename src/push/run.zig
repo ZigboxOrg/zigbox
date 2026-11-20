@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const build_options = @import("build_options");
 const constants = @import("../constants.zig");
 const Diag = @import("../diag/diag.zig").Diag;
 const diagnose = @import("diagnose.zig");
@@ -30,8 +31,13 @@ pub const Workspace = struct {
 };
 
 /// The layer writer that push, `push --dry-run` and export use: the packer's release writer,
-/// writer 1 in 0.5.2 (docs/decisions/2026-11-16-0.5.2-s2-dormant.md).
-pub const release_writer_version = pack.release_writer_version;
+/// writer 1 in 0.5.2 (docs/decisions/2026-11-16-0.5.2-s2-dormant.md), or the newest writer in a
+/// build with lazy start turned on, so that demo-s2's zbx pushes images it can start lazily
+/// (docs/decisions/2026-11-20-s2-demo-push-writer.md).
+pub const release_writer_version: u32 = if (build_options.lazy_start)
+    constants.layer_writer_version
+else
+    pack.release_writer_version;
 
 comptime {
     assert(release_writer_version >= 1);
