@@ -476,7 +476,9 @@ const script_corrupt =
 ;
 
 /// Step 7. The registry goes down right after the first read, before the fill (in the index's
-/// order) reaches `/data/e.bin`; the weights' tail is filled last.
+/// order) reaches `/data/e.bin`; the weights' tail is filled last. Once it is up, a read can
+/// still fail fast until the next probe (`lazy_down_probe_ms`) finds the source answering, so
+/// the read is repeated until it prints the hash or 10 s have passed since the registry came up.
 const script_netcut =
     \\netcut() {
     \\  fresh n; ctl up >/dev/null; ctl reset >/dev/null
@@ -499,9 +501,11 @@ const script_netcut =
     \\  with n $Z exec cut -- cat /app/config | grep -qx 'name=lazy-3g' &&
     \\    ok "cat /app/config still works" || fail "cat /app/config while down" "no config"
     \\  with n $Z exec cut -- true && ok "the container still runs" || fail "still runs" "exec"
-    \\  ctl up >/dev/null
-    \\  t0=$(now); with n $Z exec cut -- sha256sum /data/e.bin > /tmp/s2-e2.out 2>&1
-    \\  ms=$(( $(now) - t0 )); rec cut_recover_ms $ms
+    \\  ctl up >/dev/null; t0=$(now); ms=0
+    \\  while [ $ms -lt 10000 ]; do
+    \\    with n $Z exec cut -- sha256sum /data/e.bin > /tmp/s2-e2.out 2>&1
+    \\    ms=$(( $(now) - t0 )); grep -q "^$HE " /tmp/s2-e2.out && break; sleep 1
+    \\  done; rec cut_recover_ms $ms
     \\  grep -q "^$HE " /tmp/s2-e2.out && [ $ms -lt 10000 ] &&
     \\    ok "back up: the expected hash in $ms ms" ||
     \\    fail "the hash in 10 s" "$ms ms: $(last /tmp/s2-e2.out)"
