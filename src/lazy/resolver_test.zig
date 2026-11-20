@@ -966,7 +966,7 @@ test "resolver: outside the store's namespace, the put that completes an object 
     try testing.expectEqual(@as(u32, 3), fixture.registry.calls.load(.monotonic));
 }
 
-test "resolver: rootless, an object owned by a container id is never made whole, yet reads succeed" {
+test "resolver: rootless, an object owned by a container id is never made whole" {
     // Goal: pin what holds today for the accepted gap in
     // docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md. Outside the namespace and
     // without `CAP_CHOWN`, an object of 0:42 (Alpine's /etc/shadow) cannot be assembled: the
