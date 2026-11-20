@@ -217,7 +217,7 @@ test "the Debian, Fedora and Rocky pins are dated https releases with a SHA-256"
     }
     try std.testing.expect(std.mem.indexOf(u8, debian_12.url, "/bookworm/2026") != null);
     try std.testing.expect(std.mem.indexOf(u8, fedora_45.url, "/releases/45/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rocky_9.url, "-9.8-2026") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rocky_9.url, "-9.9-2026") != null);
 }
 
 test "to_hex renders lowercase hex" {
