@@ -832,6 +832,8 @@ pub const Resolver = struct {
             .content_mismatch => .content_mismatch,
             .store_full => .store_full,
             .busy => .busy,
+            // The source's bytes were right and are held: its answer, and a read gets them.
+            .held => .landed,
             .failed => .failed,
         };
     }

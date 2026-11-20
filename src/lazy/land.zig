@@ -207,6 +207,12 @@ pub const Landed = enum {
     store_full,
     /// The store lock is held by a gc or a restore; try again later.
     busy,
+    /// The chunk is held in `partial/`, verified, but the put failed after keeping it: the
+    /// object could not be assembled (rootless, outside the namespace, an owner the user may
+    /// not give: docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md). The source's
+    /// bytes were right and a read is served from the held chunk; this is not the source's
+    /// failure.
+    held,
     /// Another failure of the store.
     failed,
 };
@@ -248,7 +254,12 @@ pub fn land(
             error.BadWanted => .failed,
             error.ContentMismatch => .content_mismatch,
             error.Busy => .busy,
-            error.StoreFailed => if (failure_is_full(&failure)) .store_full else .failed,
+            error.StoreFailed => if (failure_is_full(&failure))
+                .store_full
+            else if (chunks.is_held(store, wanted, index))
+                .held
+            else
+                .failed,
         };
     };
     assert(progress.have <= progress.total);

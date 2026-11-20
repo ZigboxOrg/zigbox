@@ -967,62 +967,102 @@ test "resolver: outside the store's namespace, the put that completes an object 
 }
 
 test "resolver: rootless, an object owned by a container id is never made whole" {
-    // Goal: pin what holds today for the accepted gap in
+    // Goal: pin the accepted gap in
     // docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md. Outside the namespace and
     // without `CAP_CHOWN`, an object of 0:42 (Alpine's /etc/shadow) cannot be assembled: the
-    // last put fails on its owner. Its chunks stay held in `partial/`, verified, so every read
-    // is still served, but only after a round (`lazy_down_fail_ms`); the object is not whole and
-    // `objects_local` never counts it, so the run's record stays partial. A `security.capability`
-    // object fails the same way in the kernel; `SimFs` has no gate for it, so it is not tested.
-    // Method: owners `outside`, the file system refusing a change of owner; object 0 (two
-    // chunks) is owned by 0:42, object 1 by root. Read both; read object 0 again.
+    // last put's change of owner is `EPERM`. Its chunks stay held in `partial/`, verified, so
+    // every read is served at once from them, nothing is asked of the source again, and the
+    // source is not blamed; the object is not whole and `objects_local` never counts it. A
+    // `security.capability` object fails the same way in the kernel; `SimFs` has no gate for
+    // it, so it is not tested.
+    // Method: owners `outside` with a subordinate range, so the id is mapped and the owner
+    // gate is what refuses; object 0 (two chunks) is owned by 0:42, object 1 by root. Read
+    // both; read object 0 again.
     setup(&.{ 2 * chunk_bytes, 2 * chunk_bytes });
+    own_by_shadow(0);
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{
+        .uid = 0,
+        .gid = 0,
+        .range = .{ .uid_start = 100000, .gid_start = 100000 },
+    } };
+    gate_calls = 0;
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const report = &fixture.resolver.schedule.report;
+    try expect_true_read(0, 0, 0);
+    try testing.expectEqual(@as(u32, 0), gate_calls);
+    // Chunk 1's put fails on the owner, at the gate; the read is served in the same round.
+    try expect_true_read(0, 1, 0);
+    try testing.expectEqual(@as(u32, 1), gate_calls);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    try testing.expectEqual(@as(u32, 0), report.objects_local);
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    const round = constants.lazy_down_fail_ms;
+    try expect_true_read(1, 0, round);
+    try expect_true_read(1, 1, round);
+    try testing.expect(land_mod.object_is_whole(&fixture.store, &fixture.objects[1].wanted));
+    try testing.expectEqual(@as(u32, 1), report.objects_local);
+    // The next read of 0:42's chunk is local: no ask, no further put.
+    const calls = fixture.peers[0].calls.load(.monotonic);
+    try expect_true_read(0, 1, round);
+    try testing.expectEqual(calls, fixture.peers[0].calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), gate_calls);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    try testing.expectEqual(@as(u32, 1), report.objects_local);
+}
+
+test "resolver: an owner failure is never the source's failure, over many reads" {
+    // Goal: a put that fails on its owner (rootless, outside the namespace) is not booked
+    // against the source that sent the right bytes. Five one-chunk objects of 0:42 are read
+    // further apart than `lazy_read_deadline_ms` in all; no read fails, the source is never
+    // down, and no E1203 is logged (as the review of PR 8 found with the failure counted: the
+    // fifth read failed `Unavailable` with the peer marked down, its chunk already held).
+    // Method: one honest peer, fill off, a subordinate range so the owner gate refuses; the
+    // objects are read 7.1 s apart, then a root-owned one.
+    setup(&.{ chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes });
+    for (0..5) |index| own_by_shadow(@intCast(index));
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{
+        .uid = 0,
+        .gid = 0,
+        .range = .{ .uid_start = 100000, .gid_start = 100000 },
+    } };
+    gate_calls = 0;
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const step_ms: u64 = 7100;
+    comptime assert(5 * step_ms > constants.lazy_read_deadline_ms);
+    for (0..5) |index| try expect_true_read(@intCast(index), 0, index * step_ms);
+    try testing.expectEqual(@as(u32, 5), gate_calls);
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expect(fixture.resolver.schedule.sources[0].failing_since_ms == null);
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    try expect_true_read(5, 0, 5 * step_ms);
+    try testing.expectEqual(@as(u32, 1), fixture.resolver.schedule.report.objects_local);
+    try testing.expectEqual(@as(u32, 5), gate_calls);
+}
+
+/// Object `index` is owned by 0:42, as Alpine's /etc/shadow is.
+fn own_by_shadow(index: u32) void {
     const shadow: object_mod.Attrs = .{
         .mode = 0o640,
         .uid = 0,
         .gid = 42,
         .xattrs = &xattrs.empty,
     };
-    fixture.objects[0].wanted.attrs = shadow;
-    const owned = &fixture.objects[0].wanted;
+    const owned = &fixture.objects[index].wanted;
+    owned.attrs = shadow;
     owned.id = object_mod.object_id(owned.content, shadow);
-    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
-    fixture.store.owners = .{ .outside = .{ .uid = 0, .gid = 0, .range = null } };
-    try open_resolver(1, false, false);
-    defer close_resolver();
-    const report = &fixture.resolver.schedule.report;
-    var out: [chunk_bytes]u8 = @splat(0);
-    // Chunk 0 lands (the object is not complete); chunk 1's put fails on the owner, so the
-    // read waits a round and is then served from the held chunk.
-    try expect_true_read(0, 0, 0);
-    const begun = fixture.resolver.read_begin(0, 1, &out, 0);
-    try testing.expect(begun == .wait);
-    _ = pump(0);
-    const early = fixture.resolver.read_poll(begun.wait, &out, 0);
-    try testing.expect(early == .wait);
-    const round = constants.lazy_down_fail_ms;
-    var served = fixture.resolver.read_poll(begun.wait, &out, round);
-    if (served == .wait) {
-        _ = pump(round);
-        served = fixture.resolver.read_poll(begun.wait, &out, round);
-    }
-    try testing.expect(served == .done);
-    try testing.expectEqualSlices(u8, truth(0, 1), out[0..served.done]);
-    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
-    try testing.expectEqual(@as(u32, 0), report.objects_local);
-    // Root's object completes at once, and the next read of 0:42's chunk is local.
-    try expect_true_read(1, 0, round);
-    try expect_true_read(1, 1, round);
-    try testing.expect(land_mod.object_is_whole(&fixture.store, &fixture.objects[1].wanted));
-    try testing.expectEqual(@as(u32, 1), report.objects_local);
-    try expect_true_read(0, 1, round);
-    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
-    try testing.expectEqual(@as(u32, 1), report.objects_local);
 }
 
-/// `SimFs`'s owner gate for a process outside any new user namespace.
+var gate_calls: u32 = 0;
+
+/// `SimFs`'s owner gate for a process outside any new user namespace; counts its calls.
 fn outside(context: *anyopaque) bool {
     assert(@intFromPtr(context) != 0);
+    gate_calls += 1;
     return false;
 }
 
