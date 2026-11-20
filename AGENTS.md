@@ -7,7 +7,7 @@ Zigbox is a rootless, daemonless Linux container runtime, image store and builde
 - **Style and testing follow [docs/STYLE.md](docs/STYLE.md)** (TigerStyle, adapted). Read it before writing code. Review rejects code that breaks it.
 - Work one milestone at a time, from its brief in `docs/briefs/`. Do not start a later milestone or build anything listed under Non-goals.
 - A milestone is done only when its demo script runs live in the test VM. Unit tests passing, or code that compiles, is never reported as a passed demo. Say exactly what was and was not run.
-- Each demo script becomes an automated test, `zig build demo-mN`. Never break an earlier demo. CI runs only the demos a pull request can affect (path rules in `.github/ci-changes.sh`); a push to `main`, a pull request from a `claude/release-*` branch and a pull request labelled `full-ci` run all of them, so a break the affected set missed shows on `main`. If you are unsure, add the `full-ci` label.
+- Each demo script becomes an automated test, `zig build demo-mN`. Never break an earlier demo. CI runs only the demos a pull request can affect (path rules in `src/ci/changes.zig`, run as `zig build ci-changes`); a push to `main`, a pull request from a `claude/release-*` branch and a pull request labelled `full-ci` run all of them, so a break the affected set missed shows on `main`. If you are unsure, add the `full-ci` label.
 - Error messages are part of the demo: one line saying what was refused and why, never an `errno` dump.
 - When scope is in doubt, cut scope and keep the demo. Record the cut in the milestone's demo document, `docs/demos/mN.md`.
 - Zig version is pinned in `build.zig.zon` (`minimum_zig_version`) and CI. Do not upgrade during a milestone.

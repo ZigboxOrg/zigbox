@@ -1,9 +1,11 @@
 # CI on the fleet box (Woodpecker)
 
-Zigbox's CI runs on the fleet box (AMD Ryzen 7 1700X, 8 cores and 16 threads, 64 GiB, two 512 GB
-SATA SSDs) under [Woodpecker](https://woodpecker-ci.org) 3.20.1. Code and pull requests stay on
-GitHub (`ZigboxOrg`); Woodpecker logs in with GitHub and posts each workflow as a check on the pull
-request. Decision: `docs/decisions/2026-11-19-ci-on-woodpecker.md`.
+Zigbox's pull-request CI runs on the fleet box (AMD Ryzen 7 1700X, 8 cores and 16 threads, 64 GiB,
+two 512 GB SATA SSDs) under [Woodpecker](https://woodpecker-ci.org) 3.20.1. Code and pull requests
+stay on GitHub (`ZigboxOrg`); Woodpecker logs in with GitHub and posts each workflow as a check on
+the pull request. GitHub's `ci` workflow keeps running on every push to `main` for 0.6.0, because
+`release.yml` starts on it and reads its evidence (docs/decisions/2026-11-19-0.6.0-plan.md,
+decision 2). Decision: `docs/decisions/2026-11-19-ci-on-woodpecker.md`.
 
 | What | Where |
 |------|-------|
