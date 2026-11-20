@@ -984,7 +984,8 @@ test "resolver: rootless, an object owned by a container id is never made whole,
         .xattrs = &xattrs.empty,
     };
     fixture.objects[0].wanted.attrs = shadow;
-    fixture.objects[0].wanted.id = object_mod.object_id(fixture.objects[0].wanted.content, shadow);
+    const owned = &fixture.objects[0].wanted;
+    owned.id = object_mod.object_id(owned.content, shadow);
     fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
     fixture.store.owners = .{ .outside = .{ .uid = 0, .gid = 0, .range = null } };
     try open_resolver(1, false, false);
