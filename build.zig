@@ -985,7 +985,7 @@ fn old_commit_of(step: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, step, "demo-m7")) return releases.m7_commit;
     if (std.mem.eql(u8, step, "demo-m8")) return releases.m8_tag;
     if (std.mem.eql(u8, step, "demo-m2b")) return releases.m2b_tag;
-    if (std.mem.eql(u8, step, "demo-s2")) return releases.s2_tag;
+    if (std.mem.eql(u8, step, "demo-s2")) return releases.s2_commit;
     return null;
 }
 

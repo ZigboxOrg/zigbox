@@ -67,7 +67,9 @@ fn demo(init: std.process.Init, out: *Io.Writer, options: H.Options) !void {
     };
     const binary = try H.check_binaries(init, out, options);
     if (options.old_zbx.len == 0) {
-        try out.print("demo-s2: --old-zbx is missing: step 9 needs {s}\n", .{old_release.s2_tag});
+        try out.print("demo-s2: --old-zbx is missing: step 9 needs {s}\n", .{
+            old_release.s2_commit,
+        });
         return error.MissingBinary;
     }
     const arena = init.arena.allocator();
