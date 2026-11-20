@@ -11,7 +11,16 @@
 //!     the store.
 //!   - `save` holds a lock on the store, so concurrent pipelines take turns; an entry is written
 //!     under a temporary name and renamed, so it appears whole or not at all; and a key once
-//!     stored is never overwritten (as `actions/cache`).
+//!     stored is not overwritten (as `actions/cache`), with two exceptions below.
+//!   - An entry is replaced, never edited, when what is stored is no use: its hash list is
+//!     missing or unreadable (always), or, for an entry the demo writes into (`grows`, the m4
+//!     blob image), the workspace's files differ from the stored ones by hash and the demo steps
+//!     all passed (`SaveOptions.replace_changed`). Without that, a cold copy saved by the first
+//!     run, before the demo had pulled anything, would stay for good and every later run would
+//!     pull again. The new copy is written under a temporary name, the old one is renamed aside,
+//!     the new one renamed to the key and the old one deleted, all under the store's lock; a
+//!     restore, which takes no lock, meets the old copy or the new one, or a miss for the instant
+//!     between the renames, and every copy it takes is checked against its own list.
 //!   - Each stored entry carries the SHA-256 of every file (`.sha256`, written when it is saved),
 //!     and `restore` checks each copy against it: a file that does not match is deleted from the
 //!     workspace and the whole entry from the store, so the demo downloads afresh and the next
@@ -40,6 +49,9 @@ pub const Entry = struct {
     /// The file that pins the download, relative to the workspace; its hash is the key.
     pin: []const u8,
     key_prefix: []const u8,
+    /// The demo writes into these files (the m4 blob image keeps what the guest pulled), so a
+    /// stored copy goes stale as the workspace's grows.
+    grows: bool = false,
 };
 
 pub const entries = [_]Entry{
@@ -70,6 +82,7 @@ pub const entries = [_]Entry{
         .globs = &.{"m4-blobs.img"},
         .pin = "src/testing/vm/zbx.lock",
         .key_prefix = "vm-m4-blobs",
+        .grows = true,
     },
 };
 
@@ -89,6 +102,10 @@ pub const keys_per_entry_max = 2;
 /// Directories in the store `prune` looks at before it stops (a bound on the walk).
 const store_items_max = 256;
 const hash_chunk_bytes = 64 * 1024;
+/// A temporary or set-aside name: a dot, a key, a suffix and 16 hex digits.
+const scratch_bytes_max = key_bytes_max + 32;
+/// Leftover scratch directories one `save` removes (a crash leaves at most a few).
+const leftovers_max = 16;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Digest = [Sha256.digest_length]u8;
@@ -98,6 +115,12 @@ comptime {
     // A list of the entries' real files (short names) fits: four lines of 64 + 2 + 64 + 1 bytes.
     assert(sums_bytes_max >= 4 * (2 * Sha256.digest_length + 2 + 64 + 1));
 }
+
+pub const SaveOptions = struct {
+    /// True when the demo steps all passed: only then is a stored `grows` entry replaced by a
+    /// workspace that differs (a failed run may leave a half-written image).
+    replace_changed: bool,
+};
 
 /// Where the entries live: the workspace the demos run in, and the store shared by pipelines.
 pub const Cache = struct {
@@ -219,9 +242,10 @@ fn hash_file(io: Io, dir: Io.Dir, name: []const u8) !Digest {
     return digest;
 }
 
-/// Stores each entry the store lacks, from the workspace; takes the store's lock for the whole
-/// pass. Failures are lines: a cache that cannot be written never fails a demo.
-pub fn save(cache: *const Cache, which: []const Entry) void {
+/// Stores each entry the store lacks, or holds in a form that is no use (see the header), from
+/// the workspace; takes the store's lock for the whole pass. Failures are lines: a cache that
+/// cannot be written never fails a demo.
+pub fn save(cache: *const Cache, which: []const Entry, options: SaveOptions) void {
     const io = cache.io;
     const lock_options: Io.Dir.CreateFileOptions = .{ .truncate = false, .lock = .exclusive };
     const lock = cache.store.createFile(io, ".lock", lock_options) catch |err| {
@@ -229,16 +253,49 @@ pub fn save(cache: *const Cache, which: []const Entry) void {
         return;
     };
     defer lock.close(io);
+    sweep_leftovers(cache);
     for (which) |*entry| {
         var buffer: [key_bytes_max]u8 = undefined;
         const key = key_of(cache, entry, &buffer) orelse continue;
-        const saved = save_one(cache, entry, key) catch |err| {
+        const saved = save_one(cache, entry, key, options) catch |err| {
             const why = @errorName(err);
             cache.log.print("cache: {s}: not saved ({s})\n", .{ entry.name, why }) catch {};
             continue;
         };
-        if (saved) cache.log.print("cache: {s}: saved ({s})\n", .{ entry.name, key }) catch {};
+        switch (saved) {
+            .kept => {},
+            .stored => cache.log.print("cache: {s}: saved ({s})\n", .{ entry.name, key }) catch {},
+            .replaced => {
+                cache.log.print("cache: {s}: replaced ({s})\n", .{ entry.name, key }) catch {};
+            },
+        }
         prune(cache, entry, key);
+    }
+}
+
+/// Deletes the scratch directories (temporary and set-aside, named with a leading dot) that a
+/// `save` killed half way left. The caller holds the store's lock, so none is in use.
+fn sweep_leftovers(cache: *const Cache) void {
+    const io = cache.io;
+    var store = cache.store.openDir(io, ".", .{ .iterate = true }) catch return;
+    defer store.close(io);
+    var names: [leftovers_max][scratch_bytes_max]u8 = undefined;
+    var lengths: [leftovers_max]u8 = undefined;
+    var count: u32 = 0;
+    var it = store.iterate();
+    while (it.next(io) catch null) |item| {
+        if (count == leftovers_max) break;
+        if (item.kind != .directory) continue;
+        if (item.name[0] != '.') continue;
+        if (item.name.len > scratch_bytes_max) continue;
+        @memcpy(names[count][0..item.name.len], item.name);
+        lengths[count] = @intCast(item.name.len);
+        count += 1;
+    }
+    for (0..count) |index| {
+        const name = names[index][0..lengths[index]];
+        cache.store.deleteTree(io, name) catch continue;
+        cache.log.print("cache: removed a leftover ({s})\n", .{name}) catch {};
     }
 }
 
@@ -299,28 +356,127 @@ fn saved_time(cache: *const Cache, key: []const u8) i96 {
     return stat.mtime.nanoseconds;
 }
 
-/// True if it stored the entry; false if the key exists or the workspace has no file for it.
-fn save_one(cache: *const Cache, entry: *const Entry, key: []const u8) !bool {
+const Saved = enum { kept, stored, replaced };
+
+/// Stores the entry (`.stored`), or replaces the stored one that is no use (`.replaced`), or
+/// leaves things as they are (`.kept`: the key exists and is good, or the workspace has no file).
+fn save_one(
+    cache: *const Cache,
+    entry: *const Entry,
+    key: []const u8,
+    options: SaveOptions,
+) !Saved {
     const io = cache.io;
-    if (cache.store.access(io, key, .{})) |_| return false else |_| {}
-    var source = cache.workspace.openDir(io, entry.dir, .{ .iterate = true }) catch return false;
+    const present = if (cache.store.access(io, key, .{})) |_| true else |_| false;
+    if (present) {
+        if (!stored_is_stale(cache, entry, key, options)) return .kept;
+    }
+    var source = cache.workspace.openDir(io, entry.dir, .{ .iterate = true }) catch return .kept;
     defer source.close(io);
-    var random: [8]u8 = undefined;
-    io.random(&random);
-    var temp_buffer: [key_bytes_max + 32]u8 = undefined;
-    const suffix = std.mem.readInt(u64, &random, .little);
-    const temp = try std.fmt.bufPrint(&temp_buffer, ".{s}.tmp.{x}", .{ key, suffix });
+    var temp_buffer: [scratch_bytes_max]u8 = undefined;
+    const temp = scratch_name(io, &temp_buffer, key, "tmp");
     try cache.store.createDirPath(io, temp);
     errdefer cache.store.deleteTree(io, temp) catch {};
     const found = try copy_matching(cache, entry, source, temp);
     if (found == 0) {
         try cache.store.deleteTree(io, temp);
-        return false;
+        return .kept;
     }
     try write_sums(cache, temp);
-    // The key was absent when the lock was taken, and the lock is ours: nothing else renames it.
-    try cache.store.rename(temp, cache.store, key, io);
-    return true;
+    if (!present) {
+        // The key was absent when the lock was taken, and the lock is ours: nobody renames it.
+        try cache.store.rename(temp, cache.store, key, io);
+        return .stored;
+    }
+    try replace_key(cache, temp, key);
+    return .replaced;
+}
+
+/// `.<key>.<kind>.<16 hex digits>`: a name no other save uses, and no key (it starts with a dot).
+fn scratch_name(
+    io: Io,
+    buffer: *[scratch_bytes_max]u8,
+    key: []const u8,
+    kind: []const u8,
+) []const u8 {
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const suffix = std.mem.readInt(u64, &random, .little);
+    assert(kind.len <= 4);
+    const format = ".{s}.{s}.{x:0>16}";
+    // The buffer holds the longest key, a kind of at most four letters and 16 digits.
+    return std.fmt.bufPrint(buffer, format, .{ key, kind, suffix }) catch unreachable;
+}
+
+/// Puts the finished `temp` directory at `key`, which exists: a directory cannot be renamed over
+/// another, so the old one goes aside first, and comes back if the second rename fails. The
+/// caller holds the store's lock.
+fn replace_key(cache: *const Cache, temp: []const u8, key: []const u8) !void {
+    const io = cache.io;
+    var aside_buffer: [scratch_bytes_max]u8 = undefined;
+    const aside = scratch_name(io, &aside_buffer, key, "old");
+    try cache.store.rename(key, cache.store, aside, io);
+    cache.store.rename(temp, cache.store, key, io) catch |err| {
+        cache.store.rename(aside, cache.store, key, io) catch {};
+        return err;
+    };
+    cache.store.deleteTree(io, aside) catch {};
+}
+
+/// True if the stored `key` should be replaced by the workspace's files: its hash list is missing
+/// or unreadable, or the entry grows, the demo steps passed and the workspace's files differ.
+fn stored_is_stale(
+    cache: *const Cache,
+    entry: *const Entry,
+    key: []const u8,
+    options: SaveOptions,
+) bool {
+    const io = cache.io;
+    var source = cache.store.openDir(io, key, .{}) catch return true;
+    defer source.close(io);
+    var sums_buffer: [sums_bytes_max]u8 = undefined;
+    const sums = source.readFile(io, sums_name, &sums_buffer) catch return true;
+    if (!list_is_usable(sums)) return true;
+    if (!entry.grows) return false;
+    if (!options.replace_changed) return false;
+    return !workspace_matches(cache, entry, sums);
+}
+
+fn list_is_usable(sums: []const u8) bool {
+    var lines = std.mem.tokenizeScalar(u8, sums, '\n');
+    var count: u32 = 0;
+    while (lines.next()) |line| {
+        _ = parse_sum_line(line) catch return false;
+        count += 1;
+        if (count > files_per_entry_max) return false;
+    }
+    return count > 0;
+}
+
+/// True if the workspace holds exactly the files the list names, with the listed hashes. Any
+/// error reading the workspace is "no": the entry is then rebuilt from what is there.
+fn workspace_matches(cache: *const Cache, entry: *const Entry, sums: []const u8) bool {
+    const io = cache.io;
+    var source = cache.workspace.openDir(io, entry.dir, .{ .iterate = true }) catch return false;
+    defer source.close(io);
+    var present: u32 = 0;
+    var it = source.iterate();
+    while (it.next(io) catch return false) |file| {
+        if (file.kind != .file) continue;
+        if (!glob.matches_any(entry.globs, file.name)) continue;
+        const stat = source.statFile(io, file.name, .{}) catch return false;
+        if (stat.size == 0) continue;
+        present += 1;
+    }
+    var listed: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, sums, '\n');
+    while (lines.next()) |line| {
+        const sum = parse_sum_line(line) catch return false;
+        listed += 1;
+        const digest = hash_file(io, source, sum.name) catch return false;
+        if (!std.mem.eql(u8, &digest, &sum.digest)) return false;
+    }
+    return present == listed;
 }
 
 /// Writes the hash list of the files in the store's `temp` directory, hashed from those copies.
@@ -422,9 +578,9 @@ test "vm cache: save stores once, restore copies, nothing is overwritten" {
     const cache: Cache = .{ .io = io, .workspace = workspace, .store = store, .log = &log };
     var which = test_entries();
     which[0].dir = "dl";
-    save(&cache, &which);
+    save(&cache, &which, .{ .replace_changed = true });
     try workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "second" });
-    save(&cache, &which);
+    save(&cache, &which, .{ .replace_changed = true });
     const key = "vm-t-ba7816bf8f01cfea";
     var data: [16]u8 = undefined;
     try testing.expectEqualStrings("first", try store.readFile(io, key ++ "/a-1.img", &data));
@@ -481,7 +637,7 @@ test "vm cache: a stored file that fails its hash is not restored, and the entry
     var which = test_entries();
     which[0].dir = "dl";
     const key = "vm-t-ba7816bf8f01cfea";
-    save(&cache, &which);
+    save(&cache, &which, .{ .replace_changed = true });
     try store.access(io, key ++ "/" ++ sums_name, .{});
     try store.writeFile(io, .{ .sub_path = key ++ "/a-1.img", .data = "evil" });
     restore(&again, &which);
@@ -489,13 +645,13 @@ test "vm cache: a stored file that fails its hash is not restored, and the entry
     try testing.expectError(error.FileNotFound, store.access(io, key, .{}));
     // Saved again, then stripped of its list (as one saved before lists existed): a miss, not an
     // unchecked hit, and dropped so that the next save replaces it.
-    save(&cache, &which);
+    save(&cache, &which, .{ .replace_changed = true });
     try store.deleteFile(io, key ++ "/" ++ sums_name);
     restore(&again, &which);
     try testing.expectError(error.FileNotFound, fresh.access(io, "dl/a-1.img", .{}));
     try testing.expectError(error.FileNotFound, store.access(io, key, .{}));
     // A good entry restores.
-    save(&cache, &which);
+    save(&cache, &which, .{ .replace_changed = true });
     restore(&again, &which);
     var data: [16]u8 = undefined;
     try testing.expectEqualStrings("good", try fresh.readFile(io, "dl/a-1.img", &data));
@@ -528,7 +684,7 @@ test "vm cache: save keeps at most keys_per_entry_max keys of an entry" {
     for (pins, 0..) |pin, index| {
         try workspace.writeFile(io, .{ .sub_path = "pin.zon", .data = pin });
         _ = key_of(&cache, &which[0], &keys[index]).?;
-        save(&cache, &which);
+        save(&cache, &which, .{ .replace_changed = true });
         const key = keys[index][0..key_len];
         const sums = try std.fmt.bufPrint(&path, "{s}/{s}", .{ key, sums_name });
         const second: i96 = std.time.ns_per_s * @as(i96, @intCast(index + 1));
@@ -545,4 +701,152 @@ test "vm cache: save keeps at most keys_per_entry_max keys of an entry" {
     try store.access(io, keys[3][0..key_len], .{});
     try store.access(io, keys[2][0..key_len], .{});
     try testing.expectError(error.FileNotFound, store.access(io, keys[0][0..key_len], .{}));
+}
+
+/// A workspace and a store in a temporary directory, with one growing entry whose file is
+/// `dl/a-1.img`; the tests below share it.
+const Rig = struct {
+    tmp: testing.TmpDir,
+    workspace: Io.Dir,
+    store: Io.Dir,
+    sink: [4096]u8 = undefined,
+    log: Io.Writer = undefined,
+
+    fn open(rig: *Rig) !void {
+        const io = testing.io;
+        rig.tmp = testing.tmpDir(.{});
+        try rig.tmp.dir.createDirPath(io, "w/dl");
+        try rig.tmp.dir.createDirPath(io, "store");
+        try rig.tmp.dir.writeFile(io, .{ .sub_path = "w/pin.zon", .data = "abc" });
+        rig.workspace = try rig.tmp.dir.openDir(io, "w", .{});
+        rig.store = try rig.tmp.dir.openDir(io, "store", .{ .iterate = true });
+        rig.log = .fixed(&rig.sink);
+    }
+
+    fn close(rig: *Rig) void {
+        rig.workspace.close(testing.io);
+        rig.store.close(testing.io);
+        rig.tmp.cleanup();
+    }
+
+    fn cache(rig: *Rig) Cache {
+        return .{
+            .io = testing.io,
+            .workspace = rig.workspace,
+            .store = rig.store,
+            .log = &rig.log,
+        };
+    }
+};
+
+const test_key = "vm-t-ba7816bf8f01cfea";
+
+fn growing_entries() [1]Entry {
+    var which = test_entries();
+    which[0].dir = "dl";
+    which[0].grows = true;
+    return which;
+}
+
+fn expect_stored(store: Io.Dir, expected: []const u8) !void {
+    var data: [16]u8 = undefined;
+    const stored = try store.readFile(testing.io, test_key ++ "/a-1.img", &data);
+    try testing.expectEqualStrings(expected, stored);
+}
+
+fn expect_no_scratch(store: Io.Dir) !void {
+    var it = store.iterate();
+    while (try it.next(testing.io)) |item| {
+        if (item.kind == .directory) try testing.expect(item.name[0] != '.');
+    }
+}
+
+test "vm cache: a growing entry is replaced when the workspace's copy differs" {
+    // Goal: a cold copy saved by a first run does not stay for good (demo-m4 then pulls every
+    // time and misses its 60 s). Method: save a cold image, grow it in the workspace and save
+    // again: the store must hold the grown one, restore it, and keep no scratch directory. A
+    // workspace that matches, a failed run (`replace_changed` false) and a workspace with no
+    // file must each leave the stored copy alone.
+    var rig: Rig = undefined;
+    try rig.open();
+    defer rig.close();
+    const io = testing.io;
+    const cache = rig.cache();
+    const which = growing_entries();
+    var data: [16]u8 = undefined;
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "cold" });
+    save(&cache, &which, .{ .replace_changed = true });
+    try testing.expect(std.mem.indexOf(u8, rig.log.buffered(), "saved") != null);
+    // Unchanged: nothing is rewritten.
+    rig.log = .fixed(&rig.sink);
+    save(&cache, &which, .{ .replace_changed = true });
+    try testing.expectEqual(@as(usize, 0), rig.log.buffered().len);
+    // Changed, but the steps failed: kept.
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "warm" });
+    save(&cache, &which, .{ .replace_changed = false });
+    try expect_stored(rig.store, "cold");
+    // Changed and the steps passed: replaced, with a list that checks.
+    save(&cache, &which, .{ .replace_changed = true });
+    try testing.expect(std.mem.indexOf(u8, rig.log.buffered(), "replaced") != null);
+    try expect_stored(rig.store, "warm");
+    try expect_no_scratch(rig.store);
+    try rig.workspace.deleteTree(io, "dl");
+    restore(&cache, &which);
+    try testing.expectEqualStrings("warm", try rig.workspace.readFile(io, "dl/a-1.img", &data));
+    // No file in the workspace: the stored copy stays.
+    try rig.workspace.deleteTree(io, "dl");
+    try rig.workspace.createDirPath(io, "dl");
+    save(&cache, &which, .{ .replace_changed = true });
+    try expect_stored(rig.store, "warm");
+    try expect_no_scratch(rig.store);
+}
+
+test "vm cache: a stored entry with no usable list is replaced, whatever the entry" {
+    // Goal: an entry that restore cannot use (no list, a list that does not parse) is rebuilt
+    // from the next workspace, even for an entry that does not grow and after a failed run: it is
+    // of no use as it is. Method: store, damage the list, save again.
+    var rig: Rig = undefined;
+    try rig.open();
+    defer rig.close();
+    const io = testing.io;
+    const cache = rig.cache();
+    var which = growing_entries();
+    which[0].grows = false;
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "good" });
+    save(&cache, &which, .{ .replace_changed = false });
+    const sums_path = test_key ++ "/" ++ sums_name;
+    try rig.store.writeFile(io, .{ .sub_path = sums_path, .data = "not a list\n" });
+    save(&cache, &which, .{ .replace_changed = false });
+    try testing.expect(std.mem.indexOf(u8, rig.log.buffered(), "replaced") != null);
+    var sums: [sums_bytes_max]u8 = undefined;
+    try testing.expect(list_is_usable(try rig.store.readFile(io, sums_path, &sums)));
+    try expect_stored(rig.store, "good");
+    try rig.store.deleteFile(io, test_key ++ "/" ++ sums_name);
+    save(&cache, &which, .{ .replace_changed = false });
+    try rig.store.access(io, test_key ++ "/" ++ sums_name, .{});
+    try expect_no_scratch(rig.store);
+}
+
+test "vm cache: save removes the scratch directories a killed save left" {
+    // Goal: a save killed between its renames leaves no gigabyte directory behind for good.
+    // Method: plant a temporary and a set-aside directory and a file, save: both directories go,
+    // the file (not ours to judge) stays, and the entry is stored.
+    var rig: Rig = undefined;
+    try rig.open();
+    defer rig.close();
+    const io = testing.io;
+    const cache = rig.cache();
+    const which = growing_entries();
+    try rig.workspace.writeFile(io, .{ .sub_path = "dl/a-1.img", .data = "image" });
+    try rig.store.createDirPath(io, "." ++ test_key ++ ".tmp.0000000000000001");
+    try rig.store.writeFile(io, .{
+        .sub_path = "." ++ test_key ++ ".tmp.0000000000000001/a-1.img",
+        .data = "half",
+    });
+    try rig.store.createDirPath(io, "." ++ test_key ++ ".old.0000000000000002");
+    try rig.store.writeFile(io, .{ .sub_path = "note.txt", .data = "x" });
+    save(&cache, &which, .{ .replace_changed = true });
+    try expect_no_scratch(rig.store);
+    try rig.store.access(io, "note.txt", .{});
+    try rig.store.access(io, test_key ++ "/" ++ sums_name, .{});
 }

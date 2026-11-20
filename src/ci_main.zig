@@ -457,7 +457,10 @@ fn run_steps(ctx: *Ctx, steps: []const []const u8) !u8 {
             failed = true;
         };
     }
-    if (store != null) cache_store.save(&cache, &cache_store.entries);
+    if (store != null) {
+        const options: cache_store.SaveOptions = .{ .replace_changed = !failed };
+        cache_store.save(&cache, &cache_store.entries, options);
+    }
     return @intFromBool(failed);
 }
 

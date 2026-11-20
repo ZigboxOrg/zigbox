@@ -164,6 +164,19 @@ or `write`), and that it is in no bypass list (`bypass_pull_request_allowances` 
 actor; rulesets are not read by the script, so keep protection classic). Prefer a dedicated
 machine-user account, so that the token the box stores is not a person's.
 
+**Why this is accepted (owner, 2026-11-20).** Anyone with write access to `ZigboxOrg/zigbox`, and
+anyone holding a writer's credentials (a leaked writer token included), can run privileged steps
+on this box without approval, and so can read everything listed above and act as root on the host.
+A leaked `github_token` secret alone is narrower (it deletes or pushes scratch branches), but a
+leaked writer token is not: it can push `vmw/*`. This is accepted because the writers are the
+owner and the owner's sessions, and pull requests from forks, which anyone can open, wait for
+approval (`require_approval: forks`). `all_events` stays off. **If write access ever widens** (a
+collaborator, a team, a bot, an app with `contents: write`), the box must not stay as it is: before
+adding the writer, set `ZBX_CI_APPROVAL=all_events ZBX_CI_APPROVED_USERS=<the owner's logins>` and
+rerun `woodpecker-setup.sh` (next paragraph), or move the server off the agent's host. Treat
+write access to the repository as root on the box until then. Decision:
+`docs/decisions/2026-11-20-woodpecker-approval-and-blob-cache.md`.
+
 **Approval.** Woodpecker 3.20.1 (`server/pipeline/gated.go`) offers `require_approval` =
 `none`, `forks` (default; set explicitly), `pull_requests` (every pull request, same-repository
 ones too) or `all_events` (every push and pull request; cron and manual runs excepted), and
@@ -180,7 +193,7 @@ as the owner's account, so listing it lets them through, and approval then stops
 that account's credentials (a prompt-injected session included); it stops only other writers. Every
 other push, and every `vmw/*` push by someone not listed, waits for a click in the UI, which
 defeats `vmw/*` for them. The script does not set it by default, because that changes who can run
-what on the box (an owner's call; the decision doc records it as off). The default stays `forks`,
+what on the box (the owner decided on 2026-11-20 to keep it off, with the consequence above). The default stays `forks`,
 and `main`'s protection above is the control.
 
 It reads the settings back; the last line must be `ci-setup: OK ZigboxOrg/zigbox (id N): ...`
@@ -275,14 +288,35 @@ Each log line comes back base64-encoded in `.data`. The run's page is
   once, alone: push `vmw/m4-warm` for the `vm` scope and open a pull request for `pull_request`
   (`push` fills on the first push to `main`), wait for it to finish, then run the rest.
 - **Disk:** VM images are stored per pinned version under `/var/lib/zigbox-ci/<scope>/vm-entries`
-  (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`). Each stored entry
-  carries the SHA-256 of its files and is checked on every restore: a file that does not match is
-  not used, and the entry is deleted and stored again from a fresh download. Each save keeps at
-  most two keys per entry (the current pin and the newest older one), so a scope holds at most two
-  copies of each image set. The Zig caches (`zig`, `zig-root`) are bounded by the hourly
-  `zigbox-ci-prune` timer: a scope whose Zig caches pass 30 GiB is emptied while it holds the
-  scope's `.prune-lock` exclusively, which no step holds then (a scope in use is skipped until the
-  next hour; `journalctl -u zigbox-ci-prune` shows when). Empty one by hand the same way:
+  (`src/testing/vm/cache.zig`, switched on by `ZBX_VM_CACHE` or `-Dvm-cache`). Expect, per scope,
+  a few GiB per stored key (the Ubuntu image, three guest images, the Alpine rootfs, and the m4
+  blob image, a sparse file of up to 1 GiB), two keys at most per entry, so on the order of
+  10 to 15 GiB per scope and up to about 75 GiB over the five scopes once all are warm, besides the
+  Zig caches (30 GiB each at most). These figures are estimates, not measurements: read the real
+  ones with `du -sh /var/lib/zigbox-ci/*/vm-entries/*`. `bootstrap.sh` refuses a box with under
+  100 GiB free. Each stored entry carries the SHA-256 of its files and is checked on every
+  restore: a file that does not match is not used, and the entry is deleted and stored again from
+  a fresh download. A stored entry is also replaced, atomically (the new copy is written under a
+  temporary name, the old one renamed aside, the new one renamed in, the old one deleted, all
+  under the store's lock `vm-entries/.lock`, so it is safe beside the prune and the other
+  pipelines), when its list is missing or unreadable, and, for the m4 blob image, when a run whose
+  steps all passed leaves a different image (a cold copy saved by a first run is replaced by the
+  warm one, so the next demo-m4 does not pull again and stays inside its 60 s). Directories a
+  killed save left (names starting with a dot) are removed by the next save. Each save keeps at
+  most two keys per entry (the current pin and the newest older one). **To clear one entry by
+  hand** (a stale or suspect copy; the next run rebuilds it), take the store's lock and delete its
+  key directory, the key being the prefix and the first 16 hex digits of the SHA-256 of its pin
+  file (`vm-m4-blobs-` and `sha256sum src/testing/vm/zbx.lock | cut -c1-16`):
+  `flock -x /var/lib/zigbox-ci/<scope>/vm-entries/.lock rm -rf
+  /var/lib/zigbox-ci/<scope>/vm-entries/vm-m4-blobs-<16 hex>`; `rm -rf` of every directory in
+  `vm-entries` (the lock file stays) clears the scope's VM images. The Zig caches (`zig`,
+  `zig-root`) are bounded by the hourly `zigbox-ci-prune` timer: a scope whose Zig caches pass
+  30 GiB is emptied while it holds the scope's `.prune-lock` exclusively, which no step holds
+  then. The prune waits up to 30 minutes for that gap and logs `SKIPPED` when it gets none
+  (`journalctl -u zigbox-ci-prune`), so a scope kept busy by back-to-back pipelines can pass the
+  bound for hours (steps that start while it waits are not held back, so it needs a gap
+  between steps). If
+  `SKIPPED` repeats for a scope, empty it by hand the same way:
   `flock -x /var/lib/zigbox-ci/<scope>/.prune-lock find /var/lib/zigbox-ci/<scope>/zig
   /var/lib/zigbox-ci/<scope>/zig-root -mindepth 1 -delete`. Docker's own: `docker system prune -f`.
 - **Full CI on a pull request:** the `full-ci` label starts `check` and `demos` again at once
