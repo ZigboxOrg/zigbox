@@ -506,25 +506,7 @@ pub const HostReal = struct {
         const pid: host.Pid = @intCast(forked);
         switch (said) {
             .member => |member| return .{ .pid = pid, .member = member },
-            .failed => |errno| {
-                _ = keeper_reap(pid, true);
-                errno_last = errno; // The keeper's own cause, such as EAGAIN from its clone.
-                return host.error_for_errno(errno);
-            },
-            .ended => {
-                // The pipe ended with nothing in it: every holder of its write end is gone, so
-                // the keeper has exited and the wait is immediate. No kill: its own status is
-                // the cause, not one we made.
-                keeper_exit = keeper_reap(pid, false);
-                errno_last = 0; // No step said why; `keeper_exit` says how it ended.
-                return error.IoFailed;
-            },
-            .unknown => {
-                // A read error or a value out of range: the keeper may still be alive.
-                _ = keeper_reap(pid, true);
-                errno_last = 0;
-                return error.IoFailed;
-            },
+            .failed, .ended, .unknown => return keeper_failed(pid, said),
         }
     }
 
@@ -1818,7 +1800,7 @@ fn keeper_fail(report: i32, result: usize) noreturn {
 }
 
 /// How the last keeper that ended without a cause ended (`start_keeper`), or null when none did
-/// or it was killed here; the cause line of the start failure reads it.
+/// or its status could not be read; the cause line of the start failure reads it.
 pub threadlocal var keeper_exit: ?host.ExitStatus = null;
 
 /// Reaps the keeper zbx forked, `pid`, after a start that failed, and returns how it ended
@@ -1845,6 +1827,36 @@ fn keeper_reap(pid: host.Pid, kill: bool) ?host.ExitStatus {
         return null;
     }
     return null;
+}
+
+/// Ends a start of the keeper `pid` that did not give a member (`said` is not `.member`): kills
+/// and reaps it, records in `errno_last` and `keeper_exit` why, and returns the start's error.
+/// The kill comes first in every case. For a keeper that has already ended it changes nothing
+/// (the status of a process that is exiting is fixed), and it bounds the wait where the keeper
+/// is still alive, so no case can block on a member that holds the pipe's other end.
+fn keeper_failed(pid: host.Pid, said: KeeperReport) host.Error {
+    assert(pid > 1);
+    switch (said) {
+        .member => unreachable, // The caller returns the keeper; nothing failed.
+        .failed => |errno| {
+            _ = keeper_reap(pid, true);
+            errno_last = errno; // The keeper's own cause, such as EAGAIN from its clone.
+            return host.error_for_errno(errno);
+        },
+        .ended => {
+            // The pipe ended with nothing in it: every holder of its write end is gone, so the
+            // keeper is exiting and its status is already decided; the kill cannot change it.
+            keeper_exit = keeper_reap(pid, true);
+            errno_last = 0; // No step said why; `keeper_exit` says how it ended.
+            return error.IoFailed;
+        },
+        .unknown => {
+            // A read error or a value out of range: the keeper may still be alive.
+            _ = keeper_reap(pid, true);
+            errno_last = 0;
+            return error.IoFailed;
+        },
+    }
 }
 
 /// The keeper's member's stack. It runs in the keeper's memory (`CLONE_VM`), where this array is
@@ -1887,12 +1899,24 @@ fn keeper_main(parent: i32, hold: i32, report: i32) noreturn {
     for (0..constants.keeper_waits_max) |_| {
         const result = linux.wait4(@intCast(cloned), &status, 0, null);
         switch (linux.errno(result)) {
-            .SUCCESS => linux.exit_group(if (status == 0) 0 else 1),
+            .SUCCESS => keeper_end(status),
             .INTR => {},
             else => linux.exit_group(1),
         }
     }
     linux.exit_group(1);
+}
+
+/// Ends the keeper the way its member ended, so that zbx's reap says so: a member killed by a
+/// signal (the OOM killer's, or a user's) takes the keeper down by the same signal, where an
+/// exit status of 1 would name no cause. A signal that does not end the keeper falls through to
+/// status 1.
+fn keeper_end(status: i32) noreturn {
+    const raw: u32 = @bitCast(status);
+    if (linux.W.IFSIGNALED(raw)) {
+        _ = linux.kill(linux.getpid(), linux.W.TERMSIG(raw));
+    }
+    linux.exit_group(if (status == 0) 0 else 1);
 }
 
 /// Closes every descriptor but `low` and `high` (`low < high`). The raw result: 0, or that of
@@ -3357,8 +3381,8 @@ test "real keeper_fail: a forked process's report decodes as failed(EAGAIN), not
     // Goal: `keeper_fail`'s own encoding reaches zbx's decoder as the failed step's errno, so a
     // change to either side that made an errno read as a pid (or the reverse) fails here.
     // Method: fork a child that calls `keeper_fail` with a raw -EAGAIN, as a refused clone
-    // returns it, and read and reap it as `start_keeper` does. Also a child that exits with
-    // nothing written (`ended`, reaped unkilled with its status) and one killed by a signal.
+    // returns it, and read and reap it as `start_keeper` does. The ended and signalled children
+    // are the next two tests.
     var ends: [2]i32 = undefined;
     try HostReal.check(linux.pipe2(&ends, .{ .CLOEXEC = true }));
     const forked = linux.fork();
@@ -3372,18 +3396,90 @@ test "real keeper_fail: a forked process's report decodes as failed(EAGAIN), not
         host.ExitStatus{ .exited = 1 },
         keeper_reap(@intCast(forked), false).?,
     );
+}
+
+test "real keeper_failed: a keeper that ended with nothing written is named by its status" {
+    // Goal: the real host's `.ended` decision (report, kill, reap, `keeper_exit`) runs on a real
+    // kernel: the start fails with errno 0 and `keeper_exit` is the keeper's own status, even
+    // though it is now killed first. Method: fork a child that exits 7 with nothing written, read
+    // the pipe as `start_keeper` does (it ends), and hand the child to `keeper_failed`. Mutation
+    // check: deleting the `keeper_exit =` assignment makes the first expectation fail.
     var quiet: [2]i32 = undefined;
     try HostReal.check(linux.pipe2(&quiet, .{ .CLOEXEC = true }));
     const silent = linux.fork();
     if (silent == 0) linux.exit_group(7);
     try HostReal.check(silent);
     _ = linux.close(quiet[1]);
-    try std.testing.expectEqual(KeeperReport.ended, keeper_report_read(quiet[0]));
+    const said = keeper_report_read(quiet[0]);
     _ = linux.close(quiet[0]);
-    try std.testing.expectEqual(
-        host.ExitStatus{ .exited = 7 },
-        keeper_reap(@intCast(silent), false).?,
-    );
+    try std.testing.expectEqual(KeeperReport.ended, said);
+    keeper_exit = null;
+    errno_last = 99;
+    const result = keeper_failed(@intCast(silent), said);
+    try std.testing.expectEqual(error.IoFailed, result);
+    try std.testing.expectEqual(host.ExitStatus{ .exited = 7 }, keeper_exit.?);
+    try std.testing.expectEqual(@as(u16, 0), errno_last);
+    keeper_exit = null;
+}
+
+test "real keeper_failed: a step's errno is the cause, and a still-live keeper is reaped" {
+    // Goal: `.failed` leaves the keeper's errno as the cause and no `keeper_exit`; `.unknown`
+    // (the keeper may be alive) is killed and reaped, not waited on. Method: a child that sleeps
+    // until killed stands for the live keeper; a child that exits 1 for the one that failed.
+    keeper_exit = null;
+    const failing = linux.fork();
+    if (failing == 0) linux.exit_group(1);
+    try HostReal.check(failing);
+    const said: KeeperReport = .{ .failed = @backingInt(linux.E.AGAIN) };
+    try std.testing.expectEqual(error.WouldBlock, keeper_failed(@intCast(failing), said));
+    try std.testing.expectEqual(@as(u16, @backingInt(linux.E.AGAIN)), errno_last);
+    try std.testing.expectEqual(@as(?host.ExitStatus, null), keeper_exit);
+    const alive = linux.fork();
+    if (alive == 0) {
+        while (true) _ = linux.pause();
+    }
+    try HostReal.check(alive);
+    try std.testing.expectEqual(error.IoFailed, keeper_failed(@intCast(alive), .unknown));
+    try std.testing.expectEqual(@as(u16, 0), errno_last);
+    try std.testing.expectEqual(@as(?host.ExitStatus, null), keeper_exit);
+}
+
+test "real keeper_reap: a child killed by a signal is reported as that signal" {
+    // Goal: the signal branch of `keeper_reap`. Method: fork a child that kills itself with
+    // SIGKILL, and one that the parent kills with SIGTERM before it can do anything else; reap
+    // each unkilled and compare.
+    const own = linux.fork();
+    if (own == 0) {
+        _ = linux.kill(linux.getpid(), .KILL);
+        linux.exit_group(0);
+    }
+    try HostReal.check(own);
+    const killed = keeper_reap(@intCast(own), false).?;
+    try std.testing.expectEqual(host.ExitStatus{ .signaled = 9 }, killed);
+    const waiting = linux.fork();
+    if (waiting == 0) {
+        while (true) _ = linux.pause();
+    }
+    try HostReal.check(waiting);
+    _ = linux.kill(@intCast(waiting), .TERM);
+    const terminated = keeper_reap(@intCast(waiting), false).?;
+    try std.testing.expectEqual(host.ExitStatus{ .signaled = 15 }, terminated);
+}
+
+test "real keeper: a member killed by a signal takes the keeper down by it" {
+    // Goal: zbx's reap of a keeper whose member was killed before it reported says "signal N",
+    // not "status 1". Method: start a keeper, SIGKILL its member (the OOM killer's way), and
+    // wait for the keeper.
+    var real: HostReal = .{};
+    const subject = real.interface();
+    const hold = try subject.pipe();
+    const keeper = try subject.start_keeper(hold.read);
+    subject.close(hold.read);
+    try subject.signal(keeper.member, 9);
+    const status = try subject.wait_for(keeper.pid);
+    try std.testing.expectEqual(host.ExitStatus{ .signaled = 9 }, status);
+    subject.close(hold.write);
+    try std.testing.expectEqual(@as(u32, 0), real.open_count);
 }
 
 /// `/proc/<pid>/oom_score`, without its newline.
