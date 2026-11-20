@@ -108,6 +108,8 @@ test "a version 1 settings record is read, not rendered back (the seed 256272227
     _ = try settings.parse(v1);
     _ = try settings.parse(v2);
     try std.testing.expectError(error.Malformed, settings.parse(refused));
+    try std.testing.expectError(error.Malformed, settings.parse(v1 ++ "\n"));
+    try std.testing.expectError(error.Malformed, settings.parse(v1 ++ "disk_bytes=68719476736\n"));
     check_settings_accepted(v1);
     check_settings_accepted(v2);
     check_settings_accepted(refused);
