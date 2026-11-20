@@ -9,7 +9,7 @@
 # (security and volumes: the demo steps' /dev/kvm and the /var/lib/zigbox-ci mount), approval
 # before any pipeline of a pull request from a fork, cancel-previous for pushes and pull requests,
 # and the 180-minute timeout; and it creates or updates the `github_token` secret that
-# deletes vm/* branches. It asks for the Woodpecker token (User settings -> CLI & API) and the
+# deletes vmw/* branches. It asks for the Woodpecker token (User settings -> CLI & API) and the
 # GitHub token without echo; an empty GitHub token keeps the stored secret. Neither goes on a
 # command line: the header is a 0600 file and the secret's JSON comes from stdin.
 set -euo pipefail
@@ -78,7 +78,7 @@ api PATCH "/repos/$repo_id" -d @- >/dev/null <<'JSON'
 JSON
 
 # --- The secret ----------------------------------------------------------------------------------
-read -rsp "GitHub token for vm/* branch deletion (Enter keeps the stored one): " gh_pat </dev/tty
+read -rsp "GitHub token for vmw/* branch deletion (Enter keeps the stored one): " gh_pat </dev/tty
 echo
 if [ -n "$gh_pat" ]; then
     printf '%s' "$gh_pat" |
