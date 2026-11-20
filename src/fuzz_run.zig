@@ -287,6 +287,9 @@ const Scenario = struct {
     /// When the keeper fails, it is its clone of its member that is refused, not zbx's fork.
     keeper_fails_in_member: bool,
     keeper_dies: bool,
+    /// When the keeper fails, it instead ran and ended with this status before saying why
+    /// (`World.keeper_ended_with`); the run is refused all the same.
+    keeper_ended: ?host_mod.ExitStatus,
     /// The OOM killer kills again in the cgroup before the reap (`World.oom_takes_keeper`). It
     /// changes nothing the run reports: the keeper's member is never its victim.
     oom_again: bool,
@@ -458,6 +461,13 @@ fn random_cgroup(random: std.Random, scenario: *Scenario) void {
     scenario.keeper_fork_fails = random.uintLessThan(u8, 10) == 0;
     scenario.keeper_fails_in_member = random.boolean();
     scenario.keeper_dies = random.uintLessThan(u8, 5) == 0;
+    scenario.keeper_ended = null;
+    if (scenario.keeper_fork_fails and random.boolean()) {
+        scenario.keeper_ended = if (random.boolean())
+            .{ .exited = random.int(u8) }
+        else
+            .{ .signaled = random.intRangeAtMost(u8, 1, 64) };
+    }
     scenario.oom_again = random.boolean();
     scenario.knobs = if (random.boolean()) .none else random.enumValue(KnobsChoice);
     scenario.sysctl_refused = scenario.knobs.has_sysctl() and random.uintLessThan(u8, 4) == 0;
@@ -1267,6 +1277,7 @@ fn set_bus(sim: *HostSim, scenario: *const Scenario) void {
     sim.world.oom_kills = @intFromBool(scenario.oom);
     sim.world.keeper_dies_early = scenario.keeper_dies;
     sim.world.oom_takes_keeper = scenario.oom_again;
+    sim.world.keeper_ended_with = scenario.keeper_ended;
     if (scenario.keeper_fork_fails) {
         if (scenario.keeper_fails_in_member) {
             sim.world.keeper_member_errno = 11;

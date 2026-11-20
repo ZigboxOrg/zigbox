@@ -812,6 +812,12 @@ pub const registry = [_]Entry{
         \\(AppArmor, SELinux, seccomp), or running zbx inside another container,
         \\which hides parts of /proc. "zbx doctor" checks what this host allows.
         \\
+        \\When the process that keeps the container's cgroup scope alive ends before
+        \\it is ready, the cause says how: its exit status, or the signal that killed
+        \\it (SIGKILL is usually the OOM killer or a user's kill). When it was refused
+        \\a process, the cause is the kernel's reason (EAGAIN: the user's process
+        \\limit, which the keeper counts twice).
+        \\
         \\Rerun with --verbose to see the step's place in the plan. If the reason
         \\fits none of these, report it with the output.
         ,

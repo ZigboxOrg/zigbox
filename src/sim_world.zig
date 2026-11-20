@@ -506,6 +506,9 @@ pub const World = struct {
     /// keeper is two processes of the user's limit, and the second was refused). The real host
     /// kills and reaps that keeper itself before the start fails, so nothing is left behind.
     keeper_member_errno: ?u16,
+    /// The keeper forked and exited with this status before reporting anything (a signal kills
+    /// it, say); the start then fails with no errno, and the status is the cause.
+    keeper_ended_with: ?host.ExitStatus,
     keeper_dies_early: bool,
     /// The OOM killer, having killed the command, kills again in the same cgroup before zbx
     /// reaps it (a second process of the command was still charging) and picks the scope's
@@ -628,6 +631,7 @@ pub const World = struct {
         world.ended_memory_max = null;
         world.keeper_fork_errno = null;
         world.keeper_member_errno = null;
+        world.keeper_ended_with = null;
         world.keeper_dies_early = false;
         world.oom_takes_keeper = false;
         world.keepers_started = 0;

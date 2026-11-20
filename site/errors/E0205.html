@@ -78,6 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>zbx sets a container up in steps: the mounts, the minimal /dev, moving into the new root with pivot_root, the hostname. The kernel refused one of them, so the container was not started and nothing it mounted is left on the host.</p>
 <p>The cause names the step and the kernel's reason. Mounts inside a user namespace are refused when the host forbids them: a security policy (AppArmor, SELinux, seccomp), or running zbx inside another container, which hides parts of /proc. &quot;zbx doctor&quot; checks what this host allows.</p>
+<p>When the process that keeps the container's cgroup scope alive ends before it is ready, the cause says how: its exit status, or the signal that killed it (SIGKILL is usually the OOM killer or a user's kill). When it was refused a process, the cause is the kernel's reason (EAGAIN: the user's process limit, which the keeper counts twice).</p>
 <p>Rerun with --verbose to see the step's place in the plan. If the reason fits none of these, report it with the output.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

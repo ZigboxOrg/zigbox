@@ -257,6 +257,8 @@ pub const HostSim = struct {
     terminal_only: ?host.Stream,
     /// The errno of the most recent call, 0 if it succeeded (`Host.last_errno`).
     errno_last: u16,
+    /// How the keeper of the last failed `start_keeper` ended (`Host.keeper_exit`).
+    keeper_exit: ?host.ExitStatus,
     /// Whether NO_COLOR is set in the simulated environment.
     no_color_value: bool,
     /// Error results injected so far, split so tests can reason about what surfaced: `hard`
@@ -323,6 +325,7 @@ pub const HostSim = struct {
         sim.sigpipe_would_kill = false;
         sim.terminal_only = null;
         sim.errno_last = 0;
+        sim.keeper_exit = null;
         sim.no_color_value = false;
         sim.hard_errors_injected = 0;
         sim.interrupts_injected = 0;
@@ -408,6 +411,7 @@ pub const HostSim = struct {
         .is_unix_stream = is_unix_stream,
         .write_handle = write_handle,
         .spawn = spawn,
+        .keeper_exit = keeper_exit_last,
         .start_keeper = start_keeper,
         .start_program = start_program,
         .wait = wait,
@@ -957,11 +961,23 @@ pub const HostSim = struct {
         return sim.world.spawn(flags, entry, entry_context) orelse sim.model_error(11);
     }
 
+    fn keeper_exit_last(context: *anyopaque) ?host.ExitStatus {
+        return from_context(context).keeper_exit;
+    }
+
     fn start_keeper(context: *anyopaque, hold: host.Handle) host.Error!host.Keeper {
         const sim = from_context(context);
+        sim.keeper_exit = null;
         try sim.begin_call();
+        if (sim.world.keeper_ended_with) |status| {
+            // The keeper ran and exited before reporting; the real host reaps it, unkilled.
+            sim.keeper_exit = status;
+            return error.IoFailed; // With errno 0, as the real host leaves it.
+        }
         if (sim.world.keeper_fork_errno) |errno| return sim.model_error(errno);
-        // The keeper started and failed; the real host reaps it before it returns.
+        // The sim models a failed member clone as a refused call with no keeper process left, so
+        // the real host's reap of the keeper (`keeper_reap`: killed or not, status read) is
+        // checked by the real-kernel tests in host_real.zig only.
         if (sim.world.keeper_member_errno) |errno| return sim.model_error(errno);
         return sim.world.start_keeper(hold) orelse sim.model_error(11);
     }

@@ -50,6 +50,8 @@ pub const Details = struct {
     facts: *doctor.Facts,
     /// How pasta ended, when it did not become ready (`Session.PastaEnd`).
     pasta: ?PastaEnd = null,
+    /// How the scope's keeper ended, when it exited without saying why (`Host.keeper_exit`).
+    keeper: ?host_mod.ExitStatus = null,
 };
 
 /// How a pasta that never became ready ended (the session's own type, repeated here so that the
@@ -319,7 +321,7 @@ fn step_kind_failed(
         .mount_run,
         .remount_readonly,
         => read_only_failed(diag, step, operation, failure, info),
-        else => setup_failed(diag, step, operation, failure, info),
+        else => setup_failed(diag, step, operation, failure, info, details.keeper),
     }
 }
 
@@ -462,6 +464,7 @@ fn setup_failed(
     operation: []const u8,
     failure: Failure,
     info: RunInfo,
+    keeper: ?host_mod.ExitStatus,
 ) void {
     assert(diag.code == null);
     assert(operation.len > 0);
@@ -471,7 +474,20 @@ fn setup_failed(
         serve_fuse_reason(failure.err)
     else
         null;
-    if (refused) |reason| {
+    const ended = if (step.kind == .spawn_keeper and failure.errno == 0) keeper else null;
+    if (ended) |status| {
+        // The keeper ran and ended before it said why: its own status is the cause.
+        switch (status) {
+            .exited => |code| diag.cause(
+                "{s} failed: it exited with status {d} before it was ready",
+                .{ operation, code },
+            ),
+            .signaled => |signal| diag.cause(
+                "{s} failed: it was killed by signal {d} before it was ready",
+                .{ operation, signal },
+            ),
+        }
+    } else if (refused) |reason| {
         diag.cause("{s} failed: {s}", .{ operation, reason });
     } else {
         errors.cause_host_error(diag, operation, failure.err, failure.errno);

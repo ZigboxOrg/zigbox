@@ -237,6 +237,7 @@ pub const Session = struct {
             .scope = scope,
             .facts = session.facts,
             .pasta = session.pasta_end,
+            .keeper = session.host.keeper_exit(),
         };
     }
 

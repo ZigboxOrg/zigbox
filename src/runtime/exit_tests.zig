@@ -356,6 +356,32 @@ test "a keeper whose member cannot be cloned names the process limit, not a vani
     try expect_clean(&sim, &before);
 }
 
+test "a keeper that ended before it was ready is named by how it ended" {
+    // Goal: a keeper that exits or is killed without writing a report is ZBX-E0205 whose cause
+    // is its real status or signal, not an invented errno. Method: the fault
+    // `keeper_ended_with` for a SIGKILL and for exit status 3; exit 125, no scope, clean.
+    const args = [_][:0]const u8{
+        "zbx", "-v", "run", "--rootfs", rootfs, "--name", "web-1", "--memory", "64m", "--", "sh",
+    };
+    const cases = [_]struct { status: host_mod.ExitStatus, line: []const u8 }{
+        .{ .status = .{ .signaled = 9 }, .line = "it was killed by signal 9 before it was ready" },
+        .{ .status = .{ .exited = 3 }, .line = "it exited with status 3 before it was ready" },
+    };
+    for (cases) |case| {
+        var sim: HostSim = undefined;
+        sim_run.init(&sim, 10);
+        const before = sim_run.baseline(&sim);
+        sim.world.keeper_ended_with = case.status;
+        try testing.expectEqual(@as(u8, 125), run(&sim, &args));
+        const text = sim.stderr();
+        try testing.expect(std.mem.startsWith(u8, text, "error[ZBX-E0205]: "));
+        try testing.expect(std.mem.indexOf(u8, text, case.line) != null);
+        try testing.expect(std.mem.indexOf(u8, text, "No child processes") == null);
+        try testing.expectEqual(@as(u32, 0), sim.world.bus.scopes_started);
+        try expect_clean(&sim, &before);
+    }
+}
+
 test "the keeper is outside the container's namespaces and holds nothing but its pipe" {
     // Goal: the keeper does not appear inside the container. Method: run, then look at the
     // model's process table: the keeper was created without the container's user, pid and IPC
