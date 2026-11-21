@@ -29,14 +29,20 @@ never applied to the binaries: 0.3.x to 0.5.x print `https://zigbox.github.io/zi
 
 ## Old links
 
-0.5.x binaries print `https://zigbox.github.io/zigbox/errors/<code>.html`, which this
-repository's Pages workflow (`pages.yml`, all of `site/`) still serves. It keeps doing so for as
-long as those binaries are in use; `pages.yml` is unchanged.
+0.5.x binaries print `https://zigbox.github.io/zigbox/errors/<code>.html`. Nothing in
+`ZigboxOrg` serves that address: this repository's `pages.yml` deploys to ZigboxOrg's own Pages
+site, and the old address answers today only from the last deployment the old `Zigbox`
+organisation made, which no workflow here can refresh or keep. Those links are not guaranteed:
+they may stop answering at any time. From 0.6.0 the address is `https://zigbox.org/errors/box/`,
+and the pages for every code (0.5.x's included, since no code was removed) are there; the 0.6.0
+notes tell users of older binaries to look a code up there.
 
-## Publishing (open)
+## Publishing
 
-The pages reach zigbox.org only through `ZigboxOrg/website`, whose deploy copies `site/errors/`
-from this repository's `main` into `/errors/box/` today. Serving them at `/errors/` needs a change
-to that deploy, or a release step that writes them into that repository; which one is the
-owner's to choose. `zigbox.org/errors/index.html` is the website's own index of Zigbox's and
-Zigcube's codes, so the generated `site/errors/index.html` must not replace it.
+The pages reach zigbox.org through `ZigboxOrg/website`, whose `deploy.yml` copies
+`site/errors/*.html` from this repository's `main` into `/errors/box/`; they are served there
+today (`https://zigbox.org/errors/box/E0001.html` answers 200). zigbox.org redirects
+`<code>.html` to the bare `<code>` path, so the address the binaries print is followed to the
+page. `zigbox.org/errors/index.html` stays the website's own index of Zigbox's and Zigcube's codes;
+the generated `site/errors/index.html` does not replace it. A page added or changed here reaches
+zigbox.org with the website's next deploy after it is on `main`.

@@ -1069,12 +1069,14 @@ jobs:
           zip: ${{ runner.temp }}/public/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
           version: ${{ needs.plan.outputs.version }}
           gatekeeper: 'true'
-      # The address every diagnostic prints (constants.docs_url_base) must answer once the site
-      # is deployed. zigbox.org redirects `<code>.html` to `<code>`, so the redirect is followed.
+      # The address every diagnostic prints (constants.docs_url_base plus `<code>.html`) must
+      # answer once the site is deployed: exactly that address, not the bare path it redirects
+      # to, so a dropped redirect fails here. zigbox.org redirects `<code>.html` to `<code>`, so
+      # the redirect is followed.
       - name: An error page answers on zigbox.org
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          page=https://zigbox.org/errors/box/E0001
+          page=https://zigbox.org/errors/box/E0001.html
           code=$(/usr/bin/curl -sSL --retry 3 -o /dev/null -w '%{http_code}' "$page")
           [ "$code" = 200 ] || { echo "release: $page answered $code, not 200" >&2; exit 1; }
           echo "errors: $page answers 200"
