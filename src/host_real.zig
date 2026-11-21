@@ -1921,11 +1921,16 @@ fn keeper_main(parent: i32, hold: i32, report: i32) noreturn {
 
 /// Ends the keeper the way its member ended, so that zbx's reap says so: a member killed by a
 /// signal (the OOM killer's, or a user's) takes the keeper down by the same signal, where an
-/// exit status of 1 would name no cause. A signal that does not end the keeper falls through to
-/// status 1.
+/// exit status of 1 would name no cause. The keeper is a fork of zbx, so a re-raised SIGSEGV
+/// would dump a second core, even under a pipe `core_pattern`, which `RLIMIT_CORE` alone does not
+/// stop: it first becomes non-dumpable, which `do_coredump` refuses before it reads the pattern.
+/// That is safe only here, because the member (the one other user of this memory, whose own
+/// core is already an image of zbx's memory under zbx's name) is reaped; earlier it would make
+/// the member's `/proc` entries root-owned. A status that is not a signal exits 0 or 1.
 fn keeper_end(status: i32) noreturn {
     const raw: u32 = @bitCast(status);
     if (linux.W.IFSIGNALED(raw)) {
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
         _ = linux.kill(linux.getpid(), linux.W.TERMSIG(raw));
     }
     linux.exit_group(if (status == 0) 0 else 1);
@@ -3193,8 +3198,13 @@ test "the overlay probe leaves its scratch directory empty and removable" {
 
     const hooks = [_]*const fn () noreturn{ hook_exit_ok, hook_kill_self, hook_sleep_forever };
     for (hooks) |hook| {
-        real = .{ .scratch_parent = parent, .probe_timeout_ms = 50, .child_hook = hook };
-        _ = try real.interface().probe(.overlay);
+        // Only the hanging hook may time out: the others get time to exit, so a loaded machine
+        // cannot turn their exit or signal into a timeout and skip the cleanup path.
+        const hangs = hook == &hook_sleep_forever;
+        const timeout_ms: u32 = if (hangs) 50 else 10_000;
+        real = .{ .scratch_parent = parent, .probe_timeout_ms = timeout_ms, .child_hook = hook };
+        const outcome = try real.interface().probe(.overlay);
+        try std.testing.expectEqual(hangs, outcome == .timed_out);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir(parent.ptr)));
         try HostReal.check(linux.mkdir(parent.ptr, 0o755));
     }
@@ -3415,6 +3425,39 @@ test "real keeper_fail: a forked process's report decodes as failed(EAGAIN), not
         host.ExitStatus{ .exited = 1 },
         keeper_reap(@intCast(forked), false).?,
     );
+}
+
+test "keeper_end: the member's signal is re-raised, a core-dumping one without a core" {
+    // Goal: the keeper reports its member's signal as itself (so ZBX-E0205 names it) and, for a
+    // core-dumping one, dumps no second core. Method: fork a child that calls `keeper_end` with
+    // a raw wait status and reap it; `11 | 0x80` is synthetic, as a real SIGSEGV would leave a
+    // core in CI. The child also sets RLIMIT_CORE to 0, so a missing `SET_DUMPABLE` cannot leave
+    // a core file here. Mutation check: replacing the re-raise with `exit_group(1)` fails the
+    // first case.
+    const Case = struct { raw: i32, expected: host.ExitStatus };
+    const cases = [_]Case{
+        .{ .raw = 11 | 0x80, .expected = .{ .signaled = 11 } },
+        .{ .raw = 15, .expected = .{ .signaled = 15 } },
+        .{ .raw = 9, .expected = .{ .signaled = 9 } },
+        .{ .raw = 0, .expected = .{ .exited = 0 } },
+    };
+    for (cases) |case| {
+        const forked = linux.fork();
+        if (forked == 0) {
+            const no_core: linux.rlimit = .{ .cur = 0, .max = 0 };
+            _ = linux.setrlimit(.CORE, &no_core);
+            // The test runner handles SIGSEGV; zbx does not (main.zig), so put it back.
+            const default: linux.Sigaction = .{
+                .handler = .{ .handler = linux.SIG.DFL },
+                .mask = linux.sigemptyset(),
+                .flags = 0,
+            };
+            _ = linux.sigaction(.SEGV, &default, null);
+            keeper_end(case.raw);
+        }
+        try HostReal.check(forked);
+        try std.testing.expectEqual(case.expected, keeper_reap(@intCast(forked), false).?);
+    }
 }
 
 test "real keeper_failed: a keeper that ended with nothing written is named by its status" {

@@ -970,7 +970,8 @@ pub const HostSim = struct {
         sim.keeper_exit = null;
         try sim.begin_call();
         if (sim.world.keeper_ended_with) |status| {
-            // The keeper ran and exited before reporting; the real host reaps it, unkilled.
+            // The keeper ran and exited before reporting; the real host kills and reaps it;
+            // the kill does not change a status that is already fixed.
             sim.keeper_exit = status;
             return error.IoFailed; // With errno 0, as the real host leaves it.
         }
