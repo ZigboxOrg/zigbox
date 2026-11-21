@@ -1921,13 +1921,16 @@ fn keeper_main(parent: i32, hold: i32, report: i32) noreturn {
 
 /// Ends the keeper the way its member ended, so that zbx's reap says so: a member killed by a
 /// signal (the OOM killer's, or a user's) takes the keeper down by the same signal, where an
-/// exit status of 1 would name no cause. A signal that dumped the member's core is not re-raised:
-/// the keeper is a fork of zbx and would dump a second core under zbx's name, so it exits with
-/// status 1 instead, as does a signal that does not end the keeper.
+/// exit status of 1 would name no cause. The keeper is a fork of zbx, so a re-raised SIGSEGV
+/// would dump a second core, even under a pipe `core_pattern`, which `RLIMIT_CORE` alone does not
+/// stop: it first becomes non-dumpable, which `do_coredump` refuses before it reads the pattern.
+/// That is safe only here, because the member (the one other user of this memory, whose own
+/// core is already an image of zbx's memory under zbx's name) is reaped; earlier it would make
+/// the member's `/proc` entries root-owned. A status that is not a signal exits 0 or 1.
 fn keeper_end(status: i32) noreturn {
     const raw: u32 = @bitCast(status);
-    const core_dumped = raw & 0x80 != 0; // WCOREDUMP; std has no helper for it.
-    if (linux.W.IFSIGNALED(raw) and !core_dumped) {
+    if (linux.W.IFSIGNALED(raw)) {
+        _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
         _ = linux.kill(linux.getpid(), linux.W.TERMSIG(raw));
     }
     linux.exit_group(if (status == 0) 0 else 1);
@@ -3424,20 +3427,34 @@ test "real keeper_fail: a forked process's report decodes as failed(EAGAIN), not
     );
 }
 
-test "keeper_end: a core-dumping signal ends the keeper with status 1, others are re-raised" {
-    // Goal: the keeper never dumps a second core for its member's SIGSEGV/SIGABRT/SIGQUIT, and
-    // still reports the OOM killer's SIGKILL as itself. Method: fork a child that calls
-    // `keeper_end` with a raw wait status and reap it. Mutation check: dropping the
-    // `core_dumped` test makes the first case end signalled by 11.
+test "keeper_end: the member's signal is re-raised, a core-dumping one without a core" {
+    // Goal: the keeper reports its member's signal as itself (so ZBX-E0205 names it) and, for a
+    // core-dumping one, dumps no second core. Method: fork a child that calls `keeper_end` with
+    // a raw wait status and reap it; `11 | 0x80` is synthetic, as a real SIGSEGV would leave a
+    // core in CI. The child also sets RLIMIT_CORE to 0, so a missing `SET_DUMPABLE` cannot leave
+    // a core file here. Mutation check: replacing the re-raise with `exit_group(1)` fails the
+    // first case.
     const Case = struct { raw: i32, expected: host.ExitStatus };
     const cases = [_]Case{
-        .{ .raw = 11 | 0x80, .expected = .{ .exited = 1 } },
+        .{ .raw = 11 | 0x80, .expected = .{ .signaled = 11 } },
+        .{ .raw = 15, .expected = .{ .signaled = 15 } },
         .{ .raw = 9, .expected = .{ .signaled = 9 } },
         .{ .raw = 0, .expected = .{ .exited = 0 } },
     };
     for (cases) |case| {
         const forked = linux.fork();
-        if (forked == 0) keeper_end(case.raw);
+        if (forked == 0) {
+            const no_core: linux.rlimit = .{ .cur = 0, .max = 0 };
+            _ = linux.setrlimit(.CORE, &no_core);
+            // The test runner handles SIGSEGV; zbx does not (main.zig), so put it back.
+            const default: linux.Sigaction = .{
+                .handler = .{ .handler = linux.SIG.DFL },
+                .mask = linux.sigemptyset(),
+                .flags = 0,
+            };
+            _ = linux.sigaction(.SEGV, &default, null);
+            keeper_end(case.raw);
+        }
         try HostReal.check(forked);
         try std.testing.expectEqual(case.expected, keeper_reap(@intCast(forked), false).?);
     }
