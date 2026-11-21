@@ -302,9 +302,26 @@ fn events_of(kind: lazy.Event.Kind, source: []const u8) u32 {
 }
 
 fn land_chunk(object: lazy.ObjectIndex, chunk: u32) land_mod.Landed {
+    var failure: chunks_mod.Failure = undefined;
+    return land_chunk_failing(object, chunk, &failure);
+}
+
+fn land_chunk_failing(
+    object: lazy.ObjectIndex,
+    chunk: u32,
+    failure: *chunks_mod.Failure,
+) land_mod.Landed {
     const wanted = &fixture.objects[object].wanted;
     const bytes = truth(object, chunk);
-    return land_mod.land(&fixture.store, &fixture.put_buffer, wanted, &.{}, chunk, bytes);
+    return land_mod.land(
+        &fixture.store,
+        &fixture.put_buffer,
+        wanted,
+        &.{},
+        chunk,
+        bytes,
+        failure,
+    );
 }
 
 // The locked file system: every call of `SimFs`'s table, one at a time.
@@ -972,9 +989,9 @@ test "resolver: rootless, an object owned by a container id is never made whole"
     // without `CAP_CHOWN`, an object of 0:42 (Alpine's /etc/shadow) cannot be assembled: the
     // last put's change of owner is `EPERM`. Its chunks stay held in `partial/`, verified, so
     // every read is served at once from them, nothing is asked of the source again, and the
-    // source is not blamed; the object is not whole and `objects_local` never counts it. A
-    // `security.capability` object fails the same way in the kernel; `SimFs` has no gate for
-    // it, so it is not tested.
+    // source is not blamed; the object is not whole and `objects_local` never counts it. An
+    // EPERM from setting `security.capability` is not this gap: it is shown (the EPERM tests
+    // below).
     // Method: owners `outside` with a subordinate range, so the id is mapped and the owner
     // gate is what refuses; object 0 (two chunks) is owned by 0:42, object 1 by root. Read
     // both; read object 0 again.
@@ -999,6 +1016,7 @@ test "resolver: rootless, an object owned by a container id is never made whole"
     try testing.expectEqual(@as(u32, 0), report.objects_local);
     try testing.expect(!fixture.resolver.schedule.sources[0].down);
     try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    try testing.expectEqual(@as(u32, 0), events_of(.not_kept, ""));
     const round = constants.lazy_down_fail_ms;
     try expect_true_read(1, 0, round);
     try expect_true_read(1, 1, round);
@@ -1042,6 +1060,381 @@ test "resolver: an owner failure is never the source's failure, over many reads"
     try expect_true_read(5, 0, 5 * step_ms);
     try testing.expectEqual(@as(u32, 1), fixture.resolver.schedule.report.objects_local);
     try testing.expectEqual(@as(u32, 5), gate_calls);
+}
+
+test "land: a put that fails after keeping its chunk is held; one that lost it is failed" {
+    // Goal: `.held` is returned only when the chunk is in `partial/` and right (the source's
+    // bytes were good and a read gets them), and `.failed` when the put lost it. Method: a
+    // two-chunk object; chunk 0 lands; the file system fails the write point `point` of chunk
+    // 1's put with EIO, for each point in turn, until the put goes through. Whatever the
+    // point, the answer must agree with the held chunk's file: `.held` if it is there and
+    // right, `.failed` if not. Both answers must occur (the chunk write, then the assembly).
+    // Then a read fault on a held chunk makes the look fail: `.failed`, not `.held`, so a
+    // look at the name alone (`is_local`) would not do.
+    var held_seen: u32 = 0;
+    var failed_seen: u32 = 0;
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        var failure: chunks_mod.Failure = undefined;
+        const landed = land_chunk_failing(0, 1, &failure);
+        fixture.files.faults = .{};
+        const wanted = &fixture.objects[0].wanted;
+        switch (landed) {
+            .whole => break,
+            .held => {
+                held_seen += 1;
+                try testing.expect(chunks_mod.is_held(&fixture.store, wanted, 1));
+                try testing.expect(!land_mod.owner_refused(&failure));
+            },
+            .failed => {
+                failed_seen += 1;
+                try testing.expect(!chunks_mod.is_held(&fixture.store, wanted, 1));
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expect(point < 64);
+    try testing.expect(held_seen > 0);
+    try testing.expect(failed_seen > 0);
+}
+
+test "land: the held chunk cannot be read back, so it is failed, not held" {
+    // Goal: pair of the test above. A put whose assembly fails leaves a held chunk; if that
+    // chunk then cannot be read (an I/O error), `is_held` cannot show it is right, so the
+    // answer is `.failed`. Method: find the first write point whose failure gives `.held`;
+    // run it again with every read failing; the put and its look both see the fault.
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        var failure: chunks_mod.Failure = undefined;
+        if (land_chunk_failing(0, 1, &failure) != .held) continue;
+        break;
+    }
+    try testing.expect(point < 64);
+    setup(&.{2 * chunk_bytes});
+    try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    var failure: chunks_mod.Failure = undefined;
+    try testing.expectEqual(land_mod.Landed.held, land_chunk_failing(0, 1, &failure));
+    // The same put again: the chunk is held and duplicate, the assembly fails as before, and
+    // now every read fails too.
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    fixture.files.faults.read_error_per_mille = 1000;
+    const landed = land_chunk_failing(0, 1, &failure);
+    fixture.files.faults = .{};
+    try testing.expect(landed != .held);
+}
+
+test "land: ENOSPC on a held chunk is store_full, never held (the order is pinned)" {
+    // Goal: pin `land`'s order, `failure_is_full` before `is_held`
+    // (docs/decisions/2026-11-20-s2-held-failures-are-shown.md, item 4): a full disk that
+    // stops the assembly of a held chunk reads as `.store_full`, as it did before `.held`.
+    // Changing that changes what a user sees on a full disk and is the supervisor's decision.
+    // Method: as the held test above, with ENOSPC; some write point must give `.store_full`
+    // with the chunk held, and none may give `.held`.
+    var full_with_chunk: u32 = 0;
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        fixture.files.faults.fail_errno = 28;
+        var failure: chunks_mod.Failure = undefined;
+        const landed = land_chunk_failing(0, 1, &failure);
+        fixture.files.faults = .{};
+        switch (landed) {
+            .whole => break,
+            .store_full => {
+                const wanted = &fixture.objects[0].wanted;
+                if (chunks_mod.is_held(&fixture.store, wanted, 1)) full_with_chunk += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expect(point < 64);
+    try testing.expect(full_with_chunk > 0);
+}
+
+test "owner_refused names the rootless owner gap and nothing else" {
+    // Goal: only the owner step's refusal (`step == .owner`, as `object.apply_owner` marks it)
+    // is the accepted gap; the errno alone never decides it. Method: the two shapes
+    // `apply_owner` makes, the same shapes from other steps (an EPERM from the create, an
+    // xattr, the rename), and the failures a read-only or unwritable store gives.
+    const Case = struct { err: fs_mod.Error, errno: u16, step: Step_, refused: bool };
+    const cases = [_]Case{
+        .{ .err = error.AccessDenied, .errno = 0, .step = .owner, .refused = true }, // No map.
+        .{ .err = error.AccessDenied, .errno = 1, .step = .owner, .refused = true }, // fchown.
+        .{ .err = error.AccessDenied, .errno = 13, .step = .owner, .refused = false },
+        .{ .err = error.IoFailed, .errno = 5, .step = .owner, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .xattr, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .create, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .rename, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 0, .step = .unnamed, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .unnamed, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 13, .step = .directory, .refused = false },
+        .{ .err = error.IoFailed, .errno = 30, .step = .generation, .refused = false }, // EROFS.
+    };
+    for (cases) |case| {
+        const failure: chunks_mod.Failure = .{
+            .err = case.err,
+            .errno = case.errno,
+            .step = case.step,
+        };
+        try testing.expectEqual(case.refused, land_mod.owner_refused(&failure));
+    }
+}
+
+const Step_ = chunks_mod.Failure.Step;
+
+/// `security.capability`, as iputils' `ping` carries it: kept by the store (`xattrs.class_of`).
+const capability_xattrs = "\x01" ++ "\x13\x00" ++ "security.capability" ++ "\x04\x00" ++
+    "\x01\x00\x00\x02";
+
+/// Object `index` is owned by root and carries `security.capability`.
+fn give_capability(index: u32) void {
+    const capable: object_mod.Attrs = .{
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .xattrs = capability_xattrs,
+    };
+    assert(xattrs.validate(capable.xattrs) == .none);
+    const owned = &fixture.objects[index].wanted;
+    owned.attrs = capable;
+    owned.id = object_mod.object_id(owned.content, capable);
+}
+
+/// Rootless and outside the namespace, as the resolver's slots are: container root is the
+/// user, so an object of 0:0 needs no change of owner; any other id meets the owner gate.
+fn store_outside() void {
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{
+        .uid = 0,
+        .gid = 0,
+        .range = .{ .uid_start = 100000, .gid_start = 100000 },
+    } };
+}
+
+/// The first write point of the last chunk's put of object 0 (two chunks, root with a file
+/// capability, the store outside) at which an EPERM leaves it `.held` with `step`; null if none.
+fn eperm_point_of(step: Step_) ?u32 {
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        give_capability(0);
+        store_outside();
+        if (land_chunk(0, 0) != .landed) return null;
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        fixture.files.faults.fail_errno = 1;
+        var failure: chunks_mod.Failure = undefined;
+        const landed = land_chunk_failing(0, 1, &failure);
+        fixture.files.faults = .{};
+        if (landed == .whole) return null;
+        if (landed != .held) continue;
+        if (failure.step == step) return point;
+    }
+    return null;
+}
+
+test "land: an EPERM from a step other than the owner is never the owner gap" {
+    // Goal: the review's case. Rootless, outside the namespace, a root-owned object with
+    // `security.capability`: no change of owner is asked, so an EPERM from the xattr (no
+    // CAP_SETFCAP), the create or any other step of the assembly is a real store failure.
+    // Method: an EPERM at each write point of the last chunk's put in turn; every `.held`
+    // answer names a step, and none of them is the owner gap. The xattr and the create are
+    // both met (the two the tests below run through the resolver).
+    var steps_seen: std.EnumSet(Step_) = .empty;
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        give_capability(0);
+        store_outside();
+        try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        fixture.files.faults.fail_errno = 1;
+        var failure: chunks_mod.Failure = undefined;
+        const landed = land_chunk_failing(0, 1, &failure);
+        fixture.files.faults = .{};
+        if (landed == .whole) break;
+        if (landed != .held) continue;
+        try testing.expect(failure.step != .unnamed);
+        try testing.expect(failure.step != .owner);
+        try testing.expectEqual(@as(u16, 1), failure.errno);
+        try testing.expect(!land_mod.owner_refused(&failure));
+        steps_seen.insert(failure.step);
+    }
+    try testing.expect(point < 64);
+    try testing.expect(steps_seen.contains(.xattr));
+    try testing.expect(steps_seen.contains(.create));
+    try testing.expect(steps_seen.contains(.rename));
+}
+
+/// Runs the last chunk's put of object 0 through the resolver with an EPERM at the write
+/// point where it fails at `step` (`eperm_point_of`), and checks it is shown once: one
+/// `not_kept` naming `step` and EPERM, the read served, the source not blamed.
+fn expect_eperm_shown(step: Step_) !void {
+    const point = eperm_point_of(step) orelse return error.TestUnexpectedResult;
+    setup(&.{2 * chunk_bytes});
+    give_capability(0);
+    store_outside();
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    try expect_true_read(0, 0, 0);
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    fixture.files.faults.fail_errno = 1;
+    try expect_true_read(0, 1, 100);
+    fixture.files.faults = .{};
+    try expect_true_read(0, 1, 200);
+    fixture.resolver.drain_events();
+    try testing.expectEqual(@as(u32, 1), events_of(.not_kept, ""));
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    const shown = fixture.events[0..fixture.events_count.load(.monotonic)];
+    for (shown) |*event| {
+        if (event.kind != .not_kept) continue;
+        try testing.expectEqual(step, event.store_failure.step);
+        try testing.expectEqual(@as(u16, 1), event.store_failure.errno);
+    }
+}
+
+test "resolver: an EPERM from the xattr is shown once, not taken for the owner gap" {
+    // Goal: the review's first case end to end: rootless, an image file of 0:0 with
+    // `security.capability`; setting the xattr fails with EPERM. Method: `expect_eperm_shown`.
+    try expect_eperm_shown(.xattr);
+}
+
+test "resolver: an EPERM from the create is shown once, not taken for the owner gap" {
+    // Goal: the review's second case: a `tmp/` the store cannot create in (an immutable or
+    // sticky directory gives EPERM). Method: `expect_eperm_shown`.
+    try expect_eperm_shown(.create);
+}
+
+test "schedule: a not_kept dropped from a full queue is still counted, and the drop is final" {
+    // Goal: a `not_kept` counts in `report.errors` whether or not its event is queued, as
+    // `store_full` and `refuse` do, so the run record says the store failed even when the line
+    // is lost; a drop (`events_dropped`) is final, as for every other kind. Method: fill the
+    // queue with `store_full` events, offer a `not_kept` (dropped, counted), empty the queue,
+    // offer it again for another chunk (neither queued nor counted again).
+    setup(&.{2 * chunk_bytes});
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const schedule = &fixture.resolver.schedule;
+    fill_event_queue(schedule);
+    const failure: chunks_mod.Failure = .{ .err = error.IoFailed, .errno = 5, .step = .rename };
+    const errors_before = schedule.report.errors;
+    schedule.not_kept(0, 1, failure);
+    try testing.expectEqual(@as(u64, 1), schedule.report.events_dropped);
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    while (schedule.pop_event()) |_| {}
+    schedule.not_kept(0, 0, failure);
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    try testing.expectEqual(@as(u32, 0), schedule.events_count);
+    try testing.expectEqual(@as(u64, 1), schedule.report.events_dropped);
+}
+
+test "resolver: a not_kept dropped on the assembly path is counted, and the reads are served" {
+    // Goal: the case the drop is final for: the last chunk's assembly fails (EPERM from the
+    // xattr) while the event queue is full. The read is served, the error and the drop are
+    // counted, and no later read or put shows the event: every chunk is held, so nothing puts
+    // a chunk of the object again. Method: `expect_eperm_shown`'s run with the queue filled
+    // before the failing read.
+    const point = eperm_point_of(.xattr) orelse return error.TestUnexpectedResult;
+    setup(&.{2 * chunk_bytes});
+    give_capability(0);
+    store_outside();
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const schedule = &fixture.resolver.schedule;
+    try expect_true_read(0, 0, 0);
+    fill_event_queue(schedule);
+    const errors_before = schedule.report.errors;
+    const dropped_before = schedule.report.events_dropped;
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    fixture.files.faults.fail_errno = 1;
+    try expect_true_read(0, 1, 100);
+    fixture.files.faults = .{};
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    try testing.expectEqual(dropped_before + 1, schedule.report.events_dropped);
+    var not_kept: u32 = 0;
+    while (schedule.pop_event()) |event| {
+        if (event.kind == .not_kept) not_kept += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), not_kept);
+    try expect_true_read(0, 1, 200);
+    try expect_true_read(0, 0, 300);
+    fixture.resolver.drain_events();
+    try testing.expectEqual(@as(u32, 0), events_of(.not_kept, ""));
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+}
+
+/// Fills the schedule's event queue with `store_full` events, so the next event is dropped.
+fn fill_event_queue(schedule: *Schedule) void {
+    var filled: u32 = 0;
+    while (schedule.events_count < constants.lazy_pending_max) : (filled += 1) {
+        assert(filled < constants.lazy_pending_max);
+        schedule.store_full(0, 0);
+    }
+    assert(schedule.events_count == constants.lazy_pending_max);
+}
+
+test "resolver: a store that cannot make the object is shown once, and the read is served" {
+    // Goal: a held chunk whose object cannot be made, for a reason that is not the rootless
+    // owner gap (here EACCES on the store), is no longer silent: one `not_kept` event for the
+    // object, the read served at once from the held chunk, and the source not blamed. The
+    // owner gap itself logs nothing (the tests above).
+    // Method: find, on a scratch fixture, the write point of the last chunk's put at which an
+    // EACCES gives `.held`; run it for real through the resolver, read both chunks, read the
+    // last again, then offer the schedule the same failure a second time: still one event.
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        fixture.files.faults.fail_errno = 13;
+        var failure: chunks_mod.Failure = undefined;
+        if (land_chunk_failing(0, 1, &failure) == .held) break;
+    }
+    try testing.expect(point < 64);
+    setup(&.{2 * chunk_bytes});
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    try expect_true_read(0, 0, 0);
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    fixture.files.faults.fail_errno = 13;
+    try expect_true_read(0, 1, 100);
+    fixture.files.faults = .{};
+    try testing.expectEqual(@as(u32, 1), events_of(.not_kept, ""));
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    const calls = fixture.peers[0].calls.load(.monotonic);
+    try expect_true_read(0, 1, 200);
+    try testing.expectEqual(calls, fixture.peers[0].calls.load(.monotonic));
+    const again: chunks_mod.Failure = .{ .err = error.AccessDenied, .errno = 13 };
+    fixture.resolver.schedule.not_kept(0, 1, again);
+    fixture.resolver.drain_events();
+    try testing.expectEqual(@as(u32, 1), events_of(.not_kept, ""));
+    const shown = fixture.events[0..fixture.events_count.load(.monotonic)];
+    try testing.expectEqual(lazy.Event.Kind.not_kept, shown[shown.len - 1].kind);
+    try testing.expectEqual(@as(u16, 13), shown[shown.len - 1].store_failure.errno);
 }
 
 /// Object `index` is owned by 0:42, as Alpine's /etc/shadow is.

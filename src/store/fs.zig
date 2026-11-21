@@ -777,6 +777,48 @@ pub const Fs = struct {
 pub const Failure = struct {
     err: Error,
     errno: u16,
+    /// Which step of a chunked put (`chunks.put_chunk`, `chunks.finish`) failed, for its
+    /// diagnostic and for telling the rootless owner gap (`owner`) from every other refusal.
+    /// Every other caller leaves it `unnamed`.
+    step: Step = .unnamed,
+
+    pub const Step = enum(u8) {
+        unnamed,
+        /// The store's lock file.
+        lock,
+        /// Looking for the object under `objects/`.
+        look,
+        /// Reading a held chunk in `partial/` to check it.
+        chunk_read,
+        /// Writing the chunk to `partial/`.
+        chunk_write,
+        /// Listing the held chunks in `partial/<id>/`.
+        listing,
+        /// Raising the store's generation file.
+        generation,
+        /// Making the object's directory `objects/<shard>`.
+        directory,
+        /// Creating the object's temporary file in `tmp/`.
+        create,
+        /// Reading a held chunk while assembling the object.
+        assemble_read,
+        /// Writing (or flushing) the object's temporary file in `tmp/`.
+        assemble_write,
+        /// Giving the object its owner (`object.apply_owner`): the rootless owner gap.
+        owner,
+        /// Setting the object's mode.
+        mode,
+        /// Setting one of the object's extended attributes.
+        xattr,
+        /// Setting the object's modification time.
+        time,
+        /// Writing the object's chunk list under `objects/<shard>`.
+        list,
+        /// Renaming the object into `objects/<shard>`.
+        rename,
+        /// Flushing the directory `objects/<shard>`.
+        sync,
+    };
 };
 
 /// A NUL-terminated path built in a fixed buffer, from parts, never longer than a store path.

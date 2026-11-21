@@ -162,6 +162,14 @@ fn fail(failure: *Failure, fs: fs_mod.Fs, err: host_mod.Error) void {
     failure.* = .{ .err = err, .errno = fs.last_errno() };
 }
 
+/// `fail`, naming the step of `apply` that failed (`Failure.step`).
+fn fail_at(failure: *Failure, fs: fs_mod.Fs, err: host_mod.Error, step: Failure.Step) void {
+    assert(step != .unnamed);
+    fail(failure, fs, err);
+    failure.step = step;
+    assert(failure.step == step);
+}
+
 /// Puts the file at `source` into the store under `id`, if it is not there. The source must
 /// still be what `content` says; if it changed, `Changed`. `io` is the copy buffer.
 pub fn put(
@@ -338,7 +346,7 @@ pub fn apply(
     assert(xattrs.validate(attrs.xattrs) == .none);
     try apply_owner(fs, fd, attrs, owners, failure);
     fs.set_mode(fd, attrs.mode) catch |err| {
-        fail(failure, fs, err);
+        fail_at(failure, fs, err, .mode);
         return err;
     };
     var iterator = xattrs.Iterator.init(attrs.xattrs);
@@ -347,16 +355,16 @@ pub fn apply(
         @memcpy(name[0..item.name.len], item.name);
         name[item.name.len] = 0;
         fs.set_xattr(fd, name[0..item.name.len :0], item.value) catch |err| {
-            fail(failure, fs, err);
+            fail_at(failure, fs, err, .xattr);
             return err;
         };
     }
     fs.set_mtime(fd, constants.store_mtime_seconds) catch |err| {
-        fail(failure, fs, err);
+        fail_at(failure, fs, err, .time);
         return err;
     };
     fs.fsync(fd) catch |err| {
-        fail(failure, fs, err);
+        fail_at(failure, fs, err, .assemble_write);
         return err;
     };
 }
@@ -381,7 +389,7 @@ fn apply_owner(
             const host_gid = owners_mod.host_of(map, .gid, gid);
             if (host_uid == null or host_gid == null) {
                 // An id the namespace cannot show: inside, the write would fail the same way.
-                failure.* = .{ .err = error.AccessDenied, .errno = 0 };
+                failure.* = .{ .err = error.AccessDenied, .errno = 0, .step = .owner };
                 return error.AccessDenied;
             }
             if (host_uid.? == map.uid and host_gid.? == map.gid) return;
@@ -390,7 +398,9 @@ fn apply_owner(
         },
     }
     fs.set_owner(fd, uid, gid) catch |err| {
-        fail(failure, fs, err);
+        // Marked here, where it happens: only this step's refusal is the rootless owner gap
+        // (`land.owner_refused`), whatever errno another step leaves.
+        fail_at(failure, fs, err, .owner);
         return err;
     };
 }

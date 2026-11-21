@@ -162,6 +162,11 @@ pub const Event = struct {
         lied,
         /// E1203: a read gave up: `reason` says what each source did.
         unavailable,
+        /// E0417: a chunk is held in `partial/`, and right, but the store could not make its
+        /// object (`store_failure` says why). Reads are served from the held chunks; the object
+        /// stays unmade while the cause lasts. Once per object; the rootless owner gap
+        /// (`land.owner_refused`) is not one.
+        not_kept,
         /// E1206: the store's disk is too full.
         store_full,
     };
@@ -180,6 +185,8 @@ pub const Event = struct {
     sources_count: u8,
     /// The sources' names, indexed as `outcomes`: `sources_count` of them are set.
     names: *const [constants.lazy_sources_max][]const u8,
+    /// For `not_kept`: what the store reported.
+    store_failure: chunks.Failure = .{ .err = error.IoFailed, .errno = 0 },
 };
 
 /// What one source did for a chunk, for the `unavailable` event's reason.

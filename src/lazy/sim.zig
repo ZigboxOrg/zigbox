@@ -60,6 +60,13 @@ const blob_bytes_max = content_bytes_max +
     objects_max * chunks_per_object_max * stored_header_bytes;
 
 const attrs: object_mod.Attrs = .{ .mode = 0o644, .uid = 0, .gid = 0, .xattrs = &xattrs.empty };
+/// An object of 0:42, which rootless puts outside the namespace cannot make (`outside_owners`).
+const attrs_shadow: object_mod.Attrs = .{
+    .mode = 0o640,
+    .uid = 0,
+    .gid = 42,
+    .xattrs = &xattrs.empty,
+};
 
 /// How one source behaves for a run.
 pub const Behaviour = struct {
@@ -95,6 +102,12 @@ pub const Scenario = struct {
     /// The catalog lists a forged hash for one chunk of a many-chunk object, and every source
     /// serves the bytes it names (the module doc). Never with `honest`.
     forged: bool = false,
+    /// The store is read outside its namespace, rootless (`Owners.outside`, a subordinate id
+    /// range, no `CAP_CHOWN`), and a third of the objects are owned by 0:42, as Alpine's
+    /// /etc/shadow is: the put that would make one cannot change its owner. Such an object is
+    /// never whole; its reads are served from the held chunks and the source is not blamed
+    /// (docs/decisions/2026-11-20-s2-rootless-owner-gap-accepted.md).
+    outside_owners: bool = false,
 };
 
 const SimSource = struct {
@@ -201,9 +214,13 @@ fn make_objects(sim: *Sim) void {
         if (size > 0) _ = reader.update(bytes, hashes);
         const whole = reader.finish(hashes);
         const count = reader.count;
+        const owned = if (sim.scenario.outside_owners and random.uintLessThan(u8, 3) == 0)
+            attrs_shadow
+        else
+            attrs;
         const wanted: lazy.Wanted = .{
-            .id = object_mod.object_id(whole, attrs),
-            .attrs = attrs,
+            .id = object_mod.object_id(whole, owned),
+            .attrs = owned,
             .size = size,
             .content = whole,
             .hashes = sim.hashes[hashes_used..][0..count],
@@ -288,6 +305,26 @@ fn start_store(sim: *Sim) void {
     sim.store.chunk_bytes = chunk_bytes;
     sim.files.faults.bytes_max = sim.scenario.bytes_max;
     sim.files.faults.crash_mutation = sim.scenario.crash_mutation;
+    if (sim.scenario.outside_owners) {
+        sim.files.faults.owner_gate = .{ .context = sim, .in_new_user_namespace = never_inside };
+        sim.store.owners = .{ .outside = .{
+            .uid = 0,
+            .gid = 0,
+            .range = .{ .uid_start = 100000, .gid_start = 100000 },
+        } };
+    }
+}
+
+/// The resolver's threads are outside the store's namespace.
+fn never_inside(context: *anyopaque) bool {
+    assert(@intFromPtr(context) != 0);
+    return false;
+}
+
+/// Whether the run's object `object` is owned so that a put cannot make it (`outside_owners`).
+fn is_gapped(sim: *const Sim, object: *const lazy.Object) bool {
+    if (!sim.scenario.outside_owners) return false;
+    return object.wanted.attrs.gid == attrs_shadow.gid;
 }
 
 /// Lays out a run for `scenario` and starts the resolver (without threads).
@@ -839,12 +876,17 @@ fn check_end(sim: *Sim) void {
     support.check_whole(&sim.files, root_path, chunk_bytes) catch @panic("store not whole");
     check_chunks(sim);
     check_lies(sim);
+    check_not_kept(sim);
     if (!sim.scenario.honest) return;
     if (sim.reads_failed != 0) @panic("a read failed with honest sources");
     if (sim.scenario.fill) {
         for (sim.objects[0..sim.objects_count]) |*object| {
             const whole = land.object_is_whole(&sim.store, &object.wanted);
-            if (!whole) @panic("the fill left an object");
+            if (is_gapped(sim, object)) {
+                if (whole) @panic("an object of 0:42 was made outside the namespace");
+            } else if (!whole) {
+                @panic("the fill left an object");
+            }
         }
     }
 }
@@ -867,6 +909,29 @@ fn check_chunks(sim: *Sim) void {
             const truth = chunk_bytes_of(sim, @intCast(at), index);
             if (!std.mem.eql(u8, out[0..length], truth)) @panic("the store holds a wrong chunk");
         }
+    }
+}
+
+/// Property 6: the rootless owner gap is never shown, and any other `not_kept` is shown once per
+/// object. A failure of the owner (`land.owner_refused`) is silent by the owner's decision.
+/// Judged from the scenario, not from the predicate the resolver decides with: an honest run
+/// injects no store fault, so the owner gap (`outside_owners`) is the only failure its puts can
+/// meet, and any `not_kept` in it is a misclassification. An object whose owner is the user's
+/// own (not `is_gapped`) never asks for a change of owner, so its failure is never the owner's.
+fn check_not_kept(sim: *const Sim) void {
+    var shown: u16 = 0;
+    for (sim.events[0..sim.events_count]) |*logged| {
+        const event = &logged.event;
+        if (event.kind != .not_kept) continue;
+        if (sim.scenario.honest) @panic("the owner gap was shown, in a run without store faults");
+        const gapped = is_gapped(sim, &sim.objects[event.object]);
+        if (land.owner_refused(&event.store_failure)) {
+            if (!gapped) @panic("an owner refusal for an object owned by the user");
+            @panic("the owner gap was shown");
+        }
+        const bit = @as(u16, 1) << @intCast(event.object);
+        if (shown & bit != 0) @panic("a not_kept event was shown twice for one object");
+        shown |= bit;
     }
 }
 
@@ -913,6 +978,7 @@ pub fn random_scenario(random: std.Random) Scenario {
         .honest = random.uintLessThan(u8, 4) == 0,
     };
     if (scenario.peers == 0) scenario.registry = true;
+    scenario.outside_owners = random.uintLessThan(u8, 4) == 0;
     for (&scenario.behaviours) |*behaviour| {
         behaviour.latency_max_ms = random.intRangeAtMost(u32, 1, 3_000);
     }

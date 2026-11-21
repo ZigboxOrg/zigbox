@@ -54,6 +54,31 @@ fn reason_without_errno(err: host_mod.Error) ?[]const u8 {
     return reason;
 }
 
+/// The class of a host error in words, for a failure that came with no errno (so none is
+/// named or guessed), in `errno_reason`'s wording. Null for `IoFailed`, which names no class:
+/// the caller says the reason is unknown in its own terms.
+pub fn reason_of_class(err: host_mod.Error) ?[]const u8 {
+    const reason: ?[]const u8 = switch (err) {
+        error.NotFound => "no such file or directory",
+        error.AccessDenied => "permission denied",
+        error.Interrupted => "interrupted by a signal",
+        error.WouldBlock => "the resource is busy, try again",
+        error.NoSpace => "no space left on the device",
+        error.OutOfMemory => "out of memory",
+        error.Unsupported => "this kernel does not support it",
+        error.NoData => "the file has no such attribute",
+        error.TimedOut => "timed out",
+        error.IoFailed => null,
+        error.FileTooLarge,
+        error.Stalled,
+        error.PathTooLong,
+        error.InvalidPath,
+        => reason_without_errno(err).?,
+    };
+    if (reason) |text| assert(text.len > 0);
+    return reason;
+}
+
 /// Adds the cause "<operation> failed: <reason> (<ENAME>)", naming the errno the kernel really
 /// returned (`Host.last_errno`, read by the caller right after the failure). `operation` names the
 /// syscall or action in the caller's words, for example "write(stdout)". If the errno is missing

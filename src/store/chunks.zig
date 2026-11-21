@@ -75,11 +75,20 @@ pub const Error = error{
 
 pub const Failure = fs_mod.Failure;
 
-fn fail(fs: fs_mod.Fs, failure: *Failure, err: anyerror) Error {
+fn fail(fs: fs_mod.Fs, failure: *Failure, err: anyerror, step: Failure.Step) Error {
     assert(@intFromPtr(failure) != 0);
     assert(fs.last_errno() < 4096);
-    assert(@intFromPtr(failure) != 0);
-    failure.* = .{ .err = @errorCast(err), .errno = fs.last_errno() };
+    assert(step != .unnamed);
+    failure.* = .{ .err = @errorCast(err), .errno = fs.last_errno(), .step = step };
+    return error.StoreFailed;
+}
+
+/// Names the step whose callee filled `failure` (a callee of another module leaves it
+/// `unnamed`, or names its own step, which is kept).
+fn failed_at(failure: *Failure, step: Failure.Step) Error {
+    assert(step != .unnamed);
+    if (failure.step == .unnamed) failure.step = step;
+    assert(failure.step != .unnamed);
     return error.StoreFailed;
 }
 
@@ -90,7 +99,7 @@ fn hold(store: *Store, failure: *Failure) Error!void {
     lock.hold(store, .shared, "put_chunk") catch |err| switch (err) {
         error.Busy => return error.Busy,
         error.Failed => {
-            failure.* = .{ .err = store.lock_error, .errno = store.lock_errno };
+            failure.* = .{ .err = store.lock_error, .errno = store.lock_errno, .step = .lock };
             return error.StoreFailed;
         },
     };
@@ -133,12 +142,12 @@ pub fn partial_chunk(store: *const Store, buffer: *PathBuf, id: Digest, index: u
     return store.path(buffer, &.{ "/partial/", &hex, "/", text });
 }
 
-fn exists(store: *const Store, path: [:0]const u8) Error!bool {
+fn exists(store: *const Store, path: [:0]const u8, failure: *Failure) Error!bool {
     assert(path.len > 0);
     assert(store.root_len > 1);
     _ = store.fs.lstat(path) catch |err| {
         if (err == error.NotFound) return false;
-        return error.StoreFailed;
+        return fail(store.fs, failure, err, .look);
     };
     return true;
 }
@@ -162,7 +171,7 @@ pub fn put_chunk(
     if (bytes.len != chunk_length(store, wanted.size, index)) return error.WrongLength;
     if (!Digest.of(bytes).eql(wanted.hashes[index])) return error.HashMismatch;
     var final: PathBuf = undefined;
-    if (try exists(store, store.object_path(&final, wanted.id))) {
+    if (try exists(store, store.object_path(&final, wanted.id), failure)) {
         return .{
             .have = @intCast(wanted.hashes.len),
             .total = @intCast(wanted.hashes.len),
@@ -188,7 +197,7 @@ pub fn finish(store: *Store, io: []u8, wanted: *const Wanted, failure: *Failure)
     try hold(store, failure);
     defer lock.release(store);
     var final: PathBuf = undefined;
-    if (try exists(store, store.object_path(&final, wanted.id))) {
+    if (try exists(store, store.object_path(&final, wanted.id), failure)) {
         const total: u32 = @intCast(wanted.hashes.len);
         return .{ .have = total, .total = total, .complete = true, .duplicate = true };
     }
@@ -221,13 +230,13 @@ fn chunk_is_held(
     const fs = store.fs;
     const fd = fs.open_read(path) catch |err| {
         if (err == error.NotFound) return false;
-        return fail(fs, failure, err);
+        return fail(fs, failure, err, .chunk_read);
     };
     defer fs.close(fd);
     var hasher = Hasher.init();
     var buffer: [4096]u8 = undefined;
     while (true) {
-        const count = fs.read(fd, &buffer) catch |err| return fail(fs, failure, err);
+        const count = fs.read(fd, &buffer) catch |err| return fail(fs, failure, err, .chunk_read);
         if (count == 0) break;
         hasher.update(buffer[0..count]);
     }
@@ -246,19 +255,19 @@ fn write_chunk(
     const fs = store.fs;
     var partial_root: PathBuf = undefined;
     fs.make_directory(store.path(&partial_root, &.{"/partial"}), true) catch |err| {
-        return fail(fs, failure, err);
+        return fail(fs, failure, err, .chunk_write);
     };
     var directory: PathBuf = undefined;
     const directory_path = partial_directory(store, &directory, id);
     fs.make_directory(directory_path, true) catch |err| {
-        return fail(fs, failure, err);
+        return fail(fs, failure, err, .chunk_write);
     };
     var temporary: PathBuf = undefined;
     var final: PathBuf = undefined;
     const temporary_path = store.tmp_path(&temporary);
     const final_path = partial_chunk(store, &final, id, index);
     fs.write_atomic(temporary_path, final_path, directory_path, bytes, 0o644, failure) catch {
-        return error.StoreFailed;
+        return failed_at(failure, .chunk_write);
     };
 }
 
@@ -271,7 +280,7 @@ fn assemble_if_whole(
     assert(wanted.hashes.len <= constants.store_chunks_max);
     assert(io.len >= 4096);
     const total: u32 = @intCast(wanted.hashes.len);
-    const have = try held_count(store, io, wanted.id, total);
+    const have = try held_count(store, io, wanted.id, total, failure);
     if (have < total) return .{
         .have = have,
         .total = total,
@@ -283,14 +292,14 @@ fn assemble_if_whole(
 }
 
 /// How many chunk files `partial/<id>/` holds, by one listing of the directory.
-fn held_count(store: *Store, io: []u8, id: Digest, total: u32) Error!u32 {
+fn held_count(store: *Store, io: []u8, id: Digest, total: u32, failure: *Failure) Error!u32 {
     assert(total <= constants.store_chunks_max);
     assert(io.len >= 4096);
     var directory: PathBuf = undefined;
     var names = @import("names.zig").NameList.init(io, constants.store_chunks_max + 8);
     store.fs.read_dir(partial_directory(store, &directory, id), names.visitor()) catch |err| {
         if (err == error.NotFound) return 0;
-        return error.StoreFailed;
+        return fail(store.fs, failure, err, .listing);
     };
     var held: u32 = 0;
     var at: u32 = 0;
@@ -308,10 +317,12 @@ fn assemble(store: *Store, io: []u8, wanted: *const Wanted, failure: *Failure) E
     assert(store.root_len > 1);
     assert(io.len >= 4096);
     const fs = store.fs;
-    generation.bump(store, failure) catch return error.StoreFailed;
+    generation.bump(store, failure) catch return failed_at(failure, .generation);
     var shard: PathBuf = undefined;
     const shard_path = store.shard_path(&shard, "objects", wanted.id);
-    object.ensure_directory(store, shard_path, failure) catch return error.StoreFailed;
+    object.ensure_directory(store, shard_path, failure) catch {
+        return failed_at(failure, .directory);
+    };
     var temporary_storage: PathBuf = undefined;
     const temporary = store.tmp_path(&temporary_storage);
     build_file(store, io, wanted, temporary, failure) catch |err| {
@@ -327,11 +338,13 @@ fn assemble(store: *Store, io: []u8, wanted: *const Wanted, failure: *Failure) E
     }
     var final: PathBuf = undefined;
     fs.rename(temporary, store.object_path(&final, wanted.id)) catch |err| {
+        // Noted before the cleanup, which would overwrite the rename's errno.
+        const noted = fail(fs, failure, err, .rename);
         fs.unlink(temporary) catch {}; // Same.
-        return fail(fs, failure, err);
+        return noted;
     };
     fs.sync_directory(shard_path) catch |err| {
-        return fail(fs, failure, err);
+        return fail(fs, failure, err, .sync);
     };
     store.objects_written += 1;
     store.bytes_written += wanted.size;
@@ -355,7 +368,7 @@ fn write_list(
     const temporary_path = store.tmp_path(&temporary);
     const target = store.chunks_path(&final, wanted.id);
     store.fs.write_atomic(temporary_path, target, shard_path, io[0..total], 0o644, failure) catch {
-        return error.StoreFailed;
+        return failed_at(failure, .list);
     };
 }
 
@@ -371,7 +384,7 @@ fn build_file(
     assert(wanted.hashes.len <= constants.store_chunks_max);
     const fs = store.fs;
     const output = fs.create(temporary, 0o600) catch |err| {
-        return fail(fs, failure, err);
+        return fail(fs, failure, err, .create);
     };
     defer fs.close(output);
     var whole = Hasher.init();
@@ -380,21 +393,21 @@ fn build_file(
         var chunk_storage: PathBuf = undefined;
         const path = partial_chunk(store, &chunk_storage, wanted.id, @intCast(index));
         const input = fs.open_read(path) catch |err| {
-            return fail(fs, failure, err);
+            return fail(fs, failure, err, .assemble_read);
         };
         defer fs.close(input);
         var chunk_hash = Hasher.init();
         var length: u64 = 0;
         while (true) {
             const count = fs.read(input, io) catch |err| {
-                return fail(fs, failure, err);
+                return fail(fs, failure, err, .assemble_read);
             };
             if (count == 0) break;
             whole.update(io[0..count]);
             chunk_hash.update(io[0..count]);
             length += count;
             fs.write_all(output, io[0..count]) catch |err| {
-                return fail(fs, failure, err);
+                return fail(fs, failure, err, .assemble_write);
             };
         }
         // A held chunk was checked when it was written; a damaged file is caught here.
@@ -409,7 +422,10 @@ fn build_file(
     if (written != wanted.size or !whole.final().eql(wanted.content)) {
         return discard_and_refuse(store, wanted);
     }
-    object.apply(fs, output, wanted.attrs, &store.owners, failure) catch return error.StoreFailed;
+    // `apply` names its own step (`owner`, `mode`, `xattr`, `time`, or the flush).
+    object.apply(fs, output, wanted.attrs, &store.owners, failure) catch {
+        return failed_at(failure, .assemble_write);
+    };
 }
 
 fn discard_and_refuse(store: *Store, wanted: *const Wanted) Error {
