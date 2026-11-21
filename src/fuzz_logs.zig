@@ -1,11 +1,12 @@
-//! The container-log fuzzer: `zig build fuzz -- logs`. Each iteration builds a log on the
-//! simulated disk with the real writer (random records, a random small file size so the cap
-//! drops the oldest ones, short writes and interrupts), and checks the reader gives back exactly
-//! a contiguous run of the newest records the writer finished (all of them, unless a call was
-//! interrupted past the retry bound), with `dropped_bytes` the size of the records before it. It then crashes the machine at a random write point and checks the same after a restart;
-//! and damages the one file of a log that fits (flips of up to four bytes, a cut, a zeroed or
-//! garbage tail) and checks the reader returns only records that were written, in order,
-//! stopping at or before the damage. The writer's record list is the oracle.
+//! The container-log fuzzer: `zig build fuzz -- logs`. Each iteration builds a log on the simulated
+//! disk with the real writer (random records, a random small file size so the cap drops the oldest
+//! ones, short writes and interrupts), and checks the reader gives back exactly a contiguous run of
+//! the newest records the writer finished (all of them, unless a call was interrupted past the
+//! retry bound), with `dropped_bytes` the size of the records before it. It then crashes the
+//! machine at a random write point and checks the same after a restart; and damages the one file of
+//! a log that fits (flips of up to four bytes, a cut, a zeroed or garbage tail) and checks the
+//! reader returns only records that were written, in order, stopping at or before the damage. The
+//! writer's record list is the oracle.
 
 const std = @import("std");
 const assert = std.debug.assert;
