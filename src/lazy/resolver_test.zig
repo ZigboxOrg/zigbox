@@ -1323,32 +1323,74 @@ test "resolver: an EPERM from the create is shown once, not taken for the owner 
     try expect_eperm_shown(.create);
 }
 
-test "schedule: a not_kept dropped from a full queue is reported by the next chunk" {
-    // Goal: an event dropped because the queue was full (`events_dropped`) does not count as
-    // shown, so the object reports later; once queued, it is never queued again. Method: fill
-    // the queue with `store_full` events, offer a `not_kept` (dropped), empty the queue,
-    // offer it again (queued), and a third time (not queued).
+test "schedule: a not_kept dropped from a full queue is still counted, and the drop is final" {
+    // Goal: a `not_kept` counts in `report.errors` whether or not its event is queued, as
+    // `store_full` and `refuse` do, so the run record says the store failed even when the line
+    // is lost; a drop (`events_dropped`) is final, as for every other kind. Method: fill the
+    // queue with `store_full` events, offer a `not_kept` (dropped, counted), empty the queue,
+    // offer it again for another chunk (neither queued nor counted again).
     setup(&.{2 * chunk_bytes});
     try open_resolver(1, false, false);
     defer close_resolver();
     const schedule = &fixture.resolver.schedule;
+    fill_event_queue(schedule);
+    const failure: chunks_mod.Failure = .{ .err = error.IoFailed, .errno = 5, .step = .rename };
+    const errors_before = schedule.report.errors;
+    schedule.not_kept(0, 1, failure);
+    try testing.expectEqual(@as(u64, 1), schedule.report.events_dropped);
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    while (schedule.pop_event()) |_| {}
+    schedule.not_kept(0, 0, failure);
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    try testing.expectEqual(@as(u32, 0), schedule.events_count);
+    try testing.expectEqual(@as(u64, 1), schedule.report.events_dropped);
+}
+
+test "resolver: a not_kept dropped on the assembly path is counted, and the reads are served" {
+    // Goal: the case the drop is final for: the last chunk's assembly fails (EPERM from the
+    // xattr) while the event queue is full. The read is served, the error and the drop are
+    // counted, and no later read or put shows the event: every chunk is held, so nothing puts
+    // a chunk of the object again. Method: `expect_eperm_shown`'s run with the queue filled
+    // before the failing read.
+    const point = eperm_point_of(.xattr) orelse return error.TestUnexpectedResult;
+    setup(&.{2 * chunk_bytes});
+    give_capability(0);
+    store_outside();
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const schedule = &fixture.resolver.schedule;
+    try expect_true_read(0, 0, 0);
+    fill_event_queue(schedule);
+    const errors_before = schedule.report.errors;
+    const dropped_before = schedule.report.events_dropped;
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    fixture.files.faults.fail_errno = 1;
+    try expect_true_read(0, 1, 100);
+    fixture.files.faults = .{};
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    try testing.expectEqual(dropped_before + 1, schedule.report.events_dropped);
+    var not_kept: u32 = 0;
+    while (schedule.pop_event()) |event| {
+        if (event.kind == .not_kept) not_kept += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), not_kept);
+    try expect_true_read(0, 1, 200);
+    try expect_true_read(0, 0, 300);
+    fixture.resolver.drain_events();
+    try testing.expectEqual(@as(u32, 0), events_of(.not_kept, ""));
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+}
+
+/// Fills the schedule's event queue with `store_full` events, so the next event is dropped.
+fn fill_event_queue(schedule: *Schedule) void {
     var filled: u32 = 0;
     while (schedule.events_count < constants.lazy_pending_max) : (filled += 1) {
         assert(filled < constants.lazy_pending_max);
         schedule.store_full(0, 0);
     }
-    const failure: chunks_mod.Failure = .{ .err = error.IoFailed, .errno = 5, .step = .rename };
-    const errors_before = schedule.report.errors;
-    schedule.not_kept(0, 1, failure);
-    try testing.expectEqual(@as(u64, 1), schedule.report.events_dropped);
-    try testing.expectEqual(errors_before, schedule.report.errors);
-    while (schedule.pop_event()) |_| {}
-    schedule.not_kept(0, 1, failure);
-    schedule.not_kept(0, 0, failure);
-    try testing.expectEqual(errors_before + 1, schedule.report.errors);
-    fixture.resolver.drain_events();
-    try testing.expectEqual(@as(u32, 1), events_of(.not_kept, ""));
-    try testing.expectEqual(@as(u32, 0), events_of(.store_full, ""));
+    assert(schedule.events_count == constants.lazy_pending_max);
 }
 
 test "resolver: a store that cannot make the object is shown once, and the read is served" {

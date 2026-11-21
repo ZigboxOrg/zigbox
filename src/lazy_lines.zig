@@ -290,10 +290,10 @@ test "E1203 after a lie names it, and says no deadline passed" {
 test "E0417 for a held chunk names the step, its path in the store and the kernel's reason" {
     // Goal: the `not_kept` line is one diagnostic whose cause says which step of the put failed
     // and where in the store (E0417's explanation promises the path), with the errno's reason,
-    // never "the errno is unknown"; a failure with no errno still names the step.
+    // never "the errno is unknown"; a failure with no errno names the step and the error's class.
     // Method: render the event as the run does, for an EPERM from the xattr, an EACCES from
-    // the rename into the object's shard, and an `AccessDenied` with no errno from the
-    // directory, and compare the default text.
+    // the rename into the object's shard, and an `AccessDenied` and an `IoFailed` with no
+    // errno from the directory, and compare the default text.
     const names: [constants.lazy_sources_max][]const u8 = @splat("");
     var given: lazy.Event = .{
         .kind = .not_kept,
@@ -320,7 +320,10 @@ test "E0417 for a held chunk names the step, its path in the store and the kerne
         tail);
     given.store_failure = .{ .err = error.AccessDenied, .errno = 0, .step = .directory };
     try expect_rendered(&given, head ++
-        "  cause  making the directory objects/aa failed\n" ++ tail);
+        "  cause  making the directory objects/aa failed: permission denied\n" ++ tail);
+    given.store_failure = .{ .err = error.IoFailed, .errno = 0, .step = .directory };
+    try expect_rendered(&given, head ++
+        "  cause  making the directory objects/aa failed: the store gave no reason\n" ++ tail);
 }
 
 fn expect_rendered(given: *const lazy.Event, expected: []const u8) !void {

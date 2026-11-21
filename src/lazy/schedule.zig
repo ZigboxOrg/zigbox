@@ -108,7 +108,8 @@ pub const ObjectState = struct {
     next_chunk: u32,
     /// Seen whole in the store: counted once in `report.objects_local`.
     whole: bool,
-    /// Its `not_kept` event was queued: one per object, however many chunks meet the failure.
+    /// Its `not_kept` was counted, and its event queued or dropped from a full queue: one per
+    /// object, however many chunks meet the failure.
     keep_reported: bool,
     /// The index's locations for it are malformed: the registry is not asked for it.
     no_registry: bool,
@@ -366,11 +367,11 @@ pub const Schedule = struct {
     ) void {
         assert(kind != .not_kept);
         const unnamed: chunks.Failure = .{ .err = error.IoFailed, .errno = 0 };
-        // A dropped event is counted in `events_dropped`; these kinds are not reported again.
-        _ = schedule.emit_with(kind, object, chunk, source, outcomes, unnamed);
+        schedule.emit_with(kind, object, chunk, source, outcomes, unnamed);
     }
 
-    /// Queues an event; false if the queue was full and it was dropped (`events_dropped`).
+    /// Queues an event, or drops it if the queue is full: a drop is counted in `events_dropped`
+    /// and is final, since no kind is reported again.
     fn emit_with(
         schedule: *Schedule,
         kind: lazy.Event.Kind,
@@ -379,12 +380,12 @@ pub const Schedule = struct {
         source: []const u8,
         outcomes: *const [sources_max]lazy.Outcome,
         store_failure: chunks.Failure,
-    ) bool {
+    ) void {
         assert(object < schedule.catalog.objects.len);
         assert(schedule.events_count <= pending_max);
         if (schedule.events_count == pending_max) {
             schedule.report.events_dropped += 1;
-            return false;
+            return;
         }
         const at = (schedule.events_head + schedule.events_count) % pending_max;
         schedule.events[at] = .{
@@ -400,7 +401,6 @@ pub const Schedule = struct {
         };
         if (kind == .unavailable) schedule.name_liars(object, &schedule.events[at].outcomes);
         schedule.events_count += 1;
-        return true;
     }
 
     /// A source that lied about `object` is never asked for it again, so its outcome in a later
@@ -847,10 +847,12 @@ pub const Schedule = struct {
         assert(schedule.stopping);
     }
 
-    /// The store held a chunk but could not make its object: one `not_kept` event per object,
-    /// whichever chunk met it first. The source is not blamed and the read is served. An event
-    /// dropped because the queue was full (`events_dropped`) does not count as shown: the next
-    /// chunk that meets the failure reports it.
+    /// The store held a chunk but could not make its object: one `not_kept` per object, whichever
+    /// chunk met it first. The source is not blamed and the read is served. It is counted in
+    /// `report.errors` whether or not its event is queued, as `store_full` and `refuse` are. A
+    /// drop from a full queue (`events_dropped`) is final, as for every other kind: the failure
+    /// usually comes from the last missing chunk's assembly, after which every chunk is held
+    /// and nothing puts a chunk of the object again, so there is no later put to report it.
     pub fn not_kept(
         schedule: *Schedule,
         object: lazy.ObjectIndex,
@@ -862,11 +864,10 @@ pub const Schedule = struct {
         assert(failure.errno < 4096);
         const state = &schedule.objects[object];
         if (state.keep_reported) return;
-        const outcomes: [sources_max]lazy.Outcome = @splat(.not_tried);
-        if (!schedule.emit_with(.not_kept, object, chunk, "", &outcomes, failure)) return;
         state.keep_reported = true;
         schedule.report.errors += 1;
-        assert(schedule.events_count > 0);
+        const outcomes: [sources_max]lazy.Outcome = @splat(.not_tried);
+        schedule.emit_with(.not_kept, object, chunk, "", &outcomes, failure);
     }
 
     /// A read refused for want of disk: `E1206`.

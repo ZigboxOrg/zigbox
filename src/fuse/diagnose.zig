@@ -308,9 +308,13 @@ pub fn chunk_not_kept(diag: *Diag, object: Digest, chunk: u32, failure: *const F
     var buffer: [not_kept_step_bytes_max]u8 = undefined;
     const operation = not_kept_step(&buffer, object, failure.step);
     if (failure.errno == 0) {
-        // No errno to name (a failure the kernel did not report): the step and path are what
-        // there is to act on.
-        diag.cause("{s} failed", .{operation});
+        // No errno to name (a failure the kernel did not report): the error's class, never a
+        // guessed errno, and for `IoFailed`, which has none, that the reason is unknown.
+        if (errors.reason_of_class(failure.err)) |reason| {
+            diag.cause("{s} failed: {s}", .{ operation, reason });
+        } else {
+            diag.cause("{s} failed: the store gave no reason", .{operation});
+        }
     } else {
         errors.cause_host_error(diag, operation, failure.err, failure.errno);
     }
