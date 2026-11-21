@@ -5,4 +5,4 @@ error[ZBX-E0406]: no schema for that command
   arg    help
   fix    print one:   zbx schema ps
   more   zbx explain E0406
-  docs   https://zigbox.github.io/zigbox/errors/E0406.html
+  docs   https://zigbox.org/errors/box/E0406.html

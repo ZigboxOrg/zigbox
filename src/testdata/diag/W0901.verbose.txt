@@ -5,4 +5,4 @@ warning[ZBX-W0901]: the provenance store is full, so this result has no provenan
          refuses it
   fix    remove records of results you no longer need, then build again
   more   zbx explain W0901
-  docs   https://zigbox.github.io/zigbox/errors/W0901.html
+  docs   https://zigbox.org/errors/box/W0901.html

@@ -3,4 +3,4 @@ error[ZBX-E1013]: a directory or path is not shared with the virtual machine
          /Users/ada is
   fix    change into a directory in your home, then run it again:   cd ~
   more   zbx explain E1013 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E1013.html
+  docs   https://zigbox.org/errors/box/E1013.html

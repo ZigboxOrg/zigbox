@@ -3,4 +3,4 @@ error[ZBX-E0904]: a policy file cannot be read or is not a policy
          field in a policy file
   fix    correct the file where it says; "zbx explain E0904" shows its form
   more   zbx explain E0904 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0904.html
+  docs   https://zigbox.org/errors/box/E0904.html

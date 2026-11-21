@@ -7,4 +7,4 @@ error[ZBX-E0435]: a root record can't be used
   path   /home/alice/.local/share/zbx/store/roots
   fix    see what else is damaged:   zbx store verify
   more   zbx explain E0435
-  docs   https://zigbox.github.io/zigbox/errors/E0435.html
+  docs   https://zigbox.org/errors/box/E0435.html

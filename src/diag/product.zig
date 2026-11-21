@@ -86,7 +86,7 @@ pub const Product = struct {
         return text;
     }
 
-    /// "https://zigbox.github.io/zigbox/errors/E0501.html": the code's generated page.
+    /// "https://zigbox.org/errors/box/E0501.html": the code's generated page.
     pub fn docs_url(
         product: *const Product,
         buffer: *[constants.docs_url_bytes_max]u8,
@@ -117,7 +117,7 @@ test "Product.zbx carries the strings the renderer used before products existed"
     );
     var url: [constants.docs_url_bytes_max]u8 = undefined;
     try testing.expectEqualStrings(
-        "https://zigbox.github.io/zigbox/errors/E0501.html",
+        "https://zigbox.org/errors/box/E0501.html",
         Product.zbx.docs_url(&url, "ZBX-E0501"),
     );
 }

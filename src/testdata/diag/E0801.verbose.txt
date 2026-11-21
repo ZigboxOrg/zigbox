@@ -5,4 +5,4 @@ error[ZBX-E0801]: can't read the build file
   dir    /home/alice/hello
   fix    write zbx.build.zon in the project directory; its format is in:   zbx explain E0801
   more   zbx explain E0801
-  docs   https://zigbox.github.io/zigbox/errors/E0801.html
+  docs   https://zigbox.org/errors/box/E0801.html

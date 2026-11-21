@@ -374,7 +374,7 @@ test "text rendering: the anatomy of the standard, default and verbose" {
             "         or system-wide:   sudo sysctl a.b=0\n" ++
             "         or read the docs\n" ++
             "  more   zbx explain E0001 \u{b7} rerun with --verbose for the full cause chain\n" ++
-            "  docs   https://zigbox.github.io/zigbox/errors/E0001.html\n",
+            "  docs   https://zigbox.org/errors/box/E0001.html\n",
         render(&diag, .text, false, &buffer),
     );
     try testing.expectEqualStrings(
@@ -388,7 +388,7 @@ test "text rendering: the anatomy of the standard, default and verbose" {
             "         or system-wide:   sudo sysctl a.b=0\n" ++
             "         or read the docs\n" ++
             "  more   zbx explain E0001\n" ++
-            "  docs   https://zigbox.github.io/zigbox/errors/E0001.html\n",
+            "  docs   https://zigbox.org/errors/box/E0001.html\n",
         render(&diag, .verbose, false, &buffer),
     );
 }
@@ -466,7 +466,7 @@ test "json rendering: one line, every field, escapes, null for a fix without a c
             "{\"sentence\":\"or system-wide:\",\"command\":\"sudo sysctl a.b=0\"," ++
             "\"needs_root\":true}," ++
             "{\"sentence\":\"or read the docs\",\"command\":null}]," ++
-            "\"docs\":\"https://zigbox.github.io/zigbox/errors/E0001.html\"," ++
+            "\"docs\":\"https://zigbox.org/errors/box/E0001.html\"," ++
             "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}\n",
         output,
     );

@@ -8,4 +8,4 @@ error[ZBX-E0403]: can't signal the container
   pid    502
   fix    look at the process:   ps -o pid,user,stat,args -p <pid>
   more   zbx explain E0403
-  docs   https://zigbox.github.io/zigbox/errors/E0403.html
+  docs   https://zigbox.org/errors/box/E0403.html

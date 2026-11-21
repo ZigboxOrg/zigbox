@@ -5,4 +5,4 @@ error[ZBX-E0203]: can't create the container's namespaces
          keep it after a reboot:        echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/60-zigbox-userns.conf
          check this host (ZBX-E0101):   zbx doctor
   more   zbx explain E0203 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0203.html
+  docs   https://zigbox.org/errors/box/E0203.html

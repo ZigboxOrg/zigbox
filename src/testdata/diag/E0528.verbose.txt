@@ -5,4 +5,4 @@ error[ZBX-E0528]: AWS refused the credentials
   fix    check that the keys are current: temporary keys expire
          get new credentials, then run the command again
   more   zbx explain E0528
-  docs   https://zigbox.github.io/zigbox/errors/E0528.html
+  docs   https://zigbox.org/errors/box/E0528.html

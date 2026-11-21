@@ -10,4 +10,4 @@ error[ZBX-E0308]: can't write a limit to the container's cgroup
   step   start_scope (6 of 69)
   fix    check this host (ZBX-E0103):   zbx doctor
   more   zbx explain E0308
-  docs   https://zigbox.github.io/zigbox/errors/E0308.html
+  docs   https://zigbox.org/errors/box/E0308.html

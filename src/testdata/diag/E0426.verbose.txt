@@ -5,4 +5,4 @@ error[ZBX-E0426]: the container has no layer to commit
   name   web-1
   fix    keep a directory by importing it:   zbx store import <dir>
   more   zbx explain E0426
-  docs   https://zigbox.github.io/zigbox/errors/E0426.html
+  docs   https://zigbox.org/errors/box/E0426.html

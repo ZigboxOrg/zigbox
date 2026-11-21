@@ -3,4 +3,4 @@ error[ZBX-E0503]: can't reach the registry
   fix    check that the network is up and that HTTPS_PROXY, if set, works
          then run the command again
   more   zbx explain E0503 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0503.html
+  docs   https://zigbox.org/errors/box/E0503.html

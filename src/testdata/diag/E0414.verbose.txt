@@ -5,4 +5,4 @@ error[ZBX-E0414]: can't read the directory to import
   path   /nowhere
   fix    look at it:   ls -ld -- '/nowhere'
   more   zbx explain E0414
-  docs   https://zigbox.github.io/zigbox/errors/E0414.html
+  docs   https://zigbox.org/errors/box/E0414.html

@@ -6,4 +6,4 @@ error[ZBX-E0806]: a build step's output is refused
   path   /out/run/control
   fix    have the step remove it, or make it somewhere other than /out
   more   zbx explain E0806
-  docs   https://zigbox.github.io/zigbox/errors/E0806.html
+  docs   https://zigbox.org/errors/box/E0806.html

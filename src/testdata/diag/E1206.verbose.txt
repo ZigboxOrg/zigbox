@@ -5,4 +5,4 @@ error[ZBX-E1206]: the store's disk is too full to keep fetched chunks
   object b3:5555555555555555555555555555555555555555555555555555555555555555
   fix    free space on the disk that holds the store, then read it again
   more   zbx explain E1206
-  docs   https://zigbox.github.io/zigbox/errors/E1206.html
+  docs   https://zigbox.org/errors/box/E1206.html

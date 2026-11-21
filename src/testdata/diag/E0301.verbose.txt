@@ -10,4 +10,4 @@ error[ZBX-E0301]: can't reach the systemd user manager over D-Bus
   fix    check this host (ZBX-E0103):     zbx doctor
          keep the user manager running:   loginctl enable-linger $USER
   more   zbx explain E0301
-  docs   https://zigbox.github.io/zigbox/errors/E0301.html
+  docs   https://zigbox.org/errors/box/E0301.html

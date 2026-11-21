@@ -9,4 +9,4 @@ error[ZBX-E0527]: there are no AWS credentials to pull from Amazon ECR
          or set AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE for a web identity
          or export the keys of a profile first:   export $(aws configure export-credentials --format env)
   more   zbx explain E0527
-  docs   https://zigbox.github.io/zigbox/errors/E0527.html
+  docs   https://zigbox.org/errors/box/E0527.html

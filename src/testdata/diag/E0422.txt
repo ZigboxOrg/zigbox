@@ -4,4 +4,4 @@ error[ZBX-E0422]: a tree in the store is missing or damaged
          missing from the store
   fix    import the directory again to write what is missing, or restore a backup
   more   zbx explain E0422 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0422.html
+  docs   https://zigbox.org/errors/box/E0422.html

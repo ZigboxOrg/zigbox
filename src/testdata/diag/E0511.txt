@@ -5,4 +5,4 @@ error[ZBX-E0511]: downloaded bytes do not match their digest
          sha256:af2d3a5703db3b6b4fe99479989e4aa15fc4342cb0e6746c2b05105c95a6b591
   fix    run the command again; if it repeats, do not trust this source
   more   zbx explain E0511 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0511.html
+  docs   https://zigbox.org/errors/box/E0511.html

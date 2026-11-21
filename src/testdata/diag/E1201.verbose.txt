@@ -6,4 +6,4 @@ error[ZBX-E1201]: lazy start is not possible on this host
   fix    give users read and write on /dev/fuse (the fuse udev rule, mode 0666)
          or run it without --lazy, which reads the whole image first
   more   zbx explain E1201
-  docs   https://zigbox.github.io/zigbox/errors/E1201.html
+  docs   https://zigbox.org/errors/box/E1201.html

@@ -4,4 +4,4 @@ warning[ZBX-W0209]: groups show as nogroup inside the container
          each device
   fix    nothing to do; the groups work, only their names are not shown
   more   zbx explain W0209 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/W0209.html
+  docs   https://zigbox.org/errors/box/W0209.html

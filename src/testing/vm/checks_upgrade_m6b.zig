@@ -166,7 +166,7 @@ test "a container without a log is a coded refusal, and each lie is caught" {
         "         log could not be written, or it was removed\n" ++
         "  fix    run it again to get a log:   zbx run -d --name <name> <image>\n" ++
         "  more   zbx explain E0217 \xc2\xb7 rerun with --verbose for the full cause chain\n" ++
-        "  docs   https://zigbox.github.io/zigbox/errors/E0217.html\n";
+        "  docs   https://zigbox.org/errors/box/E0217.html\n";
     const right: Streams = .{ .stdout = "", .stderr = text };
     try check_no_log(right, 1, "m6bold");
     try testing.expectError(error.ExitCodeWrong, check_no_log(right, 125, "m6bold"));

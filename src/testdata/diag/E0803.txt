@@ -3,4 +3,4 @@ error[ZBX-E0803]: a build input is refused
          the project directory '/home/alice/hello'
   fix    copy what it names into the project, and list the copy
   more   zbx explain E0803 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0803.html
+  docs   https://zigbox.org/errors/box/E0803.html
