@@ -7,4 +7,4 @@ error[ZBX-E0213]: a --mount needs the container to run as root
   fix    run it as root, which is you inside the container:   zbx run --user 0 --mount ./site:/srv <image>
          or give the directory read-only:                     zbx run --bind ./site:/srv <image>
   more   zbx explain E0213
-  docs   https://zigbox.github.io/zigbox/errors/E0213.html
+  docs   https://zigbox.org/errors/E0213.html

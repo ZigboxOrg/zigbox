@@ -3,4 +3,4 @@ error[ZBX-E0555]: the registry refused a blob upload
          it answered 400
   fix    run the same command again; what the registry already holds is not sent twice
   more   zbx explain E0555 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0555.html
+  docs   https://zigbox.org/errors/E0555.html

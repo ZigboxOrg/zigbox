@@ -9,4 +9,4 @@ error[ZBX-E0211]: can't set up a --tmpfs, --bind or --secret mount
   step   bind_mount_file (59 of 75)
   fix    see what this host allows:   zbx doctor
   more   zbx explain E0211
-  docs   https://zigbox.github.io/zigbox/errors/E0211.html
+  docs   https://zigbox.org/errors/E0211.html

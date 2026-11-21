@@ -4,4 +4,4 @@ error[ZBX-E0506]: the registry is rate limiting this host
   fix    wait a few minutes, then run the command again
          or ask a mirror of Docker Hub first, for example:   ZBX_REGISTRY_MIRRORS=mirror.gcr.io zbx pull alpine:3.20
   more   zbx explain E0506 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0506.html
+  docs   https://zigbox.org/errors/E0506.html

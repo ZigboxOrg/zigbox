@@ -5,4 +5,4 @@ error[ZBX-E1008]: can't read the virtual machine's settings
   path   /Users/ada/Library/Application Support/zbx/vm-settings
   fix    write the settings again:   zbx vm config --cpus 4 --memory 2G
   more   zbx explain E1008
-  docs   https://zigbox.github.io/zigbox/errors/E1008.html
+  docs   https://zigbox.org/errors/E1008.html

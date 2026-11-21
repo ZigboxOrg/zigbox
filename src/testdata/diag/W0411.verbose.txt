@@ -6,4 +6,4 @@ warning[ZBX-W0411]: an extended attribute was left out of the import
   attr   trusted.thing
   fix    nothing to do unless the container needs it; the digest does not cover it
   more   zbx explain W0411
-  docs   https://zigbox.github.io/zigbox/errors/W0411.html
+  docs   https://zigbox.org/errors/W0411.html

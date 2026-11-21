@@ -5,4 +5,4 @@ warning[ZBX-W0903]: zbx verify could not check an input that is not in the store
   arg    0123456789abcdef
   fix    pull or build the input again to check it, or use --strict to fail
   more   zbx explain W0903
-  docs   https://zigbox.github.io/zigbox/errors/W0903.html
+  docs   https://zigbox.org/errors/W0903.html

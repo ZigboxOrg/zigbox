@@ -3,4 +3,4 @@ error[ZBX-E0909]: a trust bundle was refused
          signature does not verify, or its statement is not about one tree
   fix    export the bundle again with 'zbx trust export <tree>' where it was made
   more   zbx explain E0909 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0909.html
+  docs   https://zigbox.org/errors/E0909.html

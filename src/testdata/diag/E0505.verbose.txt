@@ -5,4 +5,4 @@ error[ZBX-E0505]: the registry answered with an error
   status 503
   fix    this is the registry's failure; run the command again later
   more   zbx explain E0505
-  docs   https://zigbox.github.io/zigbox/errors/E0505.html
+  docs   https://zigbox.org/errors/E0505.html

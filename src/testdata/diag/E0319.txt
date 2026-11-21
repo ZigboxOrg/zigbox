@@ -4,4 +4,4 @@ error[ZBX-E0319]: vm.max_map_count is 65530, needs >=262144
   fix    set it on the host (a file in /etc/sysctl.d/ keeps it across boots):   sudo sysctl -w vm.max_map_count=262144
          check every setting:                                                   zbx doctor
   more   zbx explain E0319 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0319.html
+  docs   https://zigbox.org/errors/E0319.html

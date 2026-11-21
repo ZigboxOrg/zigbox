@@ -7,4 +7,4 @@ error[ZBX-E0216]: the --user is not in the image
   file   /etc/passwd
   fix    use a name the image has, or a number: --user 1000
   more   zbx explain E0216
-  docs   https://zigbox.github.io/zigbox/errors/E0216.html
+  docs   https://zigbox.org/errors/E0216.html

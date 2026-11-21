@@ -4,4 +4,4 @@ error[ZBX-E0225]: can't bind that device into the container
   device /dev/dri/renderD128
   fix    list the nodes the host has, and give one of them:   ls -l /dev/dri
   more   zbx explain E0225
-  docs   https://zigbox.github.io/zigbox/errors/E0225.html
+  docs   https://zigbox.org/errors/E0225.html

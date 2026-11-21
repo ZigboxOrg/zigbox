@@ -956,7 +956,7 @@ test "from_diag copies the collector and write_json is what render wrote before"
     try testing.expectEqualStrings("a path C:\\x and a ' ' and ~", diagnostic.last_cause().?);
     try testing.expectEqual(diag.exit_code(), diagnostic.exit_code());
     try testing.expectEqualStrings(
-        "https://zigbox.github.io/zigbox/errors/E0001.html",
+        "https://zigbox.org/errors/E0001.html",
         diagnostic.docs.slice(),
     );
     var buffer: [constants.output_bytes_max]u8 = undefined;

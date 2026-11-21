@@ -3,4 +3,4 @@ error[ZBX-E0704]: no runs are recorded yet
          /home/alice/.local/state/zbx/runs
   fix    run something first:   zbx run --rootfs ./alpine -- /bin/sh
   more   zbx explain E0704 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0704.html
+  docs   https://zigbox.org/errors/E0704.html

@@ -4,4 +4,4 @@ error[ZBX-E0816]: the build file can't be written
   path   zbx.build.zon
   fix    replace it with --force, or write elsewhere with -o:   zbx import -o imported.build.zon
   more   zbx explain E0816
-  docs   https://zigbox.github.io/zigbox/errors/E0816.html
+  docs   https://zigbox.org/errors/E0816.html

@@ -5,4 +5,4 @@ error[ZBX-E0321]: a host setting --require-host asks for can't be read
   key    vm.max_map_count
   fix    see what this host has:   zbx doctor
   more   zbx explain E0321
-  docs   https://zigbox.github.io/zigbox/errors/E0321.html
+  docs   https://zigbox.org/errors/E0321.html

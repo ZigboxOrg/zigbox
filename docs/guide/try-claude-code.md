@@ -87,7 +87,7 @@ A refusal, as an agent sees it:
 
 ```
 $ zbx --output json run nosuch:1 -- true
-{"code":"ZBX-E0522","severity":"error","blame":"user","summary":"no image of that name is locked or in the store","causes":["'/home/tester/hello/zbx.lock' has no entry for 'nosuch:1'"],"while":["finding the image 'nosuch:1'"],"context":{"path":"/home/tester/hello/zbx.lock","ref":"nosuch:1"},"fixes":[{"sentence":"pull it (this also records it in zbx.lock):","command":"zbx pull 'nosuch:1'"}],"docs":"https://zigbox.github.io/zigbox/errors/E0522.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}
+{"code":"ZBX-E0522","severity":"error","blame":"user","summary":"no image of that name is locked or in the store","causes":["'/home/tester/hello/zbx.lock' has no entry for 'nosuch:1'"],"while":["finding the image 'nosuch:1'"],"context":{"path":"/home/tester/hello/zbx.lock","ref":"nosuch:1"},"fixes":[{"sentence":"pull it (this also records it in zbx.lock):","command":"zbx pull 'nosuch:1'"}],"docs":"https://zigbox.org/errors/E0522.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}
 $ echo $?
 125
 ```

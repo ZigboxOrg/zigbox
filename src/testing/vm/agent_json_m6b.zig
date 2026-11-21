@@ -446,7 +446,7 @@ const e0212 = "{\"code\":\"ZBX-E0212\",\"severity\":\"error\",\"blame\":\"user\"
     "\"/tmp/h/outside-agent\"},\"fixes\":[{\"sentence\":\"run zbx from the project's " ++
     "directory\",\"command\":null},{\"sentence\":\"or give a directory elsewhere " ++
     "read-only:\",\"command\":\"zbx run --bind /path/to/dir:/dir <image>\",\"template\":true}]," ++
-    "\"docs\":\"https://zigbox.github.io/zigbox/errors/E0212.html\",\"omitted\":{}}\n";
+    "\"docs\":\"https://zigbox.org/errors/E0212.html\",\"omitted\":{}}\n";
 const e0213 = "{\"code\":\"ZBX-E0213\",\"severity\":\"error\",\"blame\":\"user\",\"summary\":" ++
     "\"a --mount needs the container to run as root\",\"causes\":[\"the container would run as " ++
     "app:staff (uid 1000, gid 50)\"],\"while\":[\"checking\"],\"context\":{\"uid\":\"1000\"," ++
@@ -454,19 +454,19 @@ const e0213 = "{\"code\":\"ZBX-E0213\",\"severity\":\"error\",\"blame\":\"user\"
     "container:\",\"command\":\"zbx run --user 0 --mount ./site:/srv <image>\",\"template\":" ++
     "true},{\"sentence\":\"or give the directory read-only:\",\"command\":\"zbx run --bind " ++
     "./site:/srv <image>\",\"template\":true}],\"docs\":" ++
-    "\"https://zigbox.github.io/zigbox/errors/E0213.html\",\"omitted\":{}}\n";
+    "\"https://zigbox.org/errors/E0213.html\",\"omitted\":{}}\n";
 const e0220 = "{\"code\":\"ZBX-E0220\",\"severity\":\"error\",\"blame\":\"user\",\"summary\":" ++
     "\"the container is not running\",\"causes\":[\"the container web-1 is stopped: it exited " ++
     "with code 3\"],\"while\":[\"looking\"],\"context\":{\"name\":\"web-1\",\"state\":" ++
     "\"stopped\"},\"fixes\":[{\"sentence\":\"see the containers and their states:\",\"command\":" ++
     "\"zbx ps --all\"},{\"sentence\":\"start it again, then exec into it:\",\"command\":" ++
     "\"zbx run -d --name web alpine -- sleep 1000\",\"template\":true}],\"docs\":" ++
-    "\"https://zigbox.github.io/zigbox/errors/E0220.html\",\"omitted\":{}}\n";
+    "\"https://zigbox.org/errors/E0220.html\",\"omitted\":{}}\n";
 const e0402 = "{\"code\":\"ZBX-E0402\",\"severity\":\"error\",\"blame\":\"user\",\"summary\":" ++
     "\"no container with that name\",\"causes\":[\"no run record is called 'nosuch'\"]," ++
     "\"while\":[\"looking\"],\"context\":{\"name\":\"nosuch\"},\"fixes\":[{\"sentence\":" ++
     "\"see the containers:\",\"command\":\"zbx ps --all\"}],\"docs\":" ++
-    "\"https://zigbox.github.io/zigbox/errors/E0402.html\",\"omitted\":{}}\n";
+    "\"https://zigbox.org/errors/E0402.html\",\"omitted\":{}}\n";
 
 fn refused(
     arena: Allocator,

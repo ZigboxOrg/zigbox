@@ -4,4 +4,4 @@ error[ZBX-E0512]: the registry's answer can't be used
   host   registry.test
   fix    run the command again; if it repeats, the registry or a proxy is at fault
   more   zbx explain E0512
-  docs   https://zigbox.github.io/zigbox/errors/E0512.html
+  docs   https://zigbox.org/errors/E0512.html

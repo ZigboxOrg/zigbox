@@ -4,4 +4,4 @@ error[ZBX-E0812]: a Dockerfile variable has no value
   line   5
   fix    give ARG VERSION a default, or pass it with --build-arg in the build file
   more   zbx explain E0812
-  docs   https://zigbox.github.io/zigbox/errors/E0812.html
+  docs   https://zigbox.org/errors/E0812.html

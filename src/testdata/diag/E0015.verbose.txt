@@ -4,4 +4,4 @@ error[ZBX-E0015]: not a valid --user value
   arg    a:b:c
   fix    give a user of the image, by name or number:   zbx run --user 0 python:3.12-slim -- id
   more   zbx explain E0015
-  docs   https://zigbox.github.io/zigbox/errors/E0015.html
+  docs   https://zigbox.org/errors/E0015.html

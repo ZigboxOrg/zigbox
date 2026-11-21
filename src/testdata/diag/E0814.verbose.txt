@@ -4,4 +4,4 @@ error[ZBX-E0814]: --hermetic refused a step
   line   7
   fix    drop --hermetic, or change Dockerfile:7 so it needs neither the network nor a cache
   more   zbx explain E0814
-  docs   https://zigbox.github.io/zigbox/errors/E0814.html
+  docs   https://zigbox.org/errors/E0814.html

@@ -3,4 +3,4 @@ error[ZBX-E0608]: the listener could not be made inside the container
          returned EADDRINUSE
   fix    see what this host allows:   zbx doctor
   more   zbx explain E0608 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0608.html
+  docs   https://zigbox.org/errors/E0608.html

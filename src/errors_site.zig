@@ -15,7 +15,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const codes = @import("diag/codes.zig");
 
-const site_url = "https://zigbox.github.io/zigbox/";
+const site_url = "https://zigbox.org/";
 
 const head_start =
     \\<!doctype html>

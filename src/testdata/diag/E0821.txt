@@ -4,4 +4,4 @@ error[ZBX-E0821]: the fetched bytes do not match their pinned hash
   fix    if .sha256 (or ADD --checksum) was copied wrongly, correct it; it pins sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
          otherwise find out why the file changed before trusting it
   more   zbx explain E0821 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0821.html
+  docs   https://zigbox.org/errors/E0821.html

@@ -6,4 +6,4 @@ error[ZBX-E0715]: can't write the archive
   file   /nowhere/pgdata.tar.gz
   fix    free space, or write somewhere else with -o <file>
   more   zbx explain E0715
-  docs   https://zigbox.github.io/zigbox/errors/E0715.html
+  docs   https://zigbox.org/errors/E0715.html

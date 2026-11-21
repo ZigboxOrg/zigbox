@@ -6,4 +6,4 @@ error[ZBX-E0404]: the container did not stop in time
   pid    502
   fix    see what it is waiting for:   ps -o pid,stat,wchan -p <pid>
   more   zbx explain E0404
-  docs   https://zigbox.github.io/zigbox/errors/E0404.html
+  docs   https://zigbox.org/errors/E0404.html

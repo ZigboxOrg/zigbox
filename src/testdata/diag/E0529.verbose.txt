@@ -5,4 +5,4 @@ error[ZBX-E0529]: the clock of this machine is too far from AWS's
   fix    set the clock right, then run the command again
          turn on time synchronisation:   timedatectl set-ntp true
   more   zbx explain E0529
-  docs   https://zigbox.github.io/zigbox/errors/E0529.html
+  docs   https://zigbox.org/errors/E0529.html

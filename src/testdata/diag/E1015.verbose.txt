@@ -5,4 +5,4 @@ error[ZBX-E1015]: the Mac has no room for the virtual machine's disk
   path   /Users/ada/Library/Application Support/zbx/store.img
   fix    free space on the Mac's volume, then run the command again
   more   zbx explain E1015
-  docs   https://zigbox.github.io/zigbox/errors/E1015.html
+  docs   https://zigbox.org/errors/E1015.html

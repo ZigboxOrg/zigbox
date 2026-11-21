@@ -9,5 +9,5 @@ warning[ZBX-W0201]: mapping only your own id into the container
          install on Debian, Ubuntu:   sudo apt install uidmap
          install on Fedora:           sudo dnf install shadow-utils
   more   zbx explain W0201
-  docs   https://zigbox.github.io/zigbox/errors/W0201.html
+  docs   https://zigbox.org/errors/W0201.html
 zbx: note: scope zbx-web-1.scope went by itself just after the run ended

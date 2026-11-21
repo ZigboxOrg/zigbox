@@ -10,4 +10,4 @@ error[ZBX-E0713]: can't mount a state volume in the container
   step   make_state_data (58 of 75)
   fix    see what this host allows:   zbx doctor
   more   zbx explain E0713
-  docs   https://zigbox.github.io/zigbox/errors/E0713.html
+  docs   https://zigbox.org/errors/E0713.html

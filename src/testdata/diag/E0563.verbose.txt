@@ -5,4 +5,4 @@ error[ZBX-E0563]: the Google credentials file is not one zbx supports
   type   authorized_user
   fix    use an external_account file with a credential_source file or HTTPS url
   more   zbx explain E0563
-  docs   https://zigbox.github.io/zigbox/errors/E0563.html
+  docs   https://zigbox.org/errors/E0563.html

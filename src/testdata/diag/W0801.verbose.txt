@@ -6,4 +6,4 @@ warning[ZBX-W0801]: the build has steps that use the network
   steps  2
   fix    pin what they fetch, or fetch it once outside the build as an input
   more   zbx explain W0801
-  docs   https://zigbox.github.io/zigbox/errors/W0801.html
+  docs   https://zigbox.org/errors/W0801.html

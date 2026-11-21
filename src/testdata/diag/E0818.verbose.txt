@@ -6,4 +6,4 @@ error[ZBX-E0818]: a glob matched more paths than one import can hold
   limit  65536 paths
   fix    match a directory instead of the files in it, narrow the glob, or .exclude what you do not need
   more   zbx explain E0818
-  docs   https://zigbox.github.io/zigbox/errors/E0818.html
+  docs   https://zigbox.org/errors/E0818.html

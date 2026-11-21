@@ -7,4 +7,4 @@ error[ZBX-E0316]: a --sysctl is a host setting
          or refuse the run on a host without it:   --require-host 'vm.max_map_count>=<value>'
          the keys a container may set:             zbx explain E0316
   more   zbx explain E0316
-  docs   https://zigbox.github.io/zigbox/errors/E0316.html
+  docs   https://zigbox.org/errors/E0316.html

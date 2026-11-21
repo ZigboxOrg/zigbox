@@ -4,4 +4,4 @@ warning[ZBX-W0207]: the exec was not noted in the container's history
   path   /home/alice/.local/state/zbx/logs
   fix    look at the state directory's disk:   df -h "${XDG_STATE_HOME:-$HOME/.local/state}"
   more   zbx explain W0207
-  docs   https://zigbox.github.io/zigbox/errors/W0207.html
+  docs   https://zigbox.org/errors/W0207.html

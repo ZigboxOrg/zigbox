@@ -4,4 +4,4 @@ warning[ZBX-W0504]: warnings from unpacking an image were not shown
   count  7
   fix    nothing to do; the image is unpacked and recorded
   more   zbx explain W0504
-  docs   https://zigbox.github.io/zigbox/errors/W0504.html
+  docs   https://zigbox.org/errors/W0504.html

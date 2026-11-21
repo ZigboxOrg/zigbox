@@ -7,4 +7,4 @@ error[ZBX-E0507]: the registry refused anonymous access
   fix    check that the image is public and its name is right
          only Amazon ECR is supported as a private registry so far
   more   zbx explain E0507
-  docs   https://zigbox.github.io/zigbox/errors/E0507.html
+  docs   https://zigbox.org/errors/E0507.html

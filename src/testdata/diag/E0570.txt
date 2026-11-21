@@ -3,4 +3,4 @@ error[ZBX-E0570]: the Google registry host is not one zbx authenticates to
          only to the supported hosts
   fix    pull from one of <region>-docker.pkg.dev, gcr.io, us.gcr.io, eu.gcr.io, asia.gcr.io
   more   zbx explain E0570 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0570.html
+  docs   https://zigbox.org/errors/E0570.html

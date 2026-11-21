@@ -6,4 +6,4 @@ error[ZBX-E0556]: the registry refused the manifest
   code   MANIFEST_INVALID
   fix    run the same command again; what the registry already holds is not sent twice
   more   zbx explain E0556
-  docs   https://zigbox.github.io/zigbox/errors/E0556.html
+  docs   https://zigbox.org/errors/E0556.html

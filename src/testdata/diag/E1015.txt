@@ -3,4 +3,4 @@ error[ZBX-E1015]: the Mac has no room for the virtual machine's disk
          its disk
   fix    free space on the Mac's volume, then run the command again
   more   zbx explain E1015 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E1015.html
+  docs   https://zigbox.org/errors/E1015.html

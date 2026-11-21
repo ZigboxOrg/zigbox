@@ -3,4 +3,4 @@ error[ZBX-E0807]: the image can't be made as declared
          name, a number, or user:group of those
   fix    write .user as a name or a number, or as "user:group", for example "app:app" or "0:0"
   more   zbx explain E0807 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0807.html
+  docs   https://zigbox.org/errors/E0807.html

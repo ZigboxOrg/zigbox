@@ -4,4 +4,4 @@ error[ZBX-E0910]: signing was refused
   arg    0123456789abcdef
   fix    pull or build it again, then sign it
   more   zbx explain E0910
-  docs   https://zigbox.github.io/zigbox/errors/E0910.html
+  docs   https://zigbox.org/errors/E0910.html

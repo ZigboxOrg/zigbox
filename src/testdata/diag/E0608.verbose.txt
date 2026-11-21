@@ -8,4 +8,4 @@ error[ZBX-E0608]: the listener could not be made inside the container
   step   make_listener (14 of 72)
   fix    see what this host allows:   zbx doctor
   more   zbx explain E0608
-  docs   https://zigbox.github.io/zigbox/errors/E0608.html
+  docs   https://zigbox.org/errors/E0608.html

@@ -171,7 +171,7 @@ error[ZBX-E0905]: no trusted signature covers what was to run
   fix    sign it with a key the policy lists:   zbx sign docker.io/library/busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
          or add the signer's key to the policy file
   more   zbx explain E0905 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0905.html
+  docs   https://zigbox.org/errors/E0905.html
 ```
 
 `zbx policy check <image>` says what the policy would decide, without running anything, and

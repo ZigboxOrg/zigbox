@@ -4,4 +4,4 @@ error[ZBX-E0810]: the Dockerfile can't be read
   path   Dockerfile
   fix    name the Dockerfile, or run zbx import in its directory:   zbx import docker/app.Dockerfile --context .
   more   zbx explain E0810
-  docs   https://zigbox.github.io/zigbox/errors/E0810.html
+  docs   https://zigbox.org/errors/E0810.html
