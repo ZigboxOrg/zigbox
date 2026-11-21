@@ -1124,7 +1124,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q rpm shellcheck
       - name: ShellCheck
-        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/package-refresh.sh .github/package-refresh-test.sh
+        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/actions/tap-formula/check-diff.sh .github/package-refresh.sh .github/package-refresh-test.sh
       - name: Every local action loads from the workflow's commit
         run: |
           # A release commit predates later tooling fixes, so `./.github/actions/...` (resolved in
@@ -1151,7 +1151,7 @@ jobs:
         run: .github/release-sign-test.sh "$RUNNER_TEMP/out"
       - name: The draft check passes the honest draft and refuses tampered ones
         run: .github/release-prepare-test.sh "$RUNNER_TEMP/out"
-      - name: The tap check refuses a formula whose url is not the release's zip
+      - name: The tap check refuses a wrong url, and a formula that differs from the tap's where it may not
         run: .github/tap-formula-test.sh
       - name: Refresh and refuse with a throwaway key
         run: .github/package-refresh-test.sh "$RUNNER_TEMP/refresh"
