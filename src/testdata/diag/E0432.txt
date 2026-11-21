@@ -4,4 +4,4 @@ error[ZBX-E0432]: a restore would overwrite something that is back in the store
          in the store again (1 in all); nothing was moved
   fix    drop the roots that brought them back and gc again, or let the trash expire:   zbx store gc --trash
   more   zbx explain E0432 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0432.html
+  docs   https://zigbox.org/errors/box/E0432.html

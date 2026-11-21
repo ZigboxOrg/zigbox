@@ -6,4 +6,4 @@ error[ZBX-E0802]: the build graph is invalid
   at     line 4, column 77
   fix    remove a need that closes the round, such as "b" from step "a"'s .needs
   more   zbx explain E0802
-  docs   https://zigbox.org/errors/E0802.html
+  docs   https://zigbox.org/errors/box/E0802.html

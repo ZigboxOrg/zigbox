@@ -10,4 +10,4 @@ error[ZBX-E0223]: the working directory is not in the container
   fix    make it first:   zbx exec web-1 -- mkdir -p /nowhere
          or name one the container has: --workdir /
   more   zbx explain E0223
-  docs   https://zigbox.org/errors/E0223.html
+  docs   https://zigbox.org/errors/box/E0223.html

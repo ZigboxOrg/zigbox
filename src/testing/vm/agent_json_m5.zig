@@ -531,7 +531,7 @@ const missing_pasta = "{\"code\":\"ZBX-E0601\",\"severity\":\"error\",\"blame\":
     "\"command\":\"sudo apt install passt\",\"needs_root\":true}," ++
     "{\"sentence\":\"or run with the host's network:\"," ++
     "\"command\":\"zbx run --net host alpine -- sh\",\"template\":true}]," ++
-    "\"docs\":\"https://zigbox.org/errors/E0601.html\"," ++
+    "\"docs\":\"https://zigbox.org/errors/box/E0601.html\"," ++
     "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}\n";
 
 test "a missing pasta is read from the diagnostic's code and fixes, and their flags" {

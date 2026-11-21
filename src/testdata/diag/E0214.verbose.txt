@@ -4,4 +4,4 @@ error[ZBX-E0214]: a --mount source can't be used
   path   missing
   fix    zbx never makes a source: make it, or check the spelling
   more   zbx explain E0214
-  docs   https://zigbox.org/errors/E0214.html
+  docs   https://zigbox.org/errors/box/E0214.html

@@ -273,7 +273,7 @@ test "E1203 after a lie names it, and says no deadline passed" {
         "  cause  no source sent bytes that match chunk 3's hash; the reading process got\n";
     const tail = "  fix    tell the owner of the source that sent wrong bytes\n" ++
         "  more   zbx explain E1203 · rerun with --verbose for the full cause chain\n" ++
-        "  docs   https://zigbox.org/errors/E1203.html\n";
+        "  docs   https://zigbox.org/errors/box/E1203.html\n";
     given.outcomes[0] = .lied;
     try expect_rendered(&given, head ++ "         EIO (registry: sent wrong bytes)\n" ++ tail);
     given.outcomes[0] = .lied_before;
@@ -309,7 +309,7 @@ test "E0417 for a held chunk names the step, its path in the store and the kerne
     const head = "error[ZBX-E0417]: can't write the store\n";
     const tail = "  fix    check that you can write to the store directory, and the disk\n" ++
         "  more   zbx explain E0417 · rerun with --verbose for the full cause chain\n" ++
-        "  docs   https://zigbox.org/errors/E0417.html\n";
+        "  docs   https://zigbox.org/errors/box/E0417.html\n";
     try expect_rendered(&given, head ++
         "  cause  setting an extended attribute of the object in tmp/ failed: operation\n" ++
         "         not permitted (EPERM)\n" ++ tail);

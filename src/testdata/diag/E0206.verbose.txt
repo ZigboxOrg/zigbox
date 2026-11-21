@@ -5,4 +5,4 @@ error[ZBX-E0206]: invalid container name
   name   Web_1
   fix    a valid name looks like this:   zbx run --name web-1 --rootfs ./alpine -- /bin/sh
   more   zbx explain E0206
-  docs   https://zigbox.org/errors/E0206.html
+  docs   https://zigbox.org/errors/box/E0206.html

@@ -6,4 +6,4 @@ error[ZBX-E1208]: --lazy does not work with another option given
   arg    --rootfs
   fix    leave out --lazy, or the other option
   more   zbx explain E1208
-  docs   https://zigbox.org/errors/E1208.html
+  docs   https://zigbox.org/errors/box/E1208.html

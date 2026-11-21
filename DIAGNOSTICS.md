@@ -25,7 +25,7 @@ error[ZBX-E0101]: can't create a user namespace
   fix    allow zbx only:   sudo zbx doctor --fix apparmor
          or system-wide:   sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
   more   zbx explain E0101 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0101.html
+  docs   https://zigbox.org/errors/box/E0101.html
 ```
 
 With `--verbose`, the same diagnostic adds the cause chain (each layer that wrapped the failure, outermost first) and context fields:

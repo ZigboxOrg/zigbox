@@ -3,4 +3,4 @@ error[ZBX-E0403]: can't signal the container
          reused
   fix    look at the process:   ps -o pid,user,stat,args -p <pid>
   more   zbx explain E0403 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0403.html
+  docs   https://zigbox.org/errors/box/E0403.html

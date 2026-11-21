@@ -4,4 +4,4 @@ error[ZBX-E0412]: not a digest
   arg    12345
   fix    list the digests the store keeps:   zbx store ls
   more   zbx explain E0412
-  docs   https://zigbox.org/errors/E0412.html
+  docs   https://zigbox.org/errors/box/E0412.html

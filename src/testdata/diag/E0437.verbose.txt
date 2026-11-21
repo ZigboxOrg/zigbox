@@ -6,4 +6,4 @@ error[ZBX-E0437]: an image record from a peer was not taken
   path   /data/store
   fix    ask the peer for the record of the tree that was fetched
   more   zbx explain E0437
-  docs   https://zigbox.org/errors/E0437.html
+  docs   https://zigbox.org/errors/box/E0437.html

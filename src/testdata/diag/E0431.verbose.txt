@@ -9,4 +9,4 @@ error[ZBX-E0431]: the store changed since that gc plan was made
   now    b3:d6502e06b87bf0d461398667ba0cdb7cc35332cdcfb0c6aefc0bceaae7e339ea
   fix    read the plan again, and confirm that one if it is right:   zbx store gc --confirm b3:d6502e06b87bf0d461398667ba0cdb7cc35332cdcfb0c6aefc0bceaae7e339ea
   more   zbx explain E0431
-  docs   https://zigbox.org/errors/E0431.html
+  docs   https://zigbox.org/errors/box/E0431.html

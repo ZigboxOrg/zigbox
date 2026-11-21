@@ -6,4 +6,4 @@ error[ZBX-E0314]: --shm-size is larger than --memory
   memory 134217728
   fix    raise --memory, or lower --shm-size to at most it:   zbx run --rootfs ./alpine --memory 512m --shm-size 256m -- /bin/sh
   more   zbx explain E0314
-  docs   https://zigbox.org/errors/E0314.html
+  docs   https://zigbox.org/errors/box/E0314.html

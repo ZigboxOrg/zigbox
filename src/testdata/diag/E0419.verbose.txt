@@ -5,4 +5,4 @@ error[ZBX-E0419]: can't run the store worker
          permitted?
   fix    see what this host allows:   zbx doctor
   more   zbx explain E0419
-  docs   https://zigbox.org/errors/E0419.html
+  docs   https://zigbox.org/errors/box/E0419.html

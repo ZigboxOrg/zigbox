@@ -6,4 +6,4 @@ error[ZBX-E0519]: zbx.lock and the store disagree about an image
   fix    to take the store's image, pull again and let the lock follow:   zbx pull 'registry.test/fixture/open:3.20'
          or put the tree the lock names back, from version control
   more   zbx explain E0519 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0519.html
+  docs   https://zigbox.org/errors/box/E0519.html

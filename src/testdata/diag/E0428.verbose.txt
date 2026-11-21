@@ -5,4 +5,4 @@ error[ZBX-E0428]: the upper layer uses an overlayfs feature a commit can't follo
   path   /home/alice/.local/state/zbx/containers/web-1/upper/renamed
   fix    run the container again; zbx's own mounts make no redirects
   more   zbx explain E0428
-  docs   https://zigbox.org/errors/E0428.html
+  docs   https://zigbox.org/errors/box/E0428.html

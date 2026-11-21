@@ -5,4 +5,4 @@ error[ZBX-E0013]: mounts that cannot go together
   arg    /scratch/in
   fix    give each mount a path of its own, or drop one
   more   zbx explain E0013
-  docs   https://zigbox.org/errors/E0013.html
+  docs   https://zigbox.org/errors/box/E0013.html

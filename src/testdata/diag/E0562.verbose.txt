@@ -5,4 +5,4 @@ error[ZBX-E0562]: service account key files are not supported
   fix    use workload identity federation: an external_account file, with no key
          then delete the key: anyone who has it is the service account
   more   zbx explain E0562
-  docs   https://zigbox.org/errors/E0562.html
+  docs   https://zigbox.org/errors/box/E0562.html

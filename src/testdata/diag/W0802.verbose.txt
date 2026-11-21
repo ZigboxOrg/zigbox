@@ -5,4 +5,4 @@ warning[ZBX-W0802]: the build has steps with cache mounts
   steps  2
   fix    keep each cache to what the command verifies or rebuilds, and do not let its output depend on what was in it
   more   zbx explain W0802
-  docs   https://zigbox.org/errors/W0802.html
+  docs   https://zigbox.org/errors/box/W0802.html

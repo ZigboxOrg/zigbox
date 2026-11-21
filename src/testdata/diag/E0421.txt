@@ -3,4 +3,4 @@ error[ZBX-E0421]: no data directory to keep the store in
          in
   fix    name one:   export XDG_DATA_HOME=$HOME/.local/share
   more   zbx explain E0421 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0421.html
+  docs   https://zigbox.org/errors/box/E0421.html

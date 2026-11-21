@@ -4,4 +4,4 @@ error[ZBX-E0401]: a time is not a number of milliseconds
   value  soon
   fix    give a time in milliseconds:   zbx stop web-1 --grace 5000
   more   zbx explain E0401
-  docs   https://zigbox.org/errors/E0401.html
+  docs   https://zigbox.org/errors/box/E0401.html

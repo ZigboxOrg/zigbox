@@ -3,4 +3,4 @@ error[ZBX-E0217]: the container has no log
          log could not be written, or it was removed
   fix    run it again to get a log:   zbx run -d --name <name> <image>
   more   zbx explain E0217 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0217.html
+  docs   https://zigbox.org/errors/box/E0217.html

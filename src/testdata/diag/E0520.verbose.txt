@@ -10,4 +10,4 @@ error[ZBX-E0520]: the image zbx.lock names is not in the store
   path   /home/alice/project/zbx.lock
   fix    fetch the locked image:   zbx pull 'registry.test/fixture/open@sha256:1111111111111111111111111111111111111111111111111111111111111111'
   more   zbx explain E0520
-  docs   https://zigbox.org/errors/E0520.html
+  docs   https://zigbox.org/errors/box/E0520.html

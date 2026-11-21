@@ -5,4 +5,4 @@ error[ZBX-E0532]: the ECR repository does not exist
   repo   fixture/cdn
   fix    check the repository's name, and that the registry's region is right
   more   zbx explain E0532
-  docs   https://zigbox.org/errors/E0532.html
+  docs   https://zigbox.org/errors/box/E0532.html

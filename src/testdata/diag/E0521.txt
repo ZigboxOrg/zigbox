@@ -3,4 +3,4 @@ error[ZBX-E0521]: the image's user is not in the image
          entry for
   fix    the image's configuration is wrong; try another tag of it
   more   zbx explain E0521 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0521.html
+  docs   https://zigbox.org/errors/box/E0521.html

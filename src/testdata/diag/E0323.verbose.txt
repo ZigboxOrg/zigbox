@@ -10,4 +10,4 @@ error[ZBX-E0323]: the container's cgroup view could not be mounted
   fix    look for the policy that denies it:   sudo dmesg | grep -iE 'apparmor|seccomp|selinux|userns'
          check what this host allows:          zbx doctor
   more   zbx explain E0323
-  docs   https://zigbox.org/errors/E0323.html
+  docs   https://zigbox.org/errors/box/E0323.html

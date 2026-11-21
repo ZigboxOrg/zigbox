@@ -3,4 +3,4 @@ error[ZBX-E0606]: --listen is refused with these options
          container with a network reaches the host without it
   fix    hand the listener to the Unix socket you pass down as descriptor 3:   zbx run --listen 127.0.0.1:8080 --listen-send 3 alpine -- sh
   more   zbx explain E0606 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0606.html
+  docs   https://zigbox.org/errors/box/E0606.html

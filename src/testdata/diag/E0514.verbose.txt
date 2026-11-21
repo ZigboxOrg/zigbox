@@ -5,4 +5,4 @@ error[ZBX-E0514]: not a registry mirror
   mirror bad host
   fix    write the list as host[:port],host[:port]:   ZBX_REGISTRY_MIRRORS=mirror.gcr.io zbx pull alpine:3.20
   more   zbx explain E0514
-  docs   https://zigbox.org/errors/E0514.html
+  docs   https://zigbox.org/errors/box/E0514.html

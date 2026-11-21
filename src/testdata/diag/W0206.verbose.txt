@@ -5,4 +5,4 @@ warning[ZBX-W0206]: the terminal was not logged
   name   web-1
   fix    run it detached, or with the output sent to a file or a pipe, to log it:   zbx run -d --name <name> <image>
   more   zbx explain W0206
-  docs   https://zigbox.org/errors/W0206.html
+  docs   https://zigbox.org/errors/box/W0206.html

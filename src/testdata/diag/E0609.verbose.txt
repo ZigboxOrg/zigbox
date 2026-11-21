@@ -5,4 +5,4 @@ error[ZBX-E0609]: the listener could not be handed on to --listen-send
   result the container was stopped
   fix    keep the other end of the socket open until zbx has sent the listener
   more   zbx explain E0609
-  docs   https://zigbox.org/errors/E0609.html
+  docs   https://zigbox.org/errors/box/E0609.html

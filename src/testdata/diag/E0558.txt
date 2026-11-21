@@ -2,4 +2,4 @@ error[ZBX-E0558]: the password file or input is unsafe or unusable
   cause  /open can be read by other users
   fix    make it private to you:   chmod 600 /open
   more   zbx explain E0558 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0558.html
+  docs   https://zigbox.org/errors/box/E0558.html

@@ -4,4 +4,4 @@ error[ZBX-E1002]: the virtual machine did not start
   fix    read how far the guest got:   tail -n 20 '/Users/ada/Library/Application Support/zbx/vm/console.log'
          or try a smaller size:        zbx vm config --memory 1G
   more   zbx explain E1002 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E1002.html
+  docs   https://zigbox.org/errors/box/E1002.html

@@ -4,4 +4,4 @@ warning[ZBX-W1201]: the image has no lazy index: pulling it whole
   image  registry.example/team/app:1
   fix    nothing to do: the image is pulled whole, then run
   more   zbx explain W1201
-  docs   https://zigbox.org/errors/W1201.html
+  docs   https://zigbox.org/errors/box/W1201.html

@@ -3,4 +3,4 @@ error[ZBX-E0216]: the --user is not in the image
          registry.test/fixture/service:3.20 has no entry for
   fix    use a name the image has, or a number: --user 1000
   more   zbx explain E0216 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0216.html
+  docs   https://zigbox.org/errors/box/E0216.html

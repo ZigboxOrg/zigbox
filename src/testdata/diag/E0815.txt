@@ -3,4 +3,4 @@ error[ZBX-E0815]: the Dockerfile is larger than a build file holds
          limit
   fix    move the text into a script in the context and COPY it
   more   zbx explain E0815 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0815.html
+  docs   https://zigbox.org/errors/box/E0815.html

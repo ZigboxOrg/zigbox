@@ -6,4 +6,4 @@ error[ZBX-E0229]: devices are not available on this platform
   option --gpu
   fix    run the container on a Linux machine (with a GPU, for --gpu), or leave the option out
   more   zbx explain E0229
-  docs   https://zigbox.org/errors/E0229.html
+  docs   https://zigbox.org/errors/box/E0229.html

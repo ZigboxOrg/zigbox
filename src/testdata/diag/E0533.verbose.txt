@@ -5,4 +5,4 @@ error[ZBX-E0533]: the web identity token file can't be read
   fix    check that the file exists, is readable by this user, and is not empty
          in GitHub Actions the job needs 'permissions: id-token: write'
   more   zbx explain E0533
-  docs   https://zigbox.org/errors/E0533.html
+  docs   https://zigbox.org/errors/box/E0533.html

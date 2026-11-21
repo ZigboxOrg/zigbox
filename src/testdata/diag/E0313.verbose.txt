@@ -4,4 +4,4 @@ error[ZBX-E0313]: a --shm-size is not valid
   size   256q
   fix    a valid size looks like this:   zbx run --rootfs ./alpine --shm-size 256m -- /bin/sh
   more   zbx explain E0313
-  docs   https://zigbox.org/errors/E0313.html
+  docs   https://zigbox.org/errors/box/E0313.html

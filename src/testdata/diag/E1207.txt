@@ -2,4 +2,4 @@ error[ZBX-E1207]: the image is too large for lazy start
   cause  the image has more than 262144 entries
   fix    run it without --lazy, which reads the whole image first
   more   zbx explain E1207 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E1207.html
+  docs   https://zigbox.org/errors/box/E1207.html

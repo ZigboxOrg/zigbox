@@ -6,4 +6,4 @@ error[ZBX-E0228]: --gpu found no GPU device to give
   gpu    all
   fix    see what this host has, and the fix for each gap:   zbx doctor
   more   zbx explain E0228
-  docs   https://zigbox.org/errors/E0228.html
+  docs   https://zigbox.org/errors/box/E0228.html

@@ -5,7 +5,7 @@ warning[ZBX-W0209]: groups show as nogroup inside the container
          each device
   fix    nothing to do; the groups work, only their names are not shown
   more   zbx explain W0209
-  docs   https://zigbox.org/errors/W0209.html
+  docs   https://zigbox.org/errors/box/W0209.html
 warning[ZBX-W0208]: driver libraries found through LD_LIBRARY_PATH
   while  starting the container
   cause  the image's ldconfig is missing, failed, or ran past its 10 seconds
@@ -13,5 +13,5 @@ warning[ZBX-W0208]: driver libraries found through LD_LIBRARY_PATH
          LD_LIBRARY_PATH instead of the library cache
   fix    nothing to do for an image that finds them; a musl image such as Alpine cannot load glibc driver libraries, use a glibc image
   more   zbx explain W0208
-  docs   https://zigbox.org/errors/W0208.html
+  docs   https://zigbox.org/errors/box/W0208.html
 zbx: note: scope zbx-zbx-9bc203.scope went by itself just after the run ended

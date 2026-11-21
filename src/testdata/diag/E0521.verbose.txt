@@ -6,4 +6,4 @@ error[ZBX-E0521]: the image's user is not in the image
   file   /etc/passwd
   fix    the image's configuration is wrong; try another tag of it
   more   zbx explain E0521
-  docs   https://zigbox.org/errors/E0521.html
+  docs   https://zigbox.org/errors/box/E0521.html

@@ -4,4 +4,4 @@ error[ZBX-E0557]: the export directory exists and is not empty
   path   /out
   fix    name a directory that does not exist, or an empty one
   more   zbx explain E0557
-  docs   https://zigbox.org/errors/E0557.html
+  docs   https://zigbox.org/errors/box/E0557.html

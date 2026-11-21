@@ -9,4 +9,4 @@ warning[ZBX-W0803]: a pinned step drifted, and its new output was used
   output b3:b922cead1d43ac4c5de35fa6c1949849a32f507027021955be167f3023d0fe10
   fix    to accept the new output, delete the pin from zbx.lock and run zbx build --pin, or edit .expect
   more   zbx explain W0803
-  docs   https://zigbox.org/errors/W0803.html
+  docs   https://zigbox.org/errors/box/W0803.html

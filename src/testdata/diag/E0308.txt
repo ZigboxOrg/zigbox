@@ -3,4 +3,4 @@ error[ZBX-E0308]: can't write a limit to the container's cgroup
          controller is not delegated to this user
   fix    check this host (ZBX-E0103):   zbx doctor
   more   zbx explain E0308 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0308.html
+  docs   https://zigbox.org/errors/box/E0308.html

@@ -6,4 +6,4 @@ error[ZBX-E0508]: the registry has no such image
   name   3.20
   fix    check the spelling of the name and the tag
   more   zbx explain E0508
-  docs   https://zigbox.org/errors/E0508.html
+  docs   https://zigbox.org/errors/box/E0508.html

@@ -9,4 +9,4 @@ error[ZBX-E0205]: a container setup step failed
   fix    look for the policy that denies it:   sudo dmesg | grep -iE 'apparmor|seccomp|selinux|userns'
          check what this host allows:          zbx doctor
   more   zbx explain E0205
-  docs   https://zigbox.org/errors/E0205.html
+  docs   https://zigbox.org/errors/box/E0205.html

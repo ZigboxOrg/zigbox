@@ -4,4 +4,4 @@ warning[ZBX-W0811]: parts of the Dockerfile did not carry over
   count  1
   fix    nothing to do unless one matters; the report says what became of each
   more   zbx explain W0811
-  docs   https://zigbox.org/errors/W0811.html
+  docs   https://zigbox.org/errors/box/W0811.html

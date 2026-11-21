@@ -4,4 +4,4 @@ warning[ZBX-W0703]: a file was left out of the export
   path   /pipe
   fix    nothing to do: the archive holds every other file
   more   zbx explain W0703
-  docs   https://zigbox.org/errors/W0703.html
+  docs   https://zigbox.org/errors/box/W0703.html

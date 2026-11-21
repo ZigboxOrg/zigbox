@@ -4,4 +4,4 @@ error[ZBX-E0572]: a Google credential service failed
   status 500
   fix    run the command again; if it repeats, the service or a proxy is at fault
   more   zbx explain E0572
-  docs   https://zigbox.org/errors/E0572.html
+  docs   https://zigbox.org/errors/box/E0572.html

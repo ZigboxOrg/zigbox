@@ -144,7 +144,7 @@ pub const diag_wrap_columns: u32 = 80;
 pub const diag_label_columns: u32 = 9;
 /// Where the generated page of each code is served (zigbox.org, from `ZigboxOrg/website`): the
 /// base ends in "/", and a code's page is the base plus "<code>.html" (src/errors_site.zig).
-pub const docs_url_base = "https://zigbox.org/errors/";
+pub const docs_url_base = "https://zigbox.org/errors/box/";
 /// The base plus "E0001.html", with room to spare.
 pub const docs_url_bytes_max: u32 = 96;
 comptime {

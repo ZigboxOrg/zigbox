@@ -4,4 +4,4 @@ error[ZBX-E0501]: not an image reference
   fix    write it as name[:tag]:   zbx pull alpine:3.20
          or with a registry:       zbx pull ghcr.io/owner/image:v1
   more   zbx explain E0501 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0501.html
+  docs   https://zigbox.org/errors/box/E0501.html

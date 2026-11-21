@@ -5,4 +5,4 @@ error[ZBX-E0317]: a --sysctl net.* key with --net host
   sysctl net.core.somaxconn
   fix    drop --net host, so the container has a network of its own
   more   zbx explain E0317
-  docs   https://zigbox.org/errors/E0317.html
+  docs   https://zigbox.org/errors/box/E0317.html

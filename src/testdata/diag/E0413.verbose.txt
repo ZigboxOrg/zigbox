@@ -4,4 +4,4 @@ error[ZBX-E0413]: can't use the store: its format is unknown
   path   /home/alice/.local/share/zbx/store
   fix    use the zbx that wrote it, or set the store aside to start a new one:   mv '/home/alice/.local/share/zbx/store' '/home/alice/.local/share/zbx/store.old'
   more   zbx explain E0413
-  docs   https://zigbox.org/errors/E0413.html
+  docs   https://zigbox.org/errors/box/E0413.html

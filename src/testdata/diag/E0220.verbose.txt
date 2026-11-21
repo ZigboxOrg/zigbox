@@ -6,4 +6,4 @@ error[ZBX-E0220]: the container is not running
   fix    see the containers and their states:   zbx ps --all
          start it again, then exec into it:     zbx run -d --name web alpine -- sleep 1000
   more   zbx explain E0220
-  docs   https://zigbox.org/errors/E0220.html
+  docs   https://zigbox.org/errors/box/E0220.html

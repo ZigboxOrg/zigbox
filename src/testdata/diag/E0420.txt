@@ -3,4 +3,4 @@ error[ZBX-E0420]: that tree is not a root
          a tree in the store but not a root, so there is nothing to drop
   fix    list the roots:   zbx store ls
   more   zbx explain E0420 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0420.html
+  docs   https://zigbox.org/errors/box/E0420.html

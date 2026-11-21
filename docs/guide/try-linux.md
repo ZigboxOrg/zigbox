@@ -117,7 +117,7 @@ error[ZBX-E0105]: uid and gid mapping is not set up
          install on Debian, Ubuntu:   sudo apt install uidmap
          install on Fedora:           sudo dnf install shadow-utils
   more   zbx explain E0105 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0105.html
+  docs   https://zigbox.org/errors/box/E0105.html
 ```
 
 (The E0103 block is left out here.) The exit code is 0 when every check passes and 2 when one

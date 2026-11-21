@@ -4,4 +4,4 @@ error[ZBX-E0212]: a --mount source is outside the project
   fix    run zbx from the project's directory
          or give a directory elsewhere read-only:   zbx run --bind /path/to/dir:/dir <image>
   more   zbx explain E0212 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E0212.html
+  docs   https://zigbox.org/errors/box/E0212.html

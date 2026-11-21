@@ -1,4 +1,4 @@
-# Error pages move to https://zigbox.org/errors/
+# Error pages move to https://zigbox.org/errors/box/
 
 *Decided 2026-11-21, by the owner.*
 
@@ -9,9 +9,10 @@ never applied to the binaries: 0.3.x to 0.5.x print `https://zigbox.github.io/zi
 ## Decision
 
 - From 0.6.0, every diagnostic's `docs` line, its JSON `docs` field and `zbx explain` name
-  `https://zigbox.org/errors/<code>.html`: `constants.docs_url_base` is
-  `https://zigbox.org/errors/`, and the generated pages' canonical link (`errors_site.zig`
-  `site_url`) is `https://zigbox.org/`.
+  `https://zigbox.org/errors/box/<code>.html`: `constants.docs_url_base` is
+  `https://zigbox.org/errors/box/`, and the generated pages' canonical link (`errors_site.zig`)
+  is `constants.docs_url_base` plus `<code>.html`, so the two always agree.
+- The pages live under `/errors/box/` because zigbox.org's `/errors/` is the website's index of both Zigbox's and Zigcube's codes, and Zigcube's codes share names with Zigbox's (E0001 is both); the website's `deploy.yml` already copies `site/errors/*.html` from Zigbox `main` into `/errors/box/`, so nothing changes in `ZigboxOrg/website`.
 - The goldens and the VM demo expectations that print the address were rewritten with the
   constant. The repository has no golden-update mode (see
   [2026-11-09-m8-slice12-credentials.md](2026-11-09-m8-slice12-credentials.md)), so the old base
@@ -23,7 +24,7 @@ never applied to the binaries: 0.3.x to 0.5.x print `https://zigbox.github.io/zi
   Recordings of real runs (`src/testing/vm/recorded_m2b.zig`, the captured `real_e0213` in
   `agent_json_m6b.zig`), release evidence, demo documents, briefs, older release notes and
   decisions keep the address they recorded.
-- The release's `verify` job checks that `https://zigbox.org/errors/E0001.html` answers 200
+- The release's `verify` job checks that `https://zigbox.org/errors/box/E0001.html` answers 200
   (following zigbox.org's redirect from `.html` to the bare path) after the site deploy.
 
 ## Old links

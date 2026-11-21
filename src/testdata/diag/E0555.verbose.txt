@@ -8,4 +8,4 @@ error[ZBX-E0555]: the registry refused a blob upload
   blob   sha256:645cd3b3d2bb94cb957d9ad8eda4e24bc13ebc28ef39b1a40dd2174763f099ca
   fix    run the same command again; what the registry already holds is not sent twice
   more   zbx explain E0555
-  docs   https://zigbox.org/errors/E0555.html
+  docs   https://zigbox.org/errors/box/E0555.html

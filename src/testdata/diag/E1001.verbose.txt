@@ -5,4 +5,4 @@ error[ZBX-E1001]: this zbx is not allowed to run virtual machines
   fix    if you built zbx from source, sign it from the checkout:   codesign -f -s - --entitlements vm/zbx.entitlements $(which zbx)
          if you installed zbx, reinstall it, which is signed:       brew reinstall zigbox
   more   zbx explain E1001
-  docs   https://zigbox.org/errors/E1001.html
+  docs   https://zigbox.org/errors/box/E1001.html

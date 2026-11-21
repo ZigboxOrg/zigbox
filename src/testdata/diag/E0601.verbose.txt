@@ -4,4 +4,4 @@ error[ZBX-E0601]: pasta is not installed
   fix    install pasta (Debian, Ubuntu):   sudo apt install passt
          or run with the host's network:   zbx run --net host alpine -- sh
   more   zbx explain E0601
-  docs   https://zigbox.org/errors/E0601.html
+  docs   https://zigbox.org/errors/box/E0601.html

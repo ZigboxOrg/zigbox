@@ -5,4 +5,4 @@ error[ZBX-E0908]: zbx verify found a broken link
   link   3
   fix    run 'zbx store verify', remove what is damaged, then pull or build again
   more   zbx explain E0908
-  docs   https://zigbox.org/errors/E0908.html
+  docs   https://zigbox.org/errors/box/E0908.html

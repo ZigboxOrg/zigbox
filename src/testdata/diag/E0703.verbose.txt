@@ -5,4 +5,4 @@ error[ZBX-E0703]: no run record with that name
   name   nothere
   fix    bundle the most recent run:   zbx bundle --last
   more   zbx explain E0703
-  docs   https://zigbox.org/errors/E0703.html
+  docs   https://zigbox.org/errors/box/E0703.html

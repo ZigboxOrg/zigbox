@@ -6,4 +6,4 @@ error[ZBX-E0560]: there are no Google credentials to pull from this registry
   fix    point GOOGLE_APPLICATION_CREDENTIALS at a workload identity federation file
          or pull on Google Compute Engine with a service account
   more   zbx explain E0560
-  docs   https://zigbox.org/errors/E0560.html
+  docs   https://zigbox.org/errors/box/E0560.html

@@ -5,4 +5,4 @@ error[ZBX-E1203]: a chunk could not be fetched: the read got EIO
   object b3:5555555555555555555555555555555555555555555555555555555555555555
   fix    check the network and the registry, then read the file again
   more   zbx explain E1203
-  docs   https://zigbox.org/errors/E1203.html
+  docs   https://zigbox.org/errors/box/E1203.html

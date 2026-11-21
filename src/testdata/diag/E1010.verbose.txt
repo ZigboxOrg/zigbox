@@ -5,4 +5,4 @@ error[ZBX-E1010]: the virtual machine's command service did not answer
   fix    stop the machine; the next command starts a fresh one:   zbx vm stop
          read how far the guest got:                              tail -n 20 '/Users/ada/Library/Application Support/zbx/vm/console.log'
   more   zbx explain E1010
-  docs   https://zigbox.org/errors/E1010.html
+  docs   https://zigbox.org/errors/box/E1010.html

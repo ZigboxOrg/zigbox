@@ -10,4 +10,4 @@ error[ZBX-E0209]: can't set up the read-only rootfs
   fix    make them as the rootfs's owner:   mkdir -p "/srv/alpine/tmp" "/srv/alpine/run"
          or unpack the rootfs as the user who runs zbx
   more   zbx explain E0209
-  docs   https://zigbox.org/errors/E0209.html
+  docs   https://zigbox.org/errors/box/E0209.html

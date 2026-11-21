@@ -5,4 +5,4 @@ warning[ZBX-W0501]: device nodes in a layer were left out
   path   dev/tty
   fix    nothing to do: a container makes its own /dev
   more   zbx explain W0501
-  docs   https://zigbox.org/errors/W0501.html
+  docs   https://zigbox.org/errors/box/W0501.html

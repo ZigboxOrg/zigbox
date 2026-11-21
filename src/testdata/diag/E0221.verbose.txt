@@ -10,4 +10,4 @@ error[ZBX-E0221]: can't join the running container
   fix    look for the policy that denies it:   sudo dmesg | grep -iE 'apparmor|seccomp|selinux'
          check what this host allows:          zbx doctor
   more   zbx explain E0221
-  docs   https://zigbox.org/errors/E0221.html
+  docs   https://zigbox.org/errors/box/E0221.html

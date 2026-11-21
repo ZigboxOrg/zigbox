@@ -3,4 +3,4 @@ error[ZBX-E1009]: the connection to the virtual machine was lost
   fix    see whether the machine runs:                             zbx vm status
          a container that was detached may still run; list them:   zbx ps
   more   zbx explain E1009 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/E1009.html
+  docs   https://zigbox.org/errors/box/E1009.html

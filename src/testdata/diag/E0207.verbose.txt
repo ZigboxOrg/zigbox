@@ -11,4 +11,4 @@ error[ZBX-E0207]: can't restrict the container's capabilities
   fix    look for the policy that denies it:   sudo dmesg | grep -iE 'apparmor|seccomp|selinux|userns'
          check what this host allows:          zbx doctor
   more   zbx explain E0207
-  docs   https://zigbox.org/errors/E0207.html
+  docs   https://zigbox.org/errors/box/E0207.html

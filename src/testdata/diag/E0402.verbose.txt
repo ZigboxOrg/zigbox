@@ -4,4 +4,4 @@ error[ZBX-E0402]: no container with that name
   name   web-1
   fix    see the containers:   zbx ps --all
   more   zbx explain E0402
-  docs   https://zigbox.org/errors/E0402.html
+  docs   https://zigbox.org/errors/box/E0402.html

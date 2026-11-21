@@ -4,4 +4,4 @@ error[ZBX-E1202]: the image's lazy index was refused
   tree   b3:7777777777777777777777777777777777777777777777777777777777777777
   fix    run it without --lazy, which pulls the whole image
   more   zbx explain E1202
-  docs   https://zigbox.org/errors/E1202.html
+  docs   https://zigbox.org/errors/box/E1202.html

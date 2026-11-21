@@ -3,4 +3,4 @@ warning[ZBX-W1203]: lazy start (--lazy) is not possible on this host
   fix    load the fuse module:   sudo modprobe fuse
          or run without --lazy, which needs no FUSE
   more   zbx explain W1203 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.org/errors/W1203.html
+  docs   https://zigbox.org/errors/box/W1203.html
