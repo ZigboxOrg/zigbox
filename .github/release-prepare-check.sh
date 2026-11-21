@@ -19,6 +19,9 @@
 #                        the built one. The workflow sets it whenever `mac` ran in the same run.
 #   ZIGBOX_SKIP_FRESHNESS  optional: 1 skips the 14-day apt freshness rule, for a caller that
 #                        publishes no apt Release (the `tap` job); the Valid-Until must still be a date.
+#                        It is the tap's mode, so it also requires ZIGBOX_MAC_ZIP_SHA256: the tap
+#                        commits the formula only for a zip pinned by `mac`'s output in this run or,
+#                        on a published release, by the hash `plan` showed the approving owner.
 set -euo pipefail
 # No `set -x`.
 
@@ -38,6 +41,8 @@ fail() { echo "release: $*" >&2; exit 1; }
 [ -z "$mac_pin" ] || [[ "$mac_pin" =~ ^[0-9a-f]{64}$ ]] ||
   fail "ZIGBOX_MAC_ZIP_SHA256 is not 64 lower-case hex digits"
 case "$skip_freshness" in "" | 1) ;; *) fail "ZIGBOX_SKIP_FRESHNESS is 1 or unset, not $skip_freshness" ;; esac
+[ "$skip_freshness" != 1 ] || [ -n "$mac_pin" ] ||
+  fail "a tap run (ZIGBOX_SKIP_FRESHNESS=1) needs ZIGBOX_MAC_ZIP_SHA256, the zip's approved hash"
 [ -s "$keyring" ] || fail "the pinned public key $keyring is missing from the repository"
 dir=$(cd "$dir" && pwd)
 keyring=$(cd "$(dirname "$keyring")" && pwd)/$(basename "$keyring")

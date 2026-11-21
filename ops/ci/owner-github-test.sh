@@ -179,26 +179,44 @@ expect 1 "owner-github: FAIL bot is an owner of ZigboxOrg"
 echo "owner-github-test: ok owner role"
 
 # Member settings that do not stick, or that GitHub does not report: refused before the bot is
-# touched.
+# touched, naming each field with the value seen and its fix, and only those fields.
 world
-put GET orgs/ZigboxOrg 200 "$(jq -c '.members_can_create_pages = true' <<<"$org_good")"
+put GET orgs/ZigboxOrg 200 "$(jq -c '.members_can_create_pages = true
+    | .default_repository_permission = "read"' <<<"$org_good")"
 put PATCH orgs/ZigboxOrg 200 '{}'
 run
-expect 1 "after setting them"
+expect 1 "after setting them: default_repository_permission is \"read\" (gh api -X PATCH \
+orgs/ZigboxOrg -f default_repository_permission=none); members_can_create_pages is true (gh api -X \
+PATCH orgs/ZigboxOrg -F members_can_create_pages=false)"
+[ "$(grep -c 'FAIL' <<<"$out")" = 1 ] || die "more than one FAIL line"
+! grep -q 'FAIL.*members_can_create_repositories' <<<"$out" || die "a field that holds was named"
 called "PATCH orgs/ZigboxOrg" || die "the settings were not set"
 ! called "orgs/ZigboxOrg/memberships/bot" || die "the bot was read before the settings held"
 world
-put GET orgs/ZigboxOrg 200 "$(jq -c 'del(.members_can_fork_private_repositories)' <<<"$org_good")"
+put GET orgs/ZigboxOrg 200 "$(jq -c 'del(.members_can_fork_private_repositories)
+    | .members_can_create_pages = null' <<<"$org_good")"
 put PATCH orgs/ZigboxOrg 200 '{}'
 run
-expect 1 "after setting them"
+expect 1 "after setting them: members_can_create_pages is null (this plan does not offer \
+members_can_create_pages; tell the supervisor); members_can_fork_private_repositories is missing \
+(this plan does not offer members_can_fork_private_repositories; tell the supervisor)"
+! protected || die "main's protection was written with a setting missing"
 echo "owner-github-test: ok member settings"
 
-# A merging account whose write came from the base permission: refused once that is none, with
-# the command that gives it a direct role, before main's protection is written.
+# A merging account whose write came from the base permission: it has write while the base
+# permission is open and read once the PATCH sets it to none. Refused (the check runs after the
+# drop), with the command that gives it a direct role, before main's protection is written.
 world
-put GET repos/ZigboxOrg/zigbox/collaborators/owner/permission 200 '{"permission":"read"}'
+put GET orgs/ZigboxOrg 200 "$org_open"
+put GET orgs/ZigboxOrg.patched 200 "$org_good"
+put PATCH orgs/ZigboxOrg 200 "$org_good"
+put GET repos/ZigboxOrg/zigbox/collaborators/owner/permission 200 '{"permission":"write"}'
+put GET repos/ZigboxOrg/zigbox/collaborators/owner/permission.patched 200 '{"permission":"read"}'
+owner_perm=GET/repos_ZigboxOrg_zigbox_collaborators_owner_permission
+printf '%s\n' "GET/orgs_ZigboxOrg GET/orgs_ZigboxOrg.patched" "$owner_perm $owner_perm.patched" \
+    >"$stub/PATCH/orgs_ZigboxOrg.then"
 run
+called "PATCH orgs/ZigboxOrg" || die "the base permission was not dropped"
 expect 1 "owner has read on ZigboxOrg/zigbox with no base permission, so it cannot merge"
 grep -qF "gh api -X PUT repos/ZigboxOrg/zigbox/collaborators/owner -f permission=write" <<<"$out" ||
     die "the refusal does not say how to give the account a role"

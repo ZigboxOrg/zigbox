@@ -151,11 +151,18 @@ pass "14 days left" "ZIGBOX_NOW=$(( valid_at - 14 * 86400 ))"
 d=$(fresh)
 refuse "13 days left" 'fewer than 14 days are not enough' "$d" "ZIGBOX_NOW=$(( valid_at - 13 * 86400 ))"
 refuse "an expired Release" 'fewer than 14 days are not enough' "$d" "ZIGBOX_NOW=$(( valid_at + 86400 ))"
-# The tap publishes no apt Release: it skips the window, at any age, but nothing else.
-pass "a tap run 8 days after signing" ZIGBOX_SKIP_FRESHNESS=1 "ZIGBOX_NOW=$(( valid_at - 13 * 86400 ))"
-pass "a tap run on an expired Release" ZIGBOX_SKIP_FRESHNESS=1 "ZIGBOX_NOW=$(( valid_at + 30 * 86400 ))"
+# The tap publishes no apt Release: it skips the window, at any age, but nothing else, and only
+# with the zip's approved hash.
+tap_pin="ZIGBOX_MAC_ZIP_SHA256=$honest_sha"
+pass "a tap run 8 days after signing" ZIGBOX_SKIP_FRESHNESS=1 "$tap_pin" \
+  "ZIGBOX_NOW=$(( valid_at - 13 * 86400 ))"
+pass "a tap run on an expired Release" ZIGBOX_SKIP_FRESHNESS=1 "$tap_pin" \
+  "ZIGBOX_NOW=$(( valid_at + 30 * 86400 ))"
+refuse "a tap run without the zip's hash" 'needs ZIGBOX_MAC_ZIP_SHA256' "$(fresh)" ZIGBOX_SKIP_FRESHNESS=1
+refuse "a tap run with an empty zip hash" 'needs ZIGBOX_MAC_ZIP_SHA256' "$(fresh)" ZIGBOX_SKIP_FRESHNESS=1 \
+  ZIGBOX_MAC_ZIP_SHA256=
 d=$(fresh); printf 'x' >> "$(ls "$d"/*_amd64.deb)"
-refuse "a changed deb, freshness skipped" 'does not match SHA256SUMS' "$d" ZIGBOX_SKIP_FRESHNESS=1
+refuse "a changed deb, freshness skipped" 'does not match SHA256SUMS' "$d" ZIGBOX_SKIP_FRESHNESS=1 "$tap_pin"
 refuse "a freshness switch that is not 1" 'is 1 or unset' "$(fresh)" ZIGBOX_SKIP_FRESHNESS=yes
 
 echo "release-prepare-test: all cases passed"

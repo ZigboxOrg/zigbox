@@ -310,10 +310,11 @@ which is false):
   and `tap` refuse a zip that is not that one (the formula's sha256 and both sums files must match
   the zip, so they are pinned with it). On an already published release `mac` does not run, so a
   re-dispatch waits for the owner's approval (`tap-approve`, on the `release` environment) before
-  `tap` runs. Both also re-check the Linux files against `SHA256SUMS` and its signature by the
+  `tap` runs, and `tap` refuses any zip but the one `plan` hashed and showed the owner (its job
+  output), so a zip replaced during the wait is refused. Both also re-check the Linux files against `SHA256SUMS` and its signature by the
   pinned key, the formula's url and version, and that the zip holds only `zbx`; and `tap-formula`
   refuses a formula whose url is not the release's own zip. Left to the approval: on a re-dispatch,
-  the owner approves assets that nothing signed pins, after checking in `plan`'s summary that the
+  the owner approves a zip that nothing signed pins, after checking in `plan`'s summary that the
   run is their own and the zip's hash is the one recorded at release time
   (`docs/releases/automation.md`, "The tap").
 - **So the control is on accounts, not on the protection alone:** Woodpecker only ever knows a

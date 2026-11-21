@@ -71,10 +71,10 @@ release PR merged to main (supervisor; version in build.zig.zon, notes in docs/r
        │              the tap's formula differs only in url, version, sha256 (and the one-off lines)
        ├─ publish     the draft becomes the release; THIS creates the tag, at the release commit
        ├─ tap-approve env release, only when the release was already published (a re-dispatch):
-       │              the owner's approval, nothing else
+       │              the owner's approval of the zip hash `plan` showed, nothing else
        ├─ tap         env release-publish: the published assets checked again (the zip against
-       │              `mac`'s output when `mac` ran), then commit Formula/zigbox.rb to
-       │              ZigboxOrg/homebrew-tap main
+       │              `mac`'s output when `mac` ran, else against `plan`'s; refused with neither),
+       │              then commit Formula/zigbox.rb to ZigboxOrg/homebrew-tap main
        ├─ site        repository_dispatch to ZigboxOrg/website, wait for the deploy
        └─ verify      macos-15 and macos-15-intel: the public zip (signature, Gatekeeper,
                       both architectures, zbx --version), then brew install, zbx --version, brew test
@@ -92,8 +92,8 @@ version, finishes a half-done release:
   its notes are refreshed, its assets are replaced with `--clobber`);
 - the release is already public (`plan` sees it): `draft`, `linux`, `mac`, `prepare`, `publish`
   are skipped, and the run goes on to `tap-approve` (the owner approves the `release`
-  environment: `mac` did not run, so no build hash pins the published zip), `tap`, `site` and
-  `verify`;
+  environment: `mac` did not run, so `plan` hashes the published zip and shows the hash, and
+  `tap` takes only that zip), `tap`, `site` and `verify`;
 - the tag exists at another commit: `plan` refuses, before anything is written.
 
 By hand, the commit is found, not given: it is the commit of `main` that added
@@ -138,8 +138,10 @@ Apple silicon, whose kernel the VM requires.
 `tap` takes the formula from the published release (not from an artifact), checks the published
 assets as `prepare` checked the draft (without the apt freshness window: it publishes no apt
 `Release`, and a re-run may come weeks after the last signing), checks the zip against the hash
-`mac` gave as its job output when `mac` ran in the same run (on an already published release the
-owner's approval of `tap-approve` stands in for it), checks the formula's hash
+`mac` gave as its job output when `mac` ran in the same run, or, on an already published release,
+against the hash `plan` gave as its job output, the one shown to the owner before `tap-approve`
+(so the zip the owner approved is the zip that is tapped: a zip replaced during the wait for
+approval is refused; with neither hash the tap refuses), checks the formula's hash
 against the zip's, fetches the tap's current `Formula/zigbox.rb` through the API, and refuses unless
 the difference is only `url`, `version` and `sha256` lines. The first universal release also
 changes the header comment (and the formula may still drop the `depends_on arch: :arm64` line
@@ -148,7 +150,8 @@ read, so a concurrent change to the formula makes it fail, never overwrite.
 
 **Before you approve `tap-approve`** (only a run on an already published release asks): open the
 run's summary, where `plan` wrote who started the run and the SHA-256 of the Mac zip published now.
-Approve only if both hold, and reject otherwise:
+That hash is enforced: `tap` refuses any zip with another hash, so what you compare below is
+exactly what gets tapped. Approve only if both hold, and reject otherwise:
 
 - **started by** is your own login, for a dispatch you started yourself. A run started by any other
   account (the CI bot's token on the box included) is rejected, whatever it says.

@@ -100,6 +100,9 @@ jobs:
       sha: ${{ steps.plan.outputs.sha }}
       published: ${{ steps.plan.outputs.published }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      # The published zip's SHA-256, the one the owner approves at `tap-approve`; `tap` refuses any
+      # other zip. Empty unless the release was already published (then `mac` gives the hash).
+      zip_sha256: ${{ steps.plan.outputs.zip_sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
       EVENT: ${{ github.event_name }}
@@ -201,7 +204,10 @@ jobs:
             "$GH" release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$zip" \
               --dir "$RUNNER_TEMP/zip" 2> "$err" ||
               fail "could not read $zip of the published $tag: $(head -c 200 "$err")"
-            zip_hash="\`$(sha256sum "$RUNNER_TEMP/zip/$zip" | cut -d ' ' -f 1)\`"
+            zip_sha256=$(sha256sum "$RUNNER_TEMP/zip/$zip" | cut -d ' ' -f 1)
+            [[ "$zip_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "could not hash $zip of the published $tag"
+            echo "zip_sha256=$zip_sha256" >> "$GITHUB_OUTPUT"
+            zip_hash="\`$zip_sha256\` (the tap refuses any other zip)"
           else
             zip_hash="the hash comes from the mac job of this run"
           fi
@@ -841,8 +847,9 @@ jobs:
           echo "publish: $TAG is public, at $SHA"
 
   # A tap on an already published release (a re-dispatch: `mac` did not run in this run, so no
-  # build hash pins the zip) commits assets a write token may have replaced since. The owner
-  # approves it here, on `release`, as for `linux` and `mac`. This job holds no secret and runs
+  # build hash pins the zip) commits assets a write token may have replaced since. `plan` hashes
+  # the published zip and shows the hash; the owner approves that hash here, on `release`, as for
+  # `linux` and `mac`, and `tap` refuses any other zip. This job holds no secret and runs
   # nothing; the tap itself stays on `release-publish`, the one environment with the App's key.
   tap-approve:
     name: approve a tap of a published release
@@ -900,19 +907,19 @@ jobs:
       # signature by the pinned key (the repository's key, never the release's), and the formula's
       # url, version and sha256 against the zip, which must hold only zbx. The Mac zip is not in the
       # signed sums, so the zip must also be the one `mac` built in this run (its job output); on a
-      # published release `mac` did not run, and the owner's approval of `tap-approve` stands in.
+      # published release `mac` did not run, and the zip must be the one `plan` hashed and showed the
+      # owner before the approval of `tap-approve`. No path runs without a hash.
       # The apt freshness window is skipped: this job publishes no apt Release, and a tap re-run
       # may come weeks after the last signing.
       - name: Download the published assets and check them as the draft was
         env:
           GH_TOKEN: ${{ github.token }}
-          ZIGBOX_MAC_ZIP_SHA256: ${{ needs.mac.outputs.zip_sha256 }}
+          ZIGBOX_MAC_ZIP_SHA256: ${{ needs.mac.outputs.zip_sha256 || needs.plan.outputs.zip_sha256 }}
           ZIGBOX_SKIP_FRESHNESS: '1'
-          PUBLISHED: ${{ needs.plan.outputs.published }}
         run: |
           set -euo pipefail
-          if [ "$PUBLISHED" != true ] && [ -z "$ZIGBOX_MAC_ZIP_SHA256" ]; then
-            echo "release: the mac job gave no zip hash" >&2
+          if [ -z "$ZIGBOX_MAC_ZIP_SHA256" ]; then
+            echo "release: no zip hash from the mac job or from plan, so no zip is approved for the tap" >&2
             exit 1
           fi
           mkdir "$RUNNER_TEMP/assets"

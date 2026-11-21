@@ -64,17 +64,29 @@ gh_or_404() {
 echo "owner-github: the bot $BOT_LOGIN: a plain member of $org, with no base permission, $level on $repo only"
 # The organisation's member settings first: from the moment the bot is a member, it holds whatever
 # the base permission grants on every repository, and may create what members may create.
-org_fields='{default_repository_permission, members_can_create_repositories,
-    members_can_create_public_repositories, members_can_create_private_repositories,
-    members_can_create_pages, members_can_fork_private_repositories}'
-org_want='.default_repository_permission == "none" and .members_can_create_repositories == false
-    and .members_can_create_public_repositories == false
-    and .members_can_create_private_repositories == false
-    and .members_can_create_pages == false and .members_can_fork_private_repositories == false'
+# org_wrong JSON: one clause per setting that is missing, null or not as wanted, each with the value
+# seen and its fix, joined with "; " (empty when every setting holds). A setting GitHub does not
+# report is one this organisation's plan does not offer; it fails too (closed), naming the field.
+org_wrong() {
+    jq -r --arg org "$org" '[
+      [ ["default_repository_permission", "none"], ["members_can_create_repositories", false],
+        ["members_can_create_public_repositories", false],
+        ["members_can_create_private_repositories", false], ["members_can_create_pages", false],
+        ["members_can_fork_private_repositories", false] ][]
+      | . as [$f, $want]
+      | (if ($want | type) == "string" then "-f" else "-F" end) as $flag
+      | if ($input | has($f) | not) or $input[$f] == null then
+          (if $input | has($f) then "null" else "missing" end) as $seen
+          | "\($f) is \($seen) (this plan does not offer \($f); tell the supervisor)"
+        elif $input[$f] != $want then
+          "\($f) is \($input[$f] | tojson) (gh api -X PATCH orgs/\($org) \($flag) \($f)=\($want))"
+        else empty end ] | join("; ")' --argjson input "$1" -n
+}
 settings=$(gh api "orgs/$org") ||
     fail "cannot read $org's member settings (gh must be logged in as an owner of $org)"
-if ! jq -e "$org_want" >/dev/null <<<"$settings"; then
-    echo "owner-github: $org's member settings are $(jq -c "$org_fields" <<<"$settings"); setting" \
+wrong=$(org_wrong "$settings") || fail "cannot read $org's member settings as JSON"
+if [ -n "$wrong" ]; then
+    echo "owner-github: $org's member settings: $wrong; setting" \
         "the base permission to none and every member's create and fork rights off (members keep" \
         "what a team or a direct grant gives them)"
     gh api -X PATCH "orgs/$org" -f default_repository_permission=none \
@@ -84,8 +96,8 @@ if ! jq -e "$org_want" >/dev/null <<<"$settings"; then
         fail "could not set $org's member settings"
     settings=$(gh api "orgs/$org") || fail "cannot read $org's member settings back"
 fi
-jq -e "$org_want" >/dev/null <<<"$settings" ||
-    fail "$org's member settings are $(jq -c "$org_fields" <<<"$settings") after setting them"
+wrong=$(org_wrong "$settings") || fail "cannot read $org's member settings as JSON"
+[ -z "$wrong" ] || fail "$org's member settings did not hold after setting them: $wrong"
 
 # Only now, with no base permission, does a merging account's own permission show: one that had
 # write only through the base permission has none any more.
@@ -155,8 +167,8 @@ role=$(gh api "orgs/$org/memberships/$BOT_LOGIN" --jq '"\(.state)/\(.role)"') ||
     fail "cannot read $BOT_LOGIN's membership of $org back"
 [ "$role" = active/member ] || fail "$BOT_LOGIN's membership of $org is $role, not active/member"
 settings=$(gh api "orgs/$org") || fail "cannot read $org's member settings back"
-jq -e "$org_want" >/dev/null <<<"$settings" ||
-    fail "$org's member settings are $(jq -c "$org_fields" <<<"$settings"), not as set"
+wrong=$(org_wrong "$settings") || fail "cannot read $org's member settings back as JSON"
+[ -z "$wrong" ] || fail "$org's member settings are not as set: $wrong"
 prot=$(gh api "repos/$repo/branches/main/protection")
 jq -e --arg bot "$BOT_LOGIN" --argjson users "$owners" --argjson apps "$apps" '
     .enforce_admins.enabled == true
