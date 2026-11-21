@@ -167,7 +167,7 @@ do the same with a private cgroup namespace.
   no `-p`) is version 9 with its forward in `.publish`. The demo starts both, so it reads a v9
   record with a forward and a v10 record. `/dev/fuse` because v0.5.2 binds `/dev/null` and the other
   standard devices itself and refuses them as `--device`.
-- **ci-changes.sh has no separate rules for the policy files, the plan, the child or doctor**
+- **src/ci/changes.zig has no separate rules for the policy files, the plan, the child or doctor**
   (slice 3). They fall through to the rule that selects every demo, `m2b` among them; the table
   test pins that for `sysctls.zon`, `plan.zig` and `doctor.zig`.
 

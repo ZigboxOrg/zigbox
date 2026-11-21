@@ -278,10 +278,10 @@ test {
     _ = @import("runtime/knobs_tests.zig");
     _ = @import("runtime/listen_tests.zig");
     _ = @import("runtime/hosts_file_tests.zig");
-    // CI path selection (`.github/ci-changes.sh`).
-    _ = @import("ci_changes_tests.zig");
     // The git backup's copy job (`ops/backup/sync.sh`).
     _ = @import("backup_sync_tests.zig");
+    // The owner's GitHub side of the CI box (`ops/ci/owner-github.sh`).
+    _ = @import("owner_github_tests.zig");
 }
 
 test {

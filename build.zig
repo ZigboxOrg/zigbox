@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     add_trust_wasm_step(b);
     add_dbus_live_step(b, options);
     add_check_step(b, fuzz);
+    add_ci_steps(b);
     add_vm_kernel_steps(b);
 }
 
@@ -311,6 +312,7 @@ const roots = [_][]const u8{
     "src/package_main.zig",
     "src/release_assets_main.zig",
     "src/tidy.zig",
+    "src/ci_main.zig",
     "src/fuzz.zig",
     "src/size_check.zig",
     "src/release_evidence.zig",
@@ -347,6 +349,7 @@ const linux_only = [_][]const u8{
     "src/testing/vm/main_c4.zig",
     "src/testing/vm/main_z7.zig",
     "src/testing/vm/main_m8_packages.zig",
+    "src/ci_main.zig",
     "src/testing/vm/main_top20.zig",
     "src/main.zig",
     "src/zigbox.zig",
@@ -1122,6 +1125,86 @@ fn add_check_step(b: *std.Build, fuzz: *std.Build.Step.Compile) void {
     }
     const step = b.step("check", "Every gate, then the test suite as a non-root user; one line");
     step.dependOn(&run.step);
+}
+
+const CiCommand = struct { name: []const u8, help: []const u8, args: []const []const u8 };
+/// The `zig build` steps that run the CI driver, and the driver command each runs.
+const ci_commands = [_]CiCommand{
+    .{
+        .name = "ci-changes",
+        .help = "Which gates and demos a change runs",
+        .args = &.{"changes"},
+    },
+    .{
+        .name = "ci-build",
+        .help = "CI gate: build, release, trust-wasm, fuzz-macos",
+        .args = &.{ "gate", "build" },
+    },
+    .{ .name = "ci-tidy", .help = "CI gate: tidy", .args = &.{ "gate", "tidy" } },
+    .{ .name = "ci-test", .help = "CI gate: test", .args = &.{ "gate", "test" } },
+    .{
+        .name = "ci-errors-site",
+        .help = "CI gate: errors-site-check",
+        .args = &.{ "gate", "errors-site" },
+    },
+    .{
+        .name = "ci-fuzz",
+        .help = "CI gate: every fuzzer but provenance",
+        .args = &.{ "gate", "fuzz" },
+    },
+    .{
+        .name = "ci-fuzz-provenance",
+        .help = "CI gate: the provenance fuzzer, random seed",
+        .args = &.{ "gate", "fuzz-provenance" },
+    },
+    .{
+        .name = "ci-dbus-live",
+        .help = "CI gate: dbus-live in a session bus",
+        .args = &.{ "gate", "dbus-live" },
+    },
+    .{
+        .name = "ci-demos",
+        .help = "Run the VM demos a change can affect (--demo ID: one)",
+        .args = &.{"demos"},
+    },
+    .{
+        .name = "vm-branch",
+        .help = "Run a vm/* or vmw/* <demo>-<slug> branch's demos",
+        .args = &.{"vm-branch"},
+    },
+    .{
+        .name = "vm-branch-delete",
+        .help = "Delete a vm/* or vmw/* scratch branch (GITHUB_TOKEN)",
+        .args = &.{"delete-branch"},
+    },
+};
+
+/// What CI runs, as build steps (src/ci_main.zig, docs/decisions/2026-11-19-ci-on-woodpecker.md):
+/// the YAML of the self-hosted CI is one `zig build` line per step. The driver runs the work as
+/// nested `zig build` commands with this build's own `zig`, so none of it is in the YAML. Each
+/// step takes the change after `--` (`--event`, `--branch`, `--labels`, `--files`, `--files-from`,
+/// `--files-json`, `--stdin`), and its Woodpecker variables when it is not given.
+fn add_ci_steps(b: *std.Build) void {
+    const tool = b.addExecutable(.{
+        .name = "ci",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ci_main.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const cache_help = "ci-demos, vm-branch: a directory that keeps the VM downloads between runs";
+    const vm_cache = b.option([]const u8, "vm-cache", cache_help);
+    for (ci_commands) |command| {
+        const run = b.addRunArtifact(tool);
+        run.setCwd(b.path("."));
+        run.addArgs(&.{ "--zig", b.graph.zig_exe });
+        if (vm_cache) |dir| run.addArgs(&.{ "--vm-cache", dir });
+        run.addArgs(command.args);
+        run.addPassthruArgs();
+        run.has_side_effects = true;
+        b.step(command.name, command.help).dependOn(&run.step);
+    }
 }
 
 /// Where the VM's kernel `Image` lives between builds: large, so under the cache, and found by

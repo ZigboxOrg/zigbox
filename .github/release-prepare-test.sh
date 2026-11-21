@@ -70,6 +70,34 @@ d=$(fresh); tgz=$(ls "$d"/zbx-*-linux-x86_64.tar.gz); printf 'x' >> "$tgz"
 (cd "$d" && grep -v -F "${tgz##*/}" SHA256SUMS > s; sha256sum "${tgz##*/}" >> s; mv s SHA256SUMS)
 refuse "an edited SHA256SUMS" 'gpg refused SHA256SUMS.asc' "$d"
 
+# The Mac files, which the signed sums do not cover: the formula and the zip must still agree, and
+# the formula must name this release's zip (what the tap job re-checks on a published release).
+d=$(fresh); sed -i 's|releases/download/|releases/download/x|' "$d/zigbox.rb"
+refuse "a formula with another url" "formula's url is not" "$d"
+
+d=$(fresh); sed -i 's|^  sha256 ".*|  sha256 "0000000000000000000000000000000000000000000000000000000000000000"|' "$d/zigbox.rb"
+refuse "a formula with another sha256" "formula's sha256 is not" "$d"
+
+d=$(fresh); (cd "$work" && printf 'x' > evil && python3 -I -c \
+  'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); z.write("zbx"); z.write("evil"); z.close()' "$d/$zip")
+(cd "$d" && sha256sum "$zip" > "$zip.sha256" && cp "$zip.sha256" SHA256SUMS.macos &&
+  sed -i "s|^  sha256 .*|  sha256 \"$(cut -d ' ' -f 1 "$zip.sha256")\"|" zigbox.rb)
+refuse "a zip that holds more than zbx" "holds more than zbx" "$d"
+
+# The build's own hash (the `mac` job's output): the honest zip passes; a zip swapped together
+# with its .sha256, SHA256SUMS.macos and the formula passes every other check and is refused here.
+honest_sha=$(cut -d ' ' -f 1 "$draft/$zip.sha256")
+pass "the zip the mac job built" "ZIGBOX_MAC_ZIP_SHA256=$honest_sha"
+d=$(fresh); (cd "$work" && printf 'zbx-evil' > zbx && python3 -I -c \
+  'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],"w"); z.write("zbx"); z.close()' "$d/$zip")
+(cd "$d" && sha256sum "$zip" > "$zip.sha256" && cp "$zip.sha256" SHA256SUMS.macos &&
+  sed -i "s|^  sha256 .*|  sha256 \"$(cut -d ' ' -f 1 "$zip.sha256")\"|" zigbox.rb)
+run "$d" > "$work/log" || { cat "$work/log" >&2; die "the consistent swap should pass without the pin"; }
+echo "ok: accepted without the pin: a consistently swapped zip, sums and formula"
+refuse "a consistently swapped zip, sums and formula" 'not the one the mac job built' "$d" \
+  "ZIGBOX_MAC_ZIP_SHA256=$honest_sha"
+refuse "a malformed build hash" 'not 64 lower-case hex digits' "$(fresh)" "ZIGBOX_MAC_ZIP_SHA256=xyz"
+
 d=$(fresh); rpms=("$d"/*.rpm); rm "${rpms[0]}"
 refuse "a missing file" 'not exactly' "$d"
 
@@ -123,5 +151,18 @@ pass "14 days left" "ZIGBOX_NOW=$(( valid_at - 14 * 86400 ))"
 d=$(fresh)
 refuse "13 days left" 'fewer than 14 days are not enough' "$d" "ZIGBOX_NOW=$(( valid_at - 13 * 86400 ))"
 refuse "an expired Release" 'fewer than 14 days are not enough' "$d" "ZIGBOX_NOW=$(( valid_at + 86400 ))"
+# The tap publishes no apt Release: it skips the window, at any age, but nothing else, and only
+# with the zip's approved hash.
+tap_pin="ZIGBOX_MAC_ZIP_SHA256=$honest_sha"
+pass "a tap run 8 days after signing" ZIGBOX_SKIP_FRESHNESS=1 "$tap_pin" \
+  "ZIGBOX_NOW=$(( valid_at - 13 * 86400 ))"
+pass "a tap run on an expired Release" ZIGBOX_SKIP_FRESHNESS=1 "$tap_pin" \
+  "ZIGBOX_NOW=$(( valid_at + 30 * 86400 ))"
+refuse "a tap run without the zip's hash" 'needs ZIGBOX_MAC_ZIP_SHA256' "$(fresh)" ZIGBOX_SKIP_FRESHNESS=1
+refuse "a tap run with an empty zip hash" 'needs ZIGBOX_MAC_ZIP_SHA256' "$(fresh)" ZIGBOX_SKIP_FRESHNESS=1 \
+  ZIGBOX_MAC_ZIP_SHA256=
+d=$(fresh); printf 'x' >> "$(ls "$d"/*_amd64.deb)"
+refuse "a changed deb, freshness skipped" 'does not match SHA256SUMS' "$d" ZIGBOX_SKIP_FRESHNESS=1 "$tap_pin"
+refuse "a freshness switch that is not 1" 'is 1 or unset' "$(fresh)" ZIGBOX_SKIP_FRESHNESS=yes
 
 echo "release-prepare-test: all cases passed"

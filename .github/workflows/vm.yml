@@ -6,9 +6,14 @@
 # A newer push to the same branch cancels the run it supersedes. See AGENTS.md, "Git".
 name: vm
 
+# GitHub runs vm/* (docs/decisions/2026-11-19-ci-on-woodpecker.md): the box's Woodpecker runs only
+# vmw/* (.woodpecker/vm.yaml) until a pull-request pipeline is green there, so each branch has one
+# runner and one deleter. vm/top20-* is top20.yml's. By hand (`gh workflow run vm.yml --ref
+# vm/<demo>-<slug>`) it runs only on a vm/* ref: on any other it fails at once and deletes nothing.
 on:
   push:
     branches: ['vm/**', '!vm/top20-**']
+  workflow_dispatch:
 
 concurrency:
   group: vm-${{ github.ref }}
@@ -35,6 +40,12 @@ jobs:
       ZBX_GAR_REGISTRY: ${{ vars.ZBX_GAR_REGISTRY }}
       ZBX_GCR_REGISTRY: ${{ vars.ZBX_GCR_REGISTRY }}
     steps:
+      # A run started by hand on main or a session's branch must neither run nor delete it.
+      - name: Refuse a branch that is not vm/*
+        if: ${{ !startsWith(github.ref, 'refs/heads/vm/') }}
+        run: |
+          echo "vm: $GITHUB_REF is not a vm/<demo>-<slug> branch; nothing runs and nothing is deleted"
+          exit 1
       # The whole history: demo-m3 and later build an older release for the upgrade test.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,6 +56,8 @@ jobs:
         uses: ./.github/actions/m6d-setup
         with:
           fork: 'false'
+      # Before the demo is picked: the deleter at the end is the driver, built with this Zig.
+      - uses: ./.github/actions/setup-zig
       - name: Which demo
         id: pick
         env:
@@ -75,7 +88,6 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: ./.github/actions/setup-zig
       - name: Install QEMU
         uses: ./.github/actions/install-apt
         with:
@@ -142,8 +154,24 @@ jobs:
             ./zig-out/bin/zbx push --username "$ZBX_PUSH_USER" --password-stdin \
               "$digest" "$ref"
       # Not on cancel: a newer push to the branch superseded this run and still needs the branch.
+      # Only on a vm/* ref, and through the driver's delete-branch, which refuses any other branch
+      # as well (src/ci_main.zig).
       - name: Delete the scratch branch
-        if: success() || failure()
+        if: (success() || failure()) && startsWith(github.ref, 'refs/heads/vm/')
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/${{ github.ref_name }}"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # The driver needs this branch's build.zig to compile; when it cannot, the REST call
+          # does the same (the step's `if` has already limited the ref to vm/*). A 404 or 422 is
+          # a branch already gone; anything else, a 401 or 403 included, fails the step.
+          if ! zig build vm-branch-delete -- "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+            echo "the driver could not delete $GITHUB_REF_NAME; deleting it through the API"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME")
+            case "$code" in
+              204|404|422) echo "delete: HTTP $code" ;;
+              *) echo "delete: HTTP $code: the token may not delete $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          fi

@@ -1,0 +1,103 @@
+# The code gates of .github/workflows/ci.yml (build, tidy, test, errors-site, fuzz, fuzz-provenance,
+# dbus-live) on the fleet box's Woodpecker (ops/ci/README.md). Each step is one `zig build ci-<gate>`:
+# the build decides from CI_PIPELINE_FILES, CI_PIPELINE_EVENT and the labels whether the change
+# touches code (src/ci/changes.zig, as on GitHub), runs the gate as `tester` if it does, and
+# otherwise prints one line saying it skipped. Only the CI-only things are here: when it runs, the
+# image, the /cache mount and who the work runs as.
+# The /cache mount is per event (/var/lib/zigbox-ci/<event>): a push here is only ever to main, so
+# main reads and writes /var/lib/zigbox-ci/push and never a directory a pull request wrote.
+# Each command runs under `flock -s /cache/.prune-lock` (the root build of the driver included):
+# the hourly prune empties a scope's Zig caches only while it holds that lock exclusively
+# (ops/ci/bootstrap.sh), so no step's build loses files under it.
+when:
+  - event: pull_request
+  # A label added to an open pull request: `full-ci` runs everything now, without a new push
+  # (the event has no changed paths, so src/ci/changes.zig runs every gate and demo). If the
+  # forge does not pass the labels with this event, nothing runs here and the next push picks
+  # the label up.
+  - event: pull_request_metadata
+    # The whole label, not a substring (`no-full-ci` is not `full-ci`). While full-ci is on, any
+    # other label change runs everything again too (ops/ci/README.md).
+    evaluate: 'CI_PIPELINE_EVENT_REASON == "label_updated" && ("," + CI_COMMIT_PULL_REQUEST_LABELS + ",") contains ",full-ci,"'
+  - event: push
+    branch: main
+  - event: manual
+
+variables:
+  # The step itself runs as root in the root-owned checkout; the driver (src/ci_main.zig) hands the
+  # workspace to tester and runs the gate as tester with its own Zig cache. The root build, which
+  # only compiles and runs the driver, keeps its caches off the workspace (so it leaves nothing
+  # root-owned in .zig-cache for tester to trip on).
+  - &ci_env
+    ZBX_CI_USER: tester
+    ZBX_CI_USER_ZIG_CACHE: /cache/zig
+    ZIG_GLOBAL_CACHE_DIR: /cache/zig-root
+    ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
+
+clone:
+  - name: clone
+    # Pinned by digest, as every image the box runs (ops/ci/README.md).
+    image: docker.io/woodpeckerci/plugin-git:2.12.1@sha256:b8d2401997be68ec25d62bd753fe5d30236e029fe007a5e823177e0e485ae205
+
+steps:
+  - name: build
+    image: zigbox-ci:0.17.0
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-build
+
+  - name: tidy
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-tidy
+
+  - name: test
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-test
+
+  - name: errors-site
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-errors-site
+
+  - name: fuzz
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-fuzz
+
+  - name: fuzz-provenance
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-fuzz-provenance
+
+  - name: dbus-live
+    image: zigbox-ci:0.17.0
+    depends_on: [build]
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment: *ci_env
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-dbus-live

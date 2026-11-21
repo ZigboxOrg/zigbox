@@ -1,11 +1,11 @@
 # Zigbox CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
-# installed from a verified tarball (.github/actions/setup-zig); QEMU from apt. No other shell
-# but .github/ci-changes.sh, which the `changes` job runs to decide what the rest does.
+# installed from a verified tarball (.github/actions/setup-zig); QEMU from apt. No shell logic:
+# the `changes` job runs `zig build ci-changes` (src/ci/changes.zig) to decide what the rest does.
 #
 # What runs (docs/decisions/2026-11-04-ci-affected-demos.md):
 #   - A pull request that changes only docs (a .md outside src/, anything under site/ outside
 #     site/errors/) runs nothing but `changes`.
-#   - A pull request runs the VM demos its changed paths can affect, chosen by ci-changes.sh.
+#   - A pull request runs the VM demos its changed paths can affect, chosen by src/ci/changes.zig.
 #   - A push to main, a pull request from a claude/release-* branch and a pull request labelled
 #     full-ci run everything.
 #   - Every Zig job restores the build cache (.github/actions/zig-cache).
@@ -61,19 +61,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
+      - uses: ./.github/actions/setup-zig
       - name: Pick the jobs
         id: pick
         env:
           EVENT: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+        # The paths go in a file, not an argument: Linux caps one argument at 128 KiB, which a
+        # large pull request's list can pass.
         run: |
+          files="$RUNNER_TEMP/changed-paths"
+          : > "$files"
           if [ "$EVENT" = pull_request ]; then
-            git diff --name-only HEAD^1 HEAD | tee /dev/stderr | .github/ci-changes.sh
-          else
-            .github/ci-changes.sh < /dev/null
+            git diff --name-only HEAD^1 HEAD > "$files"
           fi
-          cat "$GITHUB_OUTPUT"
+          zig build ci-changes -- --output "$GITHUB_OUTPUT" --event "$EVENT" \
+            --branch "$HEAD_REF" --labels "$LABELS" --files-from "$files"
 
   build:
     name: build (both targets, size gate)

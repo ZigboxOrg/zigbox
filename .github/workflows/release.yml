@@ -100,11 +100,15 @@ jobs:
       sha: ${{ steps.plan.outputs.sha }}
       published: ${{ steps.plan.outputs.published }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      # The published zip's SHA-256, the one the owner approves at `tap-approve`; `tap` refuses any
+      # other zip. Empty unless the release was already published (then `mac` gives the hash).
+      zip_sha256: ${{ steps.plan.outputs.zip_sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
       EVENT: ${{ github.event_name }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       INPUT_VERSION: ${{ inputs.version }}
+      ACTOR: ${{ github.triggering_actor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -193,6 +197,27 @@ jobs:
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
           echo "release: $tag at $sha (published: $published, prerelease: $prerelease)"
+          # What the owner checks before approving `tap-approve` (docs/releases/automation.md,
+          # "The tap"): who started the run, and, on a published release, the zip's hash now.
+          if [ "$published" = true ]; then
+            zip="zbx-$version-macos-universal.zip"
+            "$GH" release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$zip" \
+              --dir "$RUNNER_TEMP/zip" 2> "$err" ||
+              fail "could not read $zip of the published $tag: $(head -c 200 "$err")"
+            zip_sha256=$(sha256sum "$RUNNER_TEMP/zip/$zip" | cut -d ' ' -f 1)
+            [[ "$zip_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "could not hash $zip of the published $tag"
+            echo "zip_sha256=$zip_sha256" >> "$GITHUB_OUTPUT"
+            zip_hash="\`$zip_sha256\` (the tap refuses any other zip)"
+          else
+            zip_hash="the hash comes from the mac job of this run"
+          fi
+          {
+            echo "### release $tag"
+            echo ""
+            echo "- started by: \`$ACTOR\` ($EVENT)"
+            echo "- commit: \`$sha\`, already published: $published"
+            echo "- Mac zip sha256: $zip_hash"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Replaces the wait for mac.yml: the macOS build and every gate, on a GitHub-hosted Mac, at the
   # release commit. (The VM demos need Virtualization.framework, which hosted runners lack.)
@@ -486,6 +511,12 @@ jobs:
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
     permissions:
       contents: write
+    # The zip's SHA-256 as built here. A job output is fixed once the job ends, and no token can
+    # change it, while the draft's assets can be replaced by any write token. `prepare` and `tap`
+    # refuse a zip that is not this one, so a zip, sums and formula swapped together after this job
+    # are caught (the Mac files are outside the signed SHA256SUMS).
+    outputs:
+      zip_sha256: ${{ steps.zipsum.outputs.sha256 }}
     env:
       TAG: ${{ needs.plan.outputs.tag }}
       VERSION: ${{ needs.plan.outputs.version }}
@@ -626,9 +657,15 @@ jobs:
           zig build mac-release --sysroot "$SDK" -Dsdk \
             -Dnotarize -Dsign-identity="$SIGN_IDENTITY" -Dkeychain="$KEYCHAIN"
       - name: The zip is the one that was hashed
+        id: zipsum
         run: |
           cd zig-out/mac-release
           /usr/bin/shasum -a 256 -c "zbx-$VERSION-macos-universal.zip.sha256"
+          sha=$(/usr/bin/shasum -a 256 "zbx-$VERSION-macos-universal.zip" | /usr/bin/cut -d ' ' -f 1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::mac: the zip's sha256 is not 64 hex digits"; exit 1; }
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          # The record a later tap-approve is compared against (docs/releases/automation.md).
+          echo "mac: zbx-$VERSION-macos-universal.zip sha256 $sha" >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.release-tools/.github/actions/mac-check-zip
         with:
           zip: zig-out/mac-release/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
@@ -706,8 +743,13 @@ jobs:
           sha: ${{ needs.plan.outputs.sha }}
           require: 'true'
       - name: Download the draft's assets and check them
+        env:
+          # The zip as `mac` built it: a zip, sums and formula replaced on the draft since then
+          # are refused (release-prepare-check.sh).
+          ZIGBOX_MAC_ZIP_SHA256: ${{ needs.mac.outputs.zip_sha256 }}
         run: |
           set -euo pipefail
+          [ -n "$ZIGBOX_MAC_ZIP_SHA256" ] || { echo "release: the mac job gave no zip hash" >&2; exit 1; }
           mkdir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
           "$GH" release download "$TAG" --repo "$GITHUB_REPOSITORY"
@@ -734,6 +776,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         with:
           formula: ${{ runner.temp }}/assets/zigbox.rb
+          url: https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
 
   # The one step that makes a release public, and so makes the tag (at the release commit, by
   # the draft's target). GITHUB_TOKEN with contents: write is enough; no App is involved.
@@ -803,16 +846,39 @@ jobs:
           [ "$object" = "$SHA" ] || { echo "release: the new tag $TAG is at $object, not $SHA" >&2; exit 1; }
           echo "publish: $TAG is public, at $SHA"
 
+  # A tap on an already published release (a re-dispatch: `mac` did not run in this run, so no
+  # build hash pins the zip) commits assets a write token may have replaced since. `plan` hashes
+  # the published zip and shows the hash; the owner approves that hash here, on `release`, as for
+  # `linux` and `mac`, and `tap` refuses any other zip. This job holds no secret and runs
+  # nothing; the tap itself stays on `release-publish`, the one environment with the App's key.
+  tap-approve:
+    name: approve a tap of a published release
+    needs: plan
+    if: ${{ needs.plan.outputs.go == 'true' && needs.plan.outputs.published == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions: {}
+    steps:
+      - name: Approved
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          echo "tap-approve: the owner approved the tap of the published $TAG"
+
   # The tap, from the App's token. The formula is the one on the published release, so a re-run,
   # or a run that finds the release already public, does the same thing. A contents-API call, not
   # a git push: no credential goes through git or onto a command line.
   tap:
     name: commit the formula to the tap
-    needs: [plan, publish]
+    needs: [plan, mac, publish, tap-approve]
+    # Either this run published the release (then `mac` ran in it and its zip hash pins the zip),
+    # or the release was already published and the owner approved `tap-approve`.
     if: >-
       ${{ always() && needs.plan.outputs.go == 'true'
-      && (needs.publish.result == 'success'
-      || (needs.publish.result == 'skipped' && needs.plan.outputs.published == 'true')) }}
+      && ((needs.publish.result == 'success' && needs.mac.result == 'success')
+      || (needs.publish.result == 'skipped' && needs.plan.outputs.published == 'true'
+      && needs.tap-approve.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release-publish
@@ -837,18 +903,31 @@ jobs:
           sparse-checkout: /.github/actions/
           sparse-checkout-cone-mode: false
       - uses: ./.release-tools/.github/actions/setup-gh
-      - name: Download the published formula and zip, and check the hash
+      # The published assets get the check the draft got: the Linux files against SHA256SUMS and its
+      # signature by the pinned key (the repository's key, never the release's), and the formula's
+      # url, version and sha256 against the zip, which must hold only zbx. The Mac zip is not in the
+      # signed sums, so the zip must also be the one `mac` built in this run (its job output); on a
+      # published release `mac` did not run, and the zip must be the one `plan` hashed and showed the
+      # owner before the approval of `tap-approve`. No path runs without a hash.
+      # The apt freshness window is skipped: this job publishes no apt Release, and a tap re-run
+      # may come weeks after the last signing.
+      - name: Download the published assets and check them as the draft was
         env:
           GH_TOKEN: ${{ github.token }}
+          ZIGBOX_MAC_ZIP_SHA256: ${{ needs.mac.outputs.zip_sha256 || needs.plan.outputs.zip_sha256 }}
+          ZIGBOX_SKIP_FRESHNESS: '1'
         run: |
           set -euo pipefail
+          if [ -z "$ZIGBOX_MAC_ZIP_SHA256" ]; then
+            echo "release: no zip hash from the mac job or from plan, so no zip is approved for the tap" >&2
+            exit 1
+          fi
           mkdir "$RUNNER_TEMP/assets"
           cd "$RUNNER_TEMP/assets"
-          zip="zbx-$VERSION-macos-universal.zip"
-          "$GH" release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$zip" --pattern zigbox.rb
-          sha=$(sed -n 's/^ *sha256 "\([0-9a-f]\{64\}\)"$/\1/p' zigbox.rb)
-          [ -n "$sha" ] || { echo "release: the formula has no sha256" >&2; exit 1; }
-          echo "$sha  $zip" | sha256sum -c -
+          "$GH" release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          cd "$GITHUB_WORKSPACE"
+          .github/release-prepare-check.sh "$RUNNER_TEMP/assets" "$VERSION" "$TAG" \
+            "$GITHUB_REPOSITORY" docs/releases/zigbox-release-key.asc
       - name: Mint the App token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -865,6 +944,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         with:
           formula: ${{ runner.temp }}/assets/zigbox.rb
+          url: https://github.com/${{ github.repository }}/releases/download/${{ needs.plan.outputs.tag }}/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
       - name: Commit the formula
         if: ${{ steps.diff.outputs.changed == 'true' }}
         env:
@@ -1035,7 +1115,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q rpm shellcheck
       - name: ShellCheck
-        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/package-refresh.sh .github/package-refresh-test.sh
+        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/package-refresh.sh .github/package-refresh-test.sh
       - name: Every local action loads from the workflow's commit
         run: |
           # A release commit predates later tooling fixes, so `./.github/actions/...` (resolved in
@@ -1062,6 +1142,8 @@ jobs:
         run: .github/release-sign-test.sh "$RUNNER_TEMP/out"
       - name: The draft check passes the honest draft and refuses tampered ones
         run: .github/release-prepare-test.sh "$RUNNER_TEMP/out"
+      - name: The tap check refuses a formula whose url is not the release's zip
+        run: .github/tap-formula-test.sh
       - name: Refresh and refuse with a throwaway key
         run: .github/package-refresh-test.sh "$RUNNER_TEMP/refresh"
       - name: The archive holds what packaging.md says and nothing secret

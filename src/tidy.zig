@@ -29,11 +29,21 @@ const files_max: u32 = 10_000;
 /// Shell scripts are banned (build tooling is Zig). A path listed here is allowed, and each
 /// entry needs a written reason next to it.
 const shell_allowlist = [_][]const u8{
-    // CI's path classification runs in the `changes` job, before Zig is installed.
-    ".github/ci-changes.sh",
     // The owner's one-time ZigboxOrg setup, run on the owner's laptop: glue around `gh`, `gcloud`,
     // `gpg` and `git`, before any Zig exists there; ops/owner/README.md.
     "ops/owner/zigboxorg-setup.sh",
+    // The one-time setup of the CI box (a root shell on a bare Ubuntu host: Docker, the Woodpecker
+    // containers, the secrets). It runs before any Zig exists there and touches the machine, not
+    // the repository; ops/ci/README.md.
+    "ops/ci/bootstrap.sh",
+    // The repository's settings in that Woodpecker, through its HTTP API with `curl` and `jq`, on
+    // the same box and before any Zig is there either; ops/ci/README.md, step 4.
+    "ops/ci/woodpecker-setup.sh",
+    // The owner's GitHub side of that setup (the bot account, `main`'s protection), run on the
+    // owner's laptop: glue around `gh` and `jq`; ops/ci/README.md, step 3a.
+    "ops/ci/owner-github.sh",
+    // Its test: runs the same file against a stub `gh` (src/owner_github_tests.zig).
+    "ops/ci/owner-github-test.sh",
     // The owner's release plumbing (environments, signing key, App, Mac secrets) and the copy of
     // the VM build inputs' releases: the same glue, on the same laptop.
     "ops/owner/release-setup.sh",
@@ -51,6 +61,9 @@ const shell_allowlist = [_][]const u8{
     // The last gate before publishing, and its tamper tests: the program that checks is `gpg`.
     ".github/release-prepare-check.sh",
     ".github/release-prepare-test.sh",
+    // The tap job's check that the formula names only the release's zip, and its test.
+    ".github/actions/tap-formula/check-url.sh",
+    ".github/tap-formula-test.sh",
     // The weekly re-sign: the same `gpg` glue as release-sign.sh, around its own checks.
     ".github/package-refresh.sh",
     ".github/package-refresh-test.sh",

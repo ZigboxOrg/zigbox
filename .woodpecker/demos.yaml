@@ -1,0 +1,76 @@
+# The VM demos of .github/workflows/ci.yml, in KVM guests on the fleet box (ops/ci/README.md). One
+# workflow per demo, so each is its own check on the pull request. The step is
+# `zig build ci-demos -- --demo ID`: the build decides whether the change can affect that demo
+# (src/ci/changes.zig; a push to main, a claude/release-* pull request and one labelled full-ci run
+# every demo), prints one line and passes if it cannot, and otherwise runs it as `tester` with the
+# VM downloads restored from and saved to /cache (src/testing/vm/cache.zig). demo-m6d says NOT RUN
+# until the owner's Google setup is here. Needs the repository marked Trusted (privileged for
+# /dev/kvm, the /cache mount).
+# The /cache mount is per event (/var/lib/zigbox-ci/<event>): a push here is only ever to main, so
+# main reads and writes /var/lib/zigbox-ci/push and never a directory a pull request wrote.
+# Each command runs under `flock -s /cache/.prune-lock` (the root build of the driver included):
+# the hourly prune empties a scope's Zig caches only while it holds that lock exclusively
+# (ops/ci/bootstrap.sh), so no step's build loses files under it.
+when:
+  - event: pull_request
+  # A label added to an open pull request: `full-ci` runs everything now, without a new push
+  # (the event has no changed paths, so src/ci/changes.zig runs every gate and demo). If the
+  # forge does not pass the labels with this event, nothing runs here and the next push picks
+  # the label up.
+  - event: pull_request_metadata
+    # The whole label, not a substring (`no-full-ci` is not `full-ci`). While full-ci is on, any
+    # other label change runs everything again too (ops/ci/README.md).
+    evaluate: 'CI_PIPELINE_EVENT_REASON == "label_updated" && ("," + CI_COMMIT_PULL_REQUEST_LABELS + ",") contains ",full-ci,"'
+  - event: push
+    branch: main
+  - event: manual
+
+matrix:
+  # The include form: Woodpecker 3 refuses more than 10 values in a plain axis, but takes up to 64
+  # entries here.
+  include:
+    - DEMO: m0
+    - DEMO: m1
+    - DEMO: m2
+    - DEMO: m2b
+    - DEMO: m3
+    - DEMO: m4
+    - DEMO: m5
+    - DEMO: m6
+    - DEMO: m6b
+    - DEMO: m6d
+    - DEMO: m7
+    - DEMO: m8
+    - DEMO: m8_packages
+    - DEMO: m8b
+    - DEMO: m9
+    - DEMO: m10
+    - DEMO: c4
+    - DEMO: s2_lazy
+    - DEMO: s2
+
+clone:
+  - name: clone
+    image: docker.io/woodpeckerci/plugin-git:2.12.1@sha256:b8d2401997be68ec25d62bd753fe5d30236e029fe007a5e823177e0e485ae205
+    settings:
+      # The whole history of this ref. demo-m2b, m3 to m9 build an older release whose commit is
+      # only on origin's old/* branches or tags; build_old fetches those itself when it is missing
+      # (src/testing/vm/build_old.zig), as this clone fetches one ref.
+      depth: 0
+      partial: false
+
+steps:
+  - name: demo-${DEMO}
+    image: zigbox-ci:0.17.0
+    privileged: true
+    volumes:
+      - /var/lib/zigbox-ci/${CI_PIPELINE_EVENT}:/cache
+    environment:
+      # As check.yaml: the work runs as tester; the root build keeps its own caches.
+      ZBX_CI_USER: tester
+      ZBX_CI_USER_ZIG_CACHE: /cache/zig
+      ZIG_GLOBAL_CACHE_DIR: /cache/zig-root
+      ZIG_LOCAL_CACHE_DIR: /cache/zig-root/local
+      ZBX_VM_CACHE: /cache/vm-entries
+    commands:
+      - flock -s /cache/.prune-lock zig build ci-demos -- --demo ${DEMO}

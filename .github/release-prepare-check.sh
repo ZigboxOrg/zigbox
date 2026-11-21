@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The last check of a release draft, before it is published: the directory holds exactly the
 # release's assets, each one matches its sums, SHA256SUMS.asc is a good signature by a subkey of
-# the pinned release key, the apt metadata has time left, and the Mac formula agrees with the zip.
+# the pinned release key, the apt metadata has time left, and the Mac formula agrees with the zip
+# (and the zip is the one the `mac` job built, when its hash is given).
 # The release workflow's `prepare` job and the `test` job both run this file. Writes nothing
 # outside DIR. Prints one `release: ...` line to stderr and exits 1 on the first refusal.
 #
@@ -11,6 +12,16 @@
 # Environment:
 #   ZIGBOX_SIGNING_FPR   the pinned fingerprint of the primary key (40 hex digits, upper case)
 #   ZIGBOX_NOW           optional: the current time (Unix seconds); default now. For the test.
+#   ZIGBOX_MAC_ZIP_SHA256  optional: the zip's SHA-256 as the `mac` job built it (its job output,
+#                        which no token can change afterwards). The Mac zip, its sums and the formula
+#                        are outside the signed SHA256SUMS, so a writer who replaces all of them
+#                        consistently passes every other check here; with this set, the zip must be
+#                        the built one. The workflow sets it whenever `mac` ran in the same run.
+#   ZIGBOX_SKIP_FRESHNESS  optional: 1 skips the 14-day apt freshness rule, for a caller that
+#                        publishes no apt Release (the `tap` job); the Valid-Until must still be a date.
+#                        It is the tap's mode, so it also requires ZIGBOX_MAC_ZIP_SHA256: the tap
+#                        commits the formula only for a zip pinned by `mac`'s output in this run or,
+#                        on a published release, by the hash `plan` showed the approving owner.
 set -euo pipefail
 # No `set -x`.
 
@@ -21,10 +32,17 @@ repository=${4:?repository}
 keyring=${5:?keyring}
 : "${ZIGBOX_SIGNING_FPR:?ZIGBOX_SIGNING_FPR is not set}"
 min_days=14
+mac_pin=${ZIGBOX_MAC_ZIP_SHA256:-}
+skip_freshness=${ZIGBOX_SKIP_FRESHNESS:-}
 
 fail() { echo "release: $*" >&2; exit 1; }
 
 [[ "$ZIGBOX_SIGNING_FPR" =~ ^[0-9A-F]{40}$ ]] || fail "the pinned fingerprint is not 40 upper-case hex digits"
+[ -z "$mac_pin" ] || [[ "$mac_pin" =~ ^[0-9a-f]{64}$ ]] ||
+  fail "ZIGBOX_MAC_ZIP_SHA256 is not 64 lower-case hex digits"
+case "$skip_freshness" in "" | 1) ;; *) fail "ZIGBOX_SKIP_FRESHNESS is 1 or unset, not $skip_freshness" ;; esac
+[ "$skip_freshness" != 1 ] || [ -n "$mac_pin" ] ||
+  fail "a tap run (ZIGBOX_SKIP_FRESHNESS=1) needs ZIGBOX_MAC_ZIP_SHA256, the zip's approved hash"
 [ -s "$keyring" ] || fail "the pinned public key $keyring is missing from the repository"
 dir=$(cd "$dir" && pwd)
 keyring=$(cd "$(dirname "$keyring")" && pwd)/$(basename "$keyring")
@@ -81,6 +99,11 @@ unset GNUPGHOME
 
 sha256sum -c --strict "$zip.sha256" > /dev/null || fail "the zip does not match its .sha256"
 zip_sha=$(cut -d ' ' -f 1 "$zip.sha256")
+if [ -n "$mac_pin" ]; then
+  built=$(sha256sum "$zip" | cut -d ' ' -f 1)
+  [ "$built" = "$mac_pin" ] ||
+    fail "the zip is not the one the mac job built (sha256 $built, built $mac_pin): it was replaced after the build"
+fi
 formula_sha=$(sed -n 's/^ *sha256 "\([0-9a-f]\{64\}\)"$/\1/p' zigbox.rb)
 [ "$zip_sha" = "$formula_sha" ] || fail "the formula's sha256 is not the zip's"
 grep -qxF "  url \"https://github.com/$repository/releases/download/$TAG/$zip\"" zigbox.rb ||
@@ -98,13 +121,14 @@ grep -q '^zigbox-archive-keyring.gpg$' "$work/list" || fail "the archive has no 
 ! grep -Eq 'to-sign|test-key|passphrase|secret' "$work/list" || fail "the archive holds a file named like a secret"
 
 # Freshness, at publish time: a late re-run of another job must not publish an apt Release that is
-# near its Valid-Until (apt refuses an expired one until the next weekly refresh).
+# near its Valid-Until (apt refuses an expired one until the next weekly refresh). A caller that
+# publishes no apt Release (the tap, on a release that may be weeks old) skips the window.
 valid=$(tar -xzOf zigbox-repos.tar.gz apt/dists/stable/Release | sed -n 's/^Valid-Until: //p')
 [ -n "$valid" ] || fail "the archive's apt Release has no Valid-Until"
 valid_at=$(date -u -d "$valid" +%s 2> /dev/null) || fail "the archive's Valid-Until is not a date"
 now=${ZIGBOX_NOW:-$(date +%s)}
 left=$(( (valid_at - now) / 86400 ))
-if [ "$(( valid_at - now ))" -lt $(( min_days * 86400 )) ]; then
+if [ -z "$skip_freshness" ] && [ "$(( valid_at - now ))" -lt $(( min_days * 86400 )) ]; then
   fail "the archive's apt Release is valid for $left more days (fewer than $min_days days are not enough); re-run the linux job"
 fi
 echo "prepare: the draft's assets, sums and signature are as they should be"

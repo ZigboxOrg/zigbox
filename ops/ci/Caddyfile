@@ -1,0 +1,4 @@
+# Caddy gets and renews the certificate for CI_HOST from Let's Encrypt (port 80 must be open).
+{$CI_HOST} {
+	reverse_proxy woodpecker-server:8000
+}

@@ -1,0 +1,62 @@
+# The Woodpecker server, one agent and Caddy (TLS) on the fleet box (ops/ci/README.md).
+# bootstrap.sh copies this to /opt/zigbox-ci/ and runs it; values come from /etc/zigbox-ci/ci.env
+# and the secret files beside it. Only Caddy publishes ports (80, 443). The agent reaches the
+# server's gRPC port on the compose network, never on the host's interfaces. Every image is pinned
+# by digest (the tag is for the reader); to move one, pull the new tag and copy its digest here.
+name: zigbox-ci
+
+services:
+  caddy:
+    image: docker.io/library/caddy:2.10.2@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CI_HOST: ${CI_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  woodpecker-server:
+    image: docker.io/woodpeckerci/woodpecker-server:v3.20.1@sha256:0f31560e29d67ec4a06d6eeee4bac38d2a2697a6a741b8a0db3998180f3a3517
+    restart: unless-stopped
+    environment:
+      WOODPECKER_HOST: https://${CI_HOST}
+      WOODPECKER_ADMIN: ${CI_ADMINS}
+      WOODPECKER_OPEN: "true"
+      WOODPECKER_ORGS: ${CI_GITHUB_ORG}
+      WOODPECKER_GITHUB: "true"
+      WOODPECKER_GITHUB_CLIENT_FILE: /run/secrets/github-client-id
+      WOODPECKER_GITHUB_SECRET_FILE: /run/secrets/github-client-secret
+      WOODPECKER_AGENT_SECRET_FILE: /run/secrets/agent-secret
+      WOODPECKER_MAX_PIPELINE_TIMEOUT: "180"
+    volumes:
+      - woodpecker-data:/var/lib/woodpecker
+      - /etc/zigbox-ci/github-client-id:/run/secrets/github-client-id:ro
+      - /etc/zigbox-ci/github-client-secret:/run/secrets/github-client-secret:ro
+      - /etc/zigbox-ci/agent-secret:/run/secrets/agent-secret:ro
+
+  woodpecker-agent:
+    image: docker.io/woodpeckerci/woodpecker-agent:v3.20.1@sha256:a7d7299a13add0b3936fa0ac9ed23507fe283a7fc7d9596c4289d7e8206541eb
+    restart: unless-stopped
+    depends_on:
+      - woodpecker-server
+    environment:
+      WOODPECKER_SERVER: woodpecker-server:9000
+      WOODPECKER_AGENT_SECRET_FILE: /run/secrets/agent-secret
+      WOODPECKER_BACKEND: docker
+      WOODPECKER_MAX_WORKFLOWS: ${CI_MAX_WORKFLOWS}
+      WOODPECKER_HOSTNAME: ${CI_AGENT_NAME}
+      WOODPECKER_AGENT_LABELS: kvm=true
+    volumes:
+      - woodpecker-agent:/etc/woodpecker
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/zigbox-ci/agent-secret:/run/secrets/agent-secret:ro
+
+volumes:
+  caddy-data:
+  caddy-config:
+  woodpecker-data:
+  woodpecker-agent:
