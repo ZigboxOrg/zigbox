@@ -20,7 +20,7 @@ Mac runs cited below, made with an earlier version. None was run for this guide.
 ## 1. Install
 
 ```sh
-brew install zigbox/tap/zigbox
+brew install zigboxorg/tap/zigbox
 zbx --version
 ```
 

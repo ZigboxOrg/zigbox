@@ -1085,14 +1085,14 @@ jobs:
         run: |
           set -euo pipefail
           brew update
-          brew install zigbox/tap/zigbox || brew upgrade zigbox/tap/zigbox
+          brew install zigboxorg/tap/zigbox || brew upgrade zigboxorg/tap/zigbox
           out=$(zbx --version)
           echo "$out"
           case "$out" in
             *"zbx $VERSION"*) ;;
             *) echo "release: zbx --version does not say $VERSION" >&2; exit 1 ;;
           esac
-          brew test zigbox/tap/zigbox
+          brew test zigboxorg/tap/zigbox
 
   # The whole signing script with a throwaway key: import from stdin, round 1 and 2, the check,
   # every gpg --verify and rpm -Kv, the archive. It attaches nothing and dispatches nothing.
