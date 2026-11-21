@@ -210,7 +210,7 @@ the signed packages. All of it is reproducible (fixed mtime, owner and order; gz
 
 - `zbx-<v>-linux-x86_64.tar.gz` and `zbx-<v>-linux-aarch64.tar.gz`: the static ReleaseSafe `zbx`,
   `LICENSE` and a short `README.txt`.
-- `zbx-<v>.cdx.json`: a CycloneDX 1.5 SBOM (version, licence, purl `pkg:github/zigbox/zigbox@v<v>`,
+- `zbx-<v>.cdx.json`: a CycloneDX 1.5 SBOM (version, licence, purl `pkg:github/zigboxorg/zigbox@v<v>`,
   the SHA-256 of each binary, the Zig toolchain version, and the statement that there are no
   third-party components).
 - With `-Dpackages-dir=zig-out/packages` (the tree `release-sign.sh` signed), the debs and rpms,
