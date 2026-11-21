@@ -23,6 +23,14 @@ pub const Error = error{
     BadTime,
 };
 
+/// Said when the time is out of range. The default (`package_source_date_epoch`, 1980) is below
+/// the range on purpose: a release has no fixed time, so the caller must pass one.
+const bad_time_text = std.fmt.comptimePrint(
+    "the source date is out of range ({d} to {d}): pass the release's time in seconds " ++
+        "since 1970 as -Dsource-date-epoch=N (the tool's --source-date-epoch N)",
+    .{ constants.apt_signed_at_min, constants.apt_signed_at_max },
+);
+
 pub fn describe(err: Error) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
@@ -31,7 +39,7 @@ pub fn describe(err: Error) []const u8 {
         error.BadAsset => "an asset name is not a plain file name, or two assets share one",
         error.TooManyAssets => "more assets than the bound allows",
         error.FileTooLarge => "a file is larger than the bound allows",
-        error.BadTime => "the source date is out of range",
+        error.BadTime => bad_time_text,
     };
 }
 

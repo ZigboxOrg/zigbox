@@ -47,15 +47,11 @@ sudo dnf install zigbox
 ### Renewing the keyring
 
 On 2026-11-20 the release key itself was replaced (the old secret key was lost); the new primary
-fingerprint is `1207 CB86 00CE 25FF DD3C C87E CCBE C141 C334 8787`. zigbox.org serves the new key
-from the first release signed with it (planned: 0.6.0); until then it serves the old one, so do not
-re-fetch it yet. If you installed before that release, then once it is out follow the steps in
-[the decision record](../decisions/2026-11-20-release-key-rotated.md), or `apt update` and `dnf`
-refuse the repository.
-
-The apt metadata expires: the served `Release` file says `Valid-Until` 9 December 2026. Until then
-apt works. After that date, and until a release signed with the new key ships, `apt update` reports
-`Release file ... is expired`. Do not turn the expiry check off; wait for the release.
+fingerprint is `1207 CB86 00CE 25FF DD3C C87E CCBE C141 C334 8787`. 0.6.0 is the first release
+signed with it, and zigbox.org serves it from then on. If you installed before 0.6.0, replace the
+old key with the steps in the [0.6.0 release notes](../releases/0.6.0.md#the-new-release-key), or
+`apt update` and `dnf` refuse 0.6.0. An install made with the steps above after 0.6.0 was
+published already has the new key.
 
 The signing subkey is renewed once a year, and the keyring you fetched above carries its expiry.
 Nothing updates that file, so when a release's notes say the subkey was renewed, fetch the keyring
