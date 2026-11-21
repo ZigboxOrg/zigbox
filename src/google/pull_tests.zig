@@ -570,9 +570,9 @@ fn ignore_warning(context: *anyopaque, diag: *const Diag) void {
 }
 
 test "a lazy start keeps no Google token, and no fallback, once its resolve has ended" {
-    // Goal: `zbx run --lazy` (S2's, dormant in a release build but callable here) wipes the
-    // Google token `request_of` found and drops the fallback, whose storage that is, when the
-    // resolve ends: with workload identity, and with the metadata server after a refusal.
+    // Goal: `zbx run --lazy` (S2's) wipes the Google token `request_of` found and drops the
+    // fallback, whose storage that is, when the resolve ends: with workload identity, and with
+    // the metadata server after a refusal.
     // Method: `lazy_start.start` as `zbx run --lazy` calls it; the fixture's image has two layers,
     // so the start ends `whole` right after the resolve.
     const world = try World.create();
