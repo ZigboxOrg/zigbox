@@ -1487,6 +1487,20 @@ test "every fuzzer survives a fixed seed for a few hundred iterations" {
     }
 }
 
+test "logs: a write interrupted past the retry bound stops the log, and the log stays whole" {
+    // Goal: a regression found by 0.6.0-rc1's release fuzz run (`logs`, seed 19, iteration
+    // 574572; seed 20 fails too): at a 27.9% interrupt rate one write of the log was interrupted
+    // 17 times in a row, `write_all` gave up as `store_io_retries_max` says it must, and the
+    // oracle's claim that the writer always finishes failed. Method: that iteration's seed, which
+    // must still reach the writer giving up, and then the whole fuzzer on it.
+    var splitmix = std.Random.SplitMix64.init(19);
+    for (0..574572) |_| _ = splitmix.next();
+    const seed = splitmix.next();
+    try std.testing.expectEqual(@as(u64, 10899674490826961297), seed);
+    try std.testing.expect(logs_fuzz.cap_gave_up(seed));
+    logs_fuzz.fuzz_logs(seed);
+}
+
 test "doctor: interrupts that make a write give up are not a missing diagnostic" {
     // Goal: a regression found by the soak (`doctor`, seed 23333462, iteration 86255): the
     // faulted run interrupted `write_all` more than `eintr_retries_max` times in a row, so
