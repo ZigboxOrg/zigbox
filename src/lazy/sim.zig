@@ -914,12 +914,21 @@ fn check_chunks(sim: *Sim) void {
 
 /// Property 6: the rootless owner gap is never shown, and any other `not_kept` is shown once per
 /// object. A failure of the owner (`land.owner_refused`) is silent by the owner's decision.
+/// Judged from the scenario, not from the predicate the resolver decides with: an honest run
+/// injects no store fault, so the owner gap (`outside_owners`) is the only failure its puts can
+/// meet, and any `not_kept` in it is a misclassification. An object whose owner is the user's
+/// own (not `is_gapped`) never asks for a change of owner, so its failure is never the owner's.
 fn check_not_kept(sim: *const Sim) void {
     var shown: u16 = 0;
     for (sim.events[0..sim.events_count]) |*logged| {
         const event = &logged.event;
         if (event.kind != .not_kept) continue;
-        if (land.owner_refused(&event.store_failure)) @panic("the owner gap was shown");
+        if (sim.scenario.honest) @panic("the owner gap was shown, in a run without store faults");
+        const gapped = is_gapped(sim, &sim.objects[event.object]);
+        if (land.owner_refused(&event.store_failure)) {
+            if (!gapped) @panic("an owner refusal for an object owned by the user");
+            @panic("the owner gap was shown");
+        }
         const bit = @as(u16, 1) << @intCast(event.object);
         if (shown & bit != 0) @panic("a not_kept event was shown twice for one object");
         shown |= bit;

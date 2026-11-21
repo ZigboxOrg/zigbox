@@ -297,17 +297,73 @@ pub fn store_full(diag: *Diag, object: Digest, chunk: u32) void {
 }
 
 /// ZBX-E0417 for a chunk the store holds but could not make an object of: the reads are served
-/// from the held chunks, so no read failed; the object stays unmade while the cause lasts.
+/// from the held chunks, so no read failed; the object stays unmade while the cause lasts. The
+/// cause names the step that failed and its path in the store (E0417's explanation says where
+/// the store is), and the kernel's reason.
 pub fn chunk_not_kept(diag: *Diag, object: Digest, chunk: u32, failure: *const Failure) void {
     assert(diag.code == null);
     assert(failure.errno < 4096);
     diag.raise(.E0417);
     diag.while_("keeping a fetched chunk of a lazily started image", .{});
-    errors.cause_host_error(diag, "writing the store", failure.err, failure.errno);
+    var buffer: [not_kept_step_bytes_max]u8 = undefined;
+    const operation = not_kept_step(&buffer, object, failure.step);
+    if (failure.errno == 0) {
+        // No errno to name (a failure the kernel did not report): the step and path are what
+        // there is to act on.
+        diag.cause("{s} failed", .{operation});
+    } else {
+        errors.cause_host_error(diag, operation, failure.err, failure.errno);
+    }
     diag.context("object", "{s}", .{object.text()});
     diag.context("chunk", "{d}", .{chunk});
     diag.fix(.{ .sentence = "check that you can write to the store directory, and the disk" });
     assert(diag.code == .E0417);
+}
+
+const not_kept_step_bytes_max = 64;
+
+/// The step of a chunked put that failed, in words, with its path relative to the store root.
+fn not_kept_step(
+    buffer: *[not_kept_step_bytes_max]u8,
+    object: Digest,
+    step: Failure.Step,
+) []const u8 {
+    const hex = object.hex();
+    const shard = hex[0..2];
+    const text = switch (step) {
+        .unnamed => "writing the store",
+        .lock => "taking the store's lock file",
+        .look => return shard_step(buffer, "looking for the object in objects/", shard),
+        .chunk_read => "reading the held chunk in partial/",
+        .chunk_write => "keeping the chunk in partial/",
+        .listing => "listing the held chunks in partial/",
+        .generation => "raising the store's generation file",
+        .directory => return shard_step(buffer, "making the directory objects/", shard),
+        .create => "creating the object in tmp/",
+        .assemble_read => "reading a held chunk from partial/",
+        .assemble_write => "writing the object in tmp/",
+        .owner => "giving the object its owner in tmp/",
+        .mode => "setting the object's mode in tmp/",
+        .xattr => "setting an extended attribute of the object in tmp/",
+        .time => "setting the object's time in tmp/",
+        .list => return shard_step(buffer, "writing the chunk list to objects/", shard),
+        .rename => return shard_step(buffer, "renaming the object into objects/", shard),
+        .sync => return shard_step(buffer, "flushing the directory objects/", shard),
+    };
+    assert(text.len <= not_kept_step_bytes_max);
+    return text;
+}
+
+fn shard_step(
+    buffer: *[not_kept_step_bytes_max]u8,
+    words: []const u8,
+    shard: []const u8,
+) []const u8 {
+    assert(shard.len == 2);
+    assert(words.len + shard.len <= buffer.len);
+    @memcpy(buffer[0..words.len], words);
+    @memcpy(buffer[words.len..][0..shard.len], shard);
+    return buffer[0 .. words.len + shard.len];
 }
 
 test "E1201 names which of the host's lacks keeps a lazy run from FUSE" {

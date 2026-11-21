@@ -287,6 +287,42 @@ test "E1203 after a lie names it, and says no deadline passed" {
     try testing.expectEqual(lazy_diagnose.Unavailable.lied, unavailable_why(&given));
 }
 
+test "E0417 for a held chunk names the step, its path in the store and the kernel's reason" {
+    // Goal: the `not_kept` line is one diagnostic whose cause says which step of the put failed
+    // and where in the store (E0417's explanation promises the path), with the errno's reason,
+    // never "the errno is unknown"; a failure with no errno still names the step.
+    // Method: render the event as the run does, for an EPERM from the xattr, an EACCES from
+    // the rename into the object's shard, and an `AccessDenied` with no errno from the
+    // directory, and compare the default text.
+    const names: [constants.lazy_sources_max][]const u8 = @splat("");
+    var given: lazy.Event = .{
+        .kind = .not_kept,
+        .object = 0,
+        .id = lazy.Digest.parse("b3:" ++ @import("test_util.zig").repeat('a', 64)).?,
+        .chunk = 1,
+        .source = "",
+        .outcomes = @splat(.not_tried),
+        .sources_count = 0,
+        .names = &names,
+        .store_failure = .{ .err = error.AccessDenied, .errno = 1, .step = .xattr },
+    };
+    const head = "error[ZBX-E0417]: can't write the store\n";
+    const tail = "  fix    check that you can write to the store directory, and the disk\n" ++
+        "  more   zbx explain E0417 · rerun with --verbose for the full cause chain\n" ++
+        "  docs   https://zigbox.github.io/zigbox/errors/E0417.html\n";
+    try expect_rendered(&given, head ++
+        "  cause  setting an extended attribute of the object in tmp/ failed: operation\n" ++
+        "         not permitted (EPERM)\n" ++ tail);
+    given.store_failure = .{ .err = error.AccessDenied, .errno = 13, .step = .rename };
+    try expect_rendered(&given, head ++
+        "  cause  renaming the object into objects/aa failed: permission denied " ++
+        "(EACCES)\n" ++
+        tail);
+    given.store_failure = .{ .err = error.AccessDenied, .errno = 0, .step = .directory };
+    try expect_rendered(&given, head ++
+        "  cause  making the directory objects/aa failed\n" ++ tail);
+}
+
 fn expect_rendered(given: *const lazy.Event, expected: []const u8) !void {
     var diag: Diag = undefined;
     diag.reset();

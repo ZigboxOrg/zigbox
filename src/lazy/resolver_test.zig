@@ -989,9 +989,9 @@ test "resolver: rootless, an object owned by a container id is never made whole"
     // without `CAP_CHOWN`, an object of 0:42 (Alpine's /etc/shadow) cannot be assembled: the
     // last put's change of owner is `EPERM`. Its chunks stay held in `partial/`, verified, so
     // every read is served at once from them, nothing is asked of the source again, and the
-    // source is not blamed; the object is not whole and `objects_local` never counts it. A
-    // `security.capability` object fails the same way in the kernel; `SimFs` has no gate for
-    // it, so it is not tested.
+    // source is not blamed; the object is not whole and `objects_local` never counts it. An
+    // EPERM from setting `security.capability` is not this gap: it is shown (the EPERM tests
+    // below).
     // Method: owners `outside` with a subordinate range, so the id is mapped and the owner
     // gate is what refuses; object 0 (two chunks) is owned by 0:42, object 1 by root. Read
     // both; read object 0 again.
@@ -1166,21 +1166,189 @@ test "land: ENOSPC on a held chunk is store_full, never held (the order is pinne
 }
 
 test "owner_refused names the rootless owner gap and nothing else" {
-    // Goal: only the two shapes `apply_owner` makes are the accepted gap. Method: each shape,
-    // then the failures a read-only or unwritable store gives, and a lookalike (EACCES).
-    const Case = struct { err: fs_mod.Error, errno: u16, refused: bool };
+    // Goal: only the owner step's refusal (`step == .owner`, as `object.apply_owner` marks it)
+    // is the accepted gap; the errno alone never decides it. Method: the two shapes
+    // `apply_owner` makes, the same shapes from other steps (an EPERM from the create, an
+    // xattr, the rename), and the failures a read-only or unwritable store gives.
+    const Case = struct { err: fs_mod.Error, errno: u16, step: Step_, refused: bool };
     const cases = [_]Case{
-        .{ .err = error.AccessDenied, .errno = 0, .refused = true }, // Id the map cannot show.
-        .{ .err = error.AccessDenied, .errno = 1, .refused = true }, // EPERM from fchown.
-        .{ .err = error.AccessDenied, .errno = 13, .refused = false }, // EACCES on a directory.
-        .{ .err = error.IoFailed, .errno = 5, .refused = false },
-        .{ .err = error.IoFailed, .errno = 30, .refused = false }, // EROFS.
-        .{ .err = error.IoFailed, .errno = 1, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 0, .step = .owner, .refused = true }, // No map.
+        .{ .err = error.AccessDenied, .errno = 1, .step = .owner, .refused = true }, // fchown.
+        .{ .err = error.AccessDenied, .errno = 13, .step = .owner, .refused = false },
+        .{ .err = error.IoFailed, .errno = 5, .step = .owner, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .xattr, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .create, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .rename, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 0, .step = .unnamed, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 1, .step = .unnamed, .refused = false },
+        .{ .err = error.AccessDenied, .errno = 13, .step = .directory, .refused = false },
+        .{ .err = error.IoFailed, .errno = 30, .step = .generation, .refused = false }, // EROFS.
     };
     for (cases) |case| {
-        const failure: chunks_mod.Failure = .{ .err = case.err, .errno = case.errno };
+        const failure: chunks_mod.Failure = .{
+            .err = case.err,
+            .errno = case.errno,
+            .step = case.step,
+        };
         try testing.expectEqual(case.refused, land_mod.owner_refused(&failure));
     }
+}
+
+const Step_ = chunks_mod.Failure.Step;
+
+/// `security.capability`, as iputils' `ping` carries it: kept by the store (`xattrs.class_of`).
+const capability_xattrs = "\x01" ++ "\x13\x00" ++ "security.capability" ++ "\x04\x00" ++
+    "\x01\x00\x00\x02";
+
+/// Object `index` is owned by root and carries `security.capability`.
+fn give_capability(index: u32) void {
+    const capable: object_mod.Attrs = .{
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .xattrs = capability_xattrs,
+    };
+    assert(xattrs.validate(capable.xattrs) == .none);
+    const owned = &fixture.objects[index].wanted;
+    owned.attrs = capable;
+    owned.id = object_mod.object_id(owned.content, capable);
+}
+
+/// Rootless and outside the namespace, as the resolver's slots are: container root is the
+/// user, so an object of 0:0 needs no change of owner; any other id meets the owner gate.
+fn store_outside() void {
+    fixture.files.faults.owner_gate = .{ .context = &fixture, .in_new_user_namespace = outside };
+    fixture.store.owners = .{ .outside = .{
+        .uid = 0,
+        .gid = 0,
+        .range = .{ .uid_start = 100000, .gid_start = 100000 },
+    } };
+}
+
+/// The first write point of the last chunk's put of object 0 (two chunks, root with a file
+/// capability, the store outside) at which an EPERM leaves it `.held` with `step`; null if none.
+fn eperm_point_of(step: Step_) ?u32 {
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        give_capability(0);
+        store_outside();
+        if (land_chunk(0, 0) != .landed) return null;
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        fixture.files.faults.fail_errno = 1;
+        var failure: chunks_mod.Failure = undefined;
+        const landed = land_chunk_failing(0, 1, &failure);
+        fixture.files.faults = .{};
+        if (landed == .whole) return null;
+        if (landed != .held) continue;
+        if (failure.step == step) return point;
+    }
+    return null;
+}
+
+test "land: an EPERM from a step other than the owner is never the owner gap" {
+    // Goal: the review's case. Rootless, outside the namespace, a root-owned object with
+    // `security.capability`: no change of owner is asked, so an EPERM from the xattr (no
+    // CAP_SETFCAP), the create or any other step of the assembly is a real store failure.
+    // Method: an EPERM at each write point of the last chunk's put in turn; every `.held`
+    // answer names a step, and none of them is the owner gap. The xattr and the create are
+    // both met (the two the tests below run through the resolver).
+    var steps_seen: std.EnumSet(Step_) = .empty;
+    var point: u32 = 0;
+    while (point < 64) : (point += 1) {
+        setup(&.{2 * chunk_bytes});
+        give_capability(0);
+        store_outside();
+        try testing.expectEqual(land_mod.Landed.landed, land_chunk(0, 0));
+        fixture.files.mutations = 0;
+        fixture.files.faults.fail_mutation = point;
+        fixture.files.faults.fail_errno = 1;
+        var failure: chunks_mod.Failure = undefined;
+        const landed = land_chunk_failing(0, 1, &failure);
+        fixture.files.faults = .{};
+        if (landed == .whole) break;
+        if (landed != .held) continue;
+        try testing.expect(failure.step != .unnamed);
+        try testing.expect(failure.step != .owner);
+        try testing.expectEqual(@as(u16, 1), failure.errno);
+        try testing.expect(!land_mod.owner_refused(&failure));
+        steps_seen.insert(failure.step);
+    }
+    try testing.expect(point < 64);
+    try testing.expect(steps_seen.contains(.xattr));
+    try testing.expect(steps_seen.contains(.create));
+    try testing.expect(steps_seen.contains(.rename));
+}
+
+/// Runs the last chunk's put of object 0 through the resolver with an EPERM at the write
+/// point where it fails at `step` (`eperm_point_of`), and checks it is shown once: one
+/// `not_kept` naming `step` and EPERM, the read served, the source not blamed.
+fn expect_eperm_shown(step: Step_) !void {
+    const point = eperm_point_of(step) orelse return error.TestUnexpectedResult;
+    setup(&.{2 * chunk_bytes});
+    give_capability(0);
+    store_outside();
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    try expect_true_read(0, 0, 0);
+    fixture.files.mutations = 0;
+    fixture.files.faults.fail_mutation = point;
+    fixture.files.faults.fail_errno = 1;
+    try expect_true_read(0, 1, 100);
+    fixture.files.faults = .{};
+    try expect_true_read(0, 1, 200);
+    fixture.resolver.drain_events();
+    try testing.expectEqual(@as(u32, 1), events_of(.not_kept, ""));
+    try testing.expectEqual(@as(u32, 0), events_of(.unavailable, ""));
+    try testing.expect(!fixture.resolver.schedule.sources[0].down);
+    try testing.expect(!land_mod.object_is_whole(&fixture.store, &fixture.objects[0].wanted));
+    const shown = fixture.events[0..fixture.events_count.load(.monotonic)];
+    for (shown) |*event| {
+        if (event.kind != .not_kept) continue;
+        try testing.expectEqual(step, event.store_failure.step);
+        try testing.expectEqual(@as(u16, 1), event.store_failure.errno);
+    }
+}
+
+test "resolver: an EPERM from the xattr is shown once, not taken for the owner gap" {
+    // Goal: the review's first case end to end: rootless, an image file of 0:0 with
+    // `security.capability`; setting the xattr fails with EPERM. Method: `expect_eperm_shown`.
+    try expect_eperm_shown(.xattr);
+}
+
+test "resolver: an EPERM from the create is shown once, not taken for the owner gap" {
+    // Goal: the review's second case: a `tmp/` the store cannot create in (an immutable or
+    // sticky directory gives EPERM). Method: `expect_eperm_shown`.
+    try expect_eperm_shown(.create);
+}
+
+test "schedule: a not_kept dropped from a full queue is reported by the next chunk" {
+    // Goal: an event dropped because the queue was full (`events_dropped`) does not count as
+    // shown, so the object reports later; once queued, it is never queued again. Method: fill
+    // the queue with `store_full` events, offer a `not_kept` (dropped), empty the queue,
+    // offer it again (queued), and a third time (not queued).
+    setup(&.{2 * chunk_bytes});
+    try open_resolver(1, false, false);
+    defer close_resolver();
+    const schedule = &fixture.resolver.schedule;
+    var filled: u32 = 0;
+    while (schedule.events_count < constants.lazy_pending_max) : (filled += 1) {
+        assert(filled < constants.lazy_pending_max);
+        schedule.store_full(0, 0);
+    }
+    const failure: chunks_mod.Failure = .{ .err = error.IoFailed, .errno = 5, .step = .rename };
+    const errors_before = schedule.report.errors;
+    schedule.not_kept(0, 1, failure);
+    try testing.expectEqual(@as(u64, 1), schedule.report.events_dropped);
+    try testing.expectEqual(errors_before, schedule.report.errors);
+    while (schedule.pop_event()) |_| {}
+    schedule.not_kept(0, 1, failure);
+    schedule.not_kept(0, 0, failure);
+    try testing.expectEqual(errors_before + 1, schedule.report.errors);
+    fixture.resolver.drain_events();
+    try testing.expectEqual(@as(u32, 1), events_of(.not_kept, ""));
+    try testing.expectEqual(@as(u32, 0), events_of(.store_full, ""));
 }
 
 test "resolver: a store that cannot make the object is shown once, and the read is served" {

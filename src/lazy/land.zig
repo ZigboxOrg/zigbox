@@ -233,12 +233,14 @@ pub fn anchored(chaining: []const Digest, index: u32, chunk_bytes: u32, bytes: [
     return chaining_mod.run_value(bytes, index, chunk_bytes).eql(chaining[index]);
 }
 
-/// True if `failure` is the refusal of an owner the user may not give, outside the namespace
-/// (`object.apply_owner`): an id the map cannot show (`AccessDenied`, no errno) or a `fchown`
-/// the kernel refused (EPERM). EACCES, the denial of a directory that cannot be written, is
-/// not it.
+/// True if `failure` is the refusal of an owner the user may not give, outside the namespace,
+/// as `object.apply_owner` marks it (`step == .owner`): an id the map cannot show
+/// (`AccessDenied`, no errno) or a `fchown` the kernel refused (EPERM). The errno alone never
+/// decides it: an EPERM from any other step of the put (the create, a `security.capability`
+/// xattr, the rename into an immutable directory) is a real store failure, and is shown.
 pub fn owner_refused(failure: *const chunks.Failure) bool {
     assert(failure.errno < 4096);
+    if (failure.step != .owner) return false;
     if (failure.err != error.AccessDenied) return false;
     return failure.errno == 0 or failure.errno == errno_perm;
 }
@@ -261,7 +263,8 @@ pub fn land(
     assert(index < wanted.hashes.len);
     assert(io.len >= 4096);
     assert(@intFromPtr(failure) != 0);
-    // Some failures of the put (the listing of `partial/`) name no cause; this is what they read.
+    // A failure the put does not fill (a wanted it refuses) reads as this; every store failure
+    // names its step (`Failure.step`).
     failure.* = .{ .err = error.IoFailed, .errno = 0 };
     if (bytes.len != chunks.chunk_length(store, wanted.size, index)) return .lied;
     if (!Digest.of(bytes).eql(wanted.hashes[index])) return .lied;
@@ -273,12 +276,13 @@ pub fn land(
             error.BadWanted => .failed,
             error.ContentMismatch => .content_mismatch,
             error.Busy => .busy,
-            error.StoreFailed => if (failure_is_full(failure))
-                .store_full
-            else if (chunks.is_held(store, wanted, index))
-                .held
-            else
-                .failed,
+            error.StoreFailed => stored: {
+                // Every path of the put that fails the store names its step.
+                assert(failure.step != .unnamed);
+                if (failure_is_full(failure)) break :stored .store_full;
+                if (chunks.is_held(store, wanted, index)) break :stored .held;
+                break :stored .failed;
+            },
         };
     };
     assert(progress.have <= progress.total);
