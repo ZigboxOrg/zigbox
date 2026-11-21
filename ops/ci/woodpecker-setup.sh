@@ -242,9 +242,21 @@ the check token needs Administration: read, and $login must still exist on GitHu
         *) fail "GitHub gave '$perm' as $login's permission on $repo_name, which this script does not know" ;;
     esac
 done
+# The bot is made write by owner-github.sh. Any other admin is deleted from Woodpecker, never
+# demoted on GitHub: an organisation owner reads as admin whatever its role on the repository.
+others=""
+for login in $admins; do
+    [ "$login" = "$me_login" ] || others="$others $login"
+done
+if [ -n "$others" ]; then
+    fail "Woodpecker holds the token of an admin of $repo_name:$others. Delete each from Woodpecker \
+(curl -fsS -X DELETE -H @AUTH_FILE $server/api/users/LOGIN, ops/ci/README.md, step 3a.8) and revoke its \
+grant on GitHub, then run this again; demoting it on GitHub is not the fix (an organisation owner \
+stays admin)"
+fi
 if [ -n "$admins" ]; then
-    msg="Woodpecker holds the token of an admin of $repo_name:$admins. Make it write: gh api -X PUT \
-repos/$repo_name/collaborators/LOGIN -f permission=write (ops/ci/README.md, step 3a, 'demote')"
+    msg="Woodpecker holds the token of $me_login, an admin of $repo_name. Make it write: \
+BOT_LOGIN=$me_login OWNER_LOGINS=... bash ops/ci/owner-github.sh write (ops/ci/README.md, step 3a.7)"
     [ "$active" != true ] || fail "$msg"
     echo "ci-setup: WARNING $msg; this run turned the repository on, which needs an admin. Do it \
 now and run this script again: it refuses to finish while an admin is known here."

@@ -16,7 +16,11 @@
 # member make a fine-grained token on one of its repositories. A member inherits the organisation's
 # base repository permission on every repository, so the script sets that to `none` and reads it
 # back (this takes the base access away from every member, not only the bot: each keeps what a team
-# or a direct grant gives). The bot then gets the given role on zigbox alone (`admin` only for the
+# or a direct grant gives). In the same call it takes away every member's right to create
+# repositories (public or private) and Pages sites and to fork private repositories, so a stolen bot
+# token cannot publish under the organisation's name (again every member's, not only the bot's; the
+# organisation's owners keep these rights). It then checks that every OWNER_LOGINS account can
+# still merge into zigbox. The bot then gets the given role on zigbox alone (`admin` only for the
 # run that turns the repository on in Woodpecker, since GitHub lets only an admin do that). It sets
 # main's protection so that only OWNER_LOGINS can push or merge: no approvals are required, so the
 # supervisor's merges from the author's account still work.
@@ -40,36 +44,60 @@ apps=$(jq -Rc 'split(",") | map(select(. != ""))' <<<"${ALLOW_APPS:-}")
 jq -e --arg bot "$BOT_LOGIN" 'index($bot) == null and length > 0' <<<"$owners" >/dev/null ||
     fail "OWNER_LOGINS is empty or names the bot: the bot must not be able to merge into main"
 
-for login in $(jq -r '.[]' <<<"$owners"); do
-    perm=$(gh api "repos/$repo/collaborators/$login/permission" --jq .permission)
-    case "$perm" in admin | maintain | write) ;; *) fail "$login has $perm on $repo; it cannot merge" ;; esac
-done
-
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-# gh_or_404 PATH: the body on stdout, or nothing when GitHub answers 404; any other failure fails.
+# gh_or_404 PATH: the body on stdout, or nothing when GitHub answers 404; any other answer fails.
+# `gh api` prints an error's JSON body on stdout too, so the status line (--include) decides, never
+# whether stdout is empty.
 gh_or_404() {
-    if gh api "$1" 2>"$work/err"; then return 0; fi
-    case "$(cat "$work/err")" in
-        *"HTTP 404"*) return 0 ;;
-        *) fail "cannot read $1 ($(head -c 200 "$work/err" | tr '\n' ' '))" ;;
-    esac
+    local rc=0 status
+    gh api --include "$1" >"$work/out" 2>"$work/err" || rc=$?
+    status=$(head -n 1 "$work/out" | tr -d '\r' | awk '{print $2}')
+    if [ "$rc" = 0 ] && [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+        awk 'body { print; next } /^\r?$/ { body = 1 }' "$work/out"
+        return 0
+    fi
+    [ "$rc" = 0 ] || [ "$status" != 404 ] || return 0
+    fail "cannot read $1 (status ${status:-none}, $(head -c 200 "$work/err" | tr '\n' ' '))"
 }
 
 echo "owner-github: the bot $BOT_LOGIN: a plain member of $org, with no base permission, $level on $repo only"
-# The base permission first: from the moment the bot is a member, it holds whatever this grants on
-# every repository of the organisation.
-base=$(gh api "orgs/$org" --jq .default_repository_permission) ||
-    fail "cannot read $org's base repository permission (gh must be logged in as an owner of $org)"
-if [ "$base" != none ]; then
-    echo "owner-github: $org's base repository permission is $base; setting it to none (members keep" \
+# The organisation's member settings first: from the moment the bot is a member, it holds whatever
+# the base permission grants on every repository, and may create what members may create.
+org_fields='{default_repository_permission, members_can_create_repositories,
+    members_can_create_public_repositories, members_can_create_private_repositories,
+    members_can_create_pages, members_can_fork_private_repositories}'
+org_want='.default_repository_permission == "none" and .members_can_create_repositories == false
+    and .members_can_create_public_repositories == false
+    and .members_can_create_private_repositories == false
+    and .members_can_create_pages == false and .members_can_fork_private_repositories == false'
+settings=$(gh api "orgs/$org") ||
+    fail "cannot read $org's member settings (gh must be logged in as an owner of $org)"
+if ! jq -e "$org_want" >/dev/null <<<"$settings"; then
+    echo "owner-github: $org's member settings are $(jq -c "$org_fields" <<<"$settings"); setting" \
+        "the base permission to none and every member's create and fork rights off (members keep" \
         "what a team or a direct grant gives them)"
-    gh api -X PATCH "orgs/$org" -f default_repository_permission=none >/dev/null ||
-        fail "could not set $org's base repository permission to none"
-    base=$(gh api "orgs/$org" --jq .default_repository_permission) ||
-        fail "cannot read $org's base repository permission back"
+    gh api -X PATCH "orgs/$org" -f default_repository_permission=none \
+        -F members_can_create_repositories=false -F members_can_create_public_repositories=false \
+        -F members_can_create_private_repositories=false -F members_can_create_pages=false \
+        -F members_can_fork_private_repositories=false >/dev/null ||
+        fail "could not set $org's member settings"
+    settings=$(gh api "orgs/$org") || fail "cannot read $org's member settings back"
 fi
-[ "$base" = none ] || fail "$org's base repository permission is $base after setting it to none"
+jq -e "$org_want" >/dev/null <<<"$settings" ||
+    fail "$org's member settings are $(jq -c "$org_fields" <<<"$settings") after setting them"
+
+# Only now, with no base permission, does a merging account's own permission show: one that had
+# write only through the base permission has none any more.
+for login in $(jq -r '.[]' <<<"$owners"); do
+    perm=$(gh api "repos/$repo/collaborators/$login/permission" --jq .permission) ||
+        fail "cannot read $login's permission on $repo"
+    case "$perm" in
+        admin | maintain | write) ;;
+        *) fail "$login has $perm on $repo with no base permission, so it cannot merge; give it \
+a direct role (gh api -X PUT repos/$repo/collaborators/$login -f permission=write), run this again" ;;
+    esac
+done
 
 # A 404 is the one answer that means "not a member"; any other failure stops here (a command
 # substitution's failure is checked by `||`, never left to a test, which would read it as empty).
@@ -126,9 +154,9 @@ perm=$(gh api "repos/$repo/collaborators/$BOT_LOGIN/permission" --jq .permission
 role=$(gh api "orgs/$org/memberships/$BOT_LOGIN" --jq '"\(.state)/\(.role)"') ||
     fail "cannot read $BOT_LOGIN's membership of $org back"
 [ "$role" = active/member ] || fail "$BOT_LOGIN's membership of $org is $role, not active/member"
-base=$(gh api "orgs/$org" --jq .default_repository_permission) ||
-    fail "cannot read $org's base repository permission back"
-[ "$base" = none ] || fail "$org's base repository permission is $base, not none"
+settings=$(gh api "orgs/$org") || fail "cannot read $org's member settings back"
+jq -e "$org_want" >/dev/null <<<"$settings" ||
+    fail "$org's member settings are $(jq -c "$org_fields" <<<"$settings"), not as set"
 prot=$(gh api "repos/$repo/branches/main/protection")
 jq -e --arg bot "$BOT_LOGIN" --argjson users "$owners" --argjson apps "$apps" '
     .enforce_admins.enabled == true
@@ -140,5 +168,6 @@ jq -e --arg bot "$BOT_LOGIN" --argjson users "$owners" --argjson apps "$apps" '
     and .allow_force_pushes.enabled == false and .allow_deletions.enabled == false' \
     >/dev/null <<<"$prot" || fail "main's protection is not as set: $(jq -c .restrictions <<<"$prot")"
 who=$(jq -r '[.restrictions.users[].login] | join(",")' <<<"$prot")
-echo "owner-github: OK $BOT_LOGIN is a plain member of $org (base permission none, no team) and" \
+echo "owner-github: OK $BOT_LOGIN is a plain member of $org (base permission none, members create" \
+    "and fork nothing, no team) and" \
     "$level on $repo; only $who can push or merge into main"

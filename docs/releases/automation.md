@@ -146,6 +146,18 @@ changes the header comment (and the formula may still drop the `depends_on arch:
 if the owner later allows Intel), so those two are allowed (`.github/actions/tap-formula`). The write is one contents-API call with the blob SHA it
 read, so a concurrent change to the formula makes it fail, never overwrite.
 
+**Before you approve `tap-approve`** (only a run on an already published release asks): open the
+run's summary, where `plan` wrote who started the run and the SHA-256 of the Mac zip published now.
+Approve only if both hold, and reject otherwise:
+
+- **started by** is your own login, for a dispatch you started yourself. A run started by any other
+  account (the CI bot's token on the box included) is rejected, whatever it says.
+- **Mac zip sha256** is the hash recorded when the release was made: the `mac:` line in the summary
+  of that release's run (its `mac` job), or the `sha256` of the tap's current `Formula/zigbox.rb`
+  (`gh api repos/ZigboxOrg/homebrew-tap/contents/Formula/zigbox.rb --jq .content | base64 -d |
+  grep sha256`) when the tap already carries this version. A different hash means the published zip
+  was replaced since: reject, and find out who replaced it before anything else.
+
 ### The evidence table
 
 The draft's notes end with a table that says what CI did for the release commit, rendered from the

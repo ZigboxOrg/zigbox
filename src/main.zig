@@ -280,6 +280,8 @@ test {
     _ = @import("runtime/hosts_file_tests.zig");
     // The git backup's copy job (`ops/backup/sync.sh`).
     _ = @import("backup_sync_tests.zig");
+    // The owner's GitHub side of the CI box (`ops/ci/owner-github.sh`).
+    _ = @import("owner_github_tests.zig");
 }
 
 test {

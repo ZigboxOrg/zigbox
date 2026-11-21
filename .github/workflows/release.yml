@@ -105,6 +105,7 @@ jobs:
       EVENT: ${{ github.event_name }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       INPUT_VERSION: ${{ inputs.version }}
+      ACTOR: ${{ github.triggering_actor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -193,6 +194,24 @@ jobs:
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
           echo "release: $tag at $sha (published: $published, prerelease: $prerelease)"
+          # What the owner checks before approving `tap-approve` (docs/releases/automation.md,
+          # "The tap"): who started the run, and, on a published release, the zip's hash now.
+          if [ "$published" = true ]; then
+            zip="zbx-$version-macos-universal.zip"
+            "$GH" release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$zip" \
+              --dir "$RUNNER_TEMP/zip" 2> "$err" ||
+              fail "could not read $zip of the published $tag: $(head -c 200 "$err")"
+            zip_hash="\`$(sha256sum "$RUNNER_TEMP/zip/$zip" | cut -d ' ' -f 1)\`"
+          else
+            zip_hash="the hash comes from the mac job of this run"
+          fi
+          {
+            echo "### release $tag"
+            echo ""
+            echo "- started by: \`$ACTOR\` ($EVENT)"
+            echo "- commit: \`$sha\`, already published: $published"
+            echo "- Mac zip sha256: $zip_hash"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Replaces the wait for mac.yml: the macOS build and every gate, on a GitHub-hosted Mac, at the
   # release commit. (The VM demos need Virtualization.framework, which hosted runners lack.)
@@ -639,6 +658,8 @@ jobs:
           sha=$(/usr/bin/shasum -a 256 "zbx-$VERSION-macos-universal.zip" | /usr/bin/cut -d ' ' -f 1)
           [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::mac: the zip's sha256 is not 64 hex digits"; exit 1; }
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          # The record a later tap-approve is compared against (docs/releases/automation.md).
+          echo "mac: zbx-$VERSION-macos-universal.zip sha256 $sha" >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.release-tools/.github/actions/mac-check-zip
         with:
           zip: zig-out/mac-release/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip

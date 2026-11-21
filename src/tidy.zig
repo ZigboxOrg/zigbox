@@ -42,6 +42,8 @@ const shell_allowlist = [_][]const u8{
     // The owner's GitHub side of that setup (the bot account, `main`'s protection), run on the
     // owner's laptop: glue around `gh` and `jq`; ops/ci/README.md, step 3a.
     "ops/ci/owner-github.sh",
+    // Its test: runs the same file against a stub `gh` (src/owner_github_tests.zig).
+    "ops/ci/owner-github-test.sh",
     // The owner's release plumbing (environments, signing key, App, Mac secrets) and the copy of
     // the VM build inputs' releases: the same glue, on the same laptop.
     "ops/owner/release-setup.sh",

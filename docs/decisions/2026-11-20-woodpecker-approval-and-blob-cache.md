@@ -56,7 +56,10 @@ bot)", and to add this sentence after it: "The one exception is the Woodpecker b
 a plain member of `ZigboxOrg` (role `member`, never an owner, in no team: Woodpecker's
 `WOODPECKER_ORGS` logs in only members, and only a member can make a fine-grained token on the
 organisation's repository) while the organisation's base repository permission is `none`, so the
-membership grants it nothing on any other repository, not on `main`'s push restrictions, whose token lives only on this box; it widens nothing because it is the account
+membership grants it nothing on any other repository, and members may not create repositories
+(public or private) or Pages sites, nor fork private repositories (these settings, like the base
+permission, apply to every member of the organisation; its owners keep the right to create), so
+its token cannot publish anything under the organisation's name; not on `main`'s push restrictions, whose token lives only on this box; it widens nothing because it is the account
 Woodpecker acts as, and `woodpecker-setup.sh` refuses while it, or any other account Woodpecker
 holds, can change `main` or is a repository admin."
 

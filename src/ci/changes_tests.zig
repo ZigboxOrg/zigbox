@@ -139,12 +139,15 @@ const rows = [_]Row{
         .paths = &.{".github/release-sign-test.sh"},
         .true_outputs = &.{"code"},
     },
-    // The scripts under ops/ run on the owner's machines and the backup box, never in a demo.
+    // The scripts under ops/ run on the owner's machines and the backup box, never in a demo; their
+    // tests run in `zig build test` (code).
     .{
         .paths = &.{
             "ops/backup/sync.sh",
             "ops/backup/bootstrap.sh",
             "ops/owner/zigboxorg-setup.sh",
+            "ops/ci/owner-github.sh",
+            "ops/ci/owner-github-test.sh",
         },
         .true_outputs = &.{"code"},
     },

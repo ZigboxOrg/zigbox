@@ -133,10 +133,19 @@ and runs nothing, with no error anywhere.
    bash ops/ci/owner-github.sh admin    # or: write, on a box whose repository is already on
    ```
 
-   It first sets `ZigboxOrg`'s base repository permission to `none` and reads it back. **This
-   applies to every member, not only the bot:** a member then keeps only what a team or a direct
-   grant on a repository gives them; check with `gh api orgs/ZigboxOrg/members --jq '.[].login'`
-   who that is before the first run. The first run then invites the bot to `ZigboxOrg` as a
+   It first sets `ZigboxOrg`'s base repository permission to `none` and, in the same call, turns
+   off members' rights to create repositories (public and private), to create Pages sites and to
+   fork private repositories (`members_can_create_repositories`,
+   `members_can_create_public_repositories`, `members_can_create_private_repositories`,
+   `members_can_create_pages`, `members_can_fork_private_repositories`), so the bot's token, read
+   from the box, cannot publish anything under the organisation's name. It reads each one back and
+   stops unless all hold. **These apply to every member, not only the bot:** a member then keeps
+   only what a team or a direct grant on a repository gives them, and creates nothing (owners of
+   the organisation still can); check with `gh api orgs/ZigboxOrg/members --jq '.[].login'` who
+   that is before the first run. With the base permission gone, it checks that every
+   `OWNER_LOGINS` account can still merge (an owner of the organisation, or a direct `write`,
+   `maintain` or `admin` role) and stops, naming the account and the `gh api` line that gives it a
+   direct role, before it writes anything else. The first run then invites the bot to `ZigboxOrg` as a
    `member` and stops. Log in as the bot in a private browser window, accept at
    <https://github.com/orgs/ZigboxOrg/invitation> (or `gh api -X PATCH user/memberships/orgs/ZigboxOrg
    -f state=active` with the bot's own `gh` login), and run the same command again. It refuses
@@ -147,7 +156,7 @@ and runs nothing, with no error anywhere.
    (**no approving review**, so the supervisor's merges still work), `enforce_admins`, force pushes
    and deletion off, and **pushes and merges restricted to `OWNER_LOGINS`**. It reads everything
    back (the bot is an active `member` with the role on the repository, the base permission is
-   `none`, the restrictions are exactly `OWNER_LOGINS` and `ALLOW_APPS`, reviews are required) and
+   `none` and members create and fork nothing, the restrictions are exactly `OWNER_LOGINS` and `ALLOW_APPS`, reviews are required) and
    ends in `owner-github: OK ...`. Before you run it, check that no
    workflow pushes to `main` with a token of its own: `grep -n 'git push' .github/workflows/*.yml`
    (none does today besides tags); if one does, pass its GitHub App's slug in `ALLOW_APPS=slug`.
@@ -156,6 +165,15 @@ and runs nothing, with no error anywhere.
    only, **Administration: Read** and **Metadata: Read**, expiry 30 days; step 6's script asks for
    it, uses it for its checks and does not store it. As the **bot** (logged in as the bot):
    `ZigboxOrg/zigbox` only, **Contents: Read and write**, for the branch deletion (step 6).
+   If `ZigboxOrg` requires administrator approval of fine-grained tokens, the bot's token stays
+   *pending*, and every call with it answers 403 until you approve it, so look before step 6.
+   Approve it in the browser, at
+   <https://github.com/organizations/ZigboxOrg/settings/personal-access-token-requests> (the
+   organisation's **Settings → Personal access tokens → Pending requests**): GitHub's API for these
+   requests (`orgs/ZigboxOrg/personal-access-token-requests`) answers GitHub Apps only, so `gh`
+   logged in as you cannot list or approve them. Approve only a request from `BOT_LOGIN` for
+   `ZigboxOrg/zigbox` alone with **Contents: Read and write**; it then appears under **Active
+   tokens** on the same page.
 4. **Make the bot the Woodpecker admin** (on a fresh box the bootstrap asked for it). On the box,
    as root: set `CI_ADMINS=BOT_LOGIN` in `/etc/zigbox-ci/ci.env`, then run the bootstrap command of
    step 3 again. It installs `sqlite3`, which step 6 uses to check the repository's owner.
@@ -295,7 +313,9 @@ which is false):
   `tap` runs. Both also re-check the Linux files against `SHA256SUMS` and its signature by the
   pinned key, the formula's url and version, and that the zip holds only `zbx`; and `tap-formula`
   refuses a formula whose url is not the release's own zip. Left to the approval: on a re-dispatch,
-  the owner approves assets that nothing signed pins (`docs/releases/automation.md`).
+  the owner approves assets that nothing signed pins, after checking in `plan`'s summary that the
+  run is their own and the zip's hash is the one recorded at release time
+  (`docs/releases/automation.md`, "The tap").
 - **So the control is on accounts, not on the protection alone:** Woodpecker only ever knows a
   dedicated bot account with the `write` role, which is not on `main`'s restriction list; the owner
   accounts that can merge never log in to it (step 3a). `woodpecker-setup.sh` checks this, with a
