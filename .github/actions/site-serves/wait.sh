@@ -22,7 +22,8 @@
 # release or the archive's sum changed: a refresh that replaces the asset, or a newer release
 # published mid-wait, moves the target instead of failing a healthy wait.
 # Exit 0 once every file matches (or the wait is skipped); 1, with one line on stderr saying what
-# was served instead, when the wait runs out; 2 on a usage, API or archive error.
+# was served instead, when the wait runs out; 2 on a usage, API or archive error (the requests
+# before the wait are tried four times first).
 set -euo pipefail
 
 who=${SITE_WHO:-site}
@@ -54,13 +55,17 @@ trap 'rm -rf "$work"' EXIT
 
 auth=()
 [ -z "${GH_TOKEN:-}" ] || auth=(-H "Authorization: Bearer $GH_TOKEN")
+# The requests made before the wait starts are retried, so one 502 or reset connection from the
+# API or the downloads does not fail the run; the loop sets this empty, since its next poll is
+# the retry.
+retry=(--retry 3 --retry-all-errors)
 # Reads the releases. Sets `self_prerelease` for this tag, and `newer` to the
 # newest release created after it that is neither a draft nor a prerelease and carries the
 # archive (empty if none, or if this tag is not listed yet). Only a release newer than this one
 # counts: while a refresh replaces this release's asset it briefly carries none, and an older
 # release must not be taken for the newest then. Returns 1 if the API does not answer.
 releases() {
-  curl -fsS --max-time 30 "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+  curl -fsS --max-time 30 "${retry[@]}" "${auth[@]}" -H 'Accept: application/vnd.github+json' \
     -o "$work/releases.json" "$api/releases?per_page=100" 2>/dev/null || return 1
   jq -r --arg t "$tag" '
     (map(select(.tag_name == $t)) | .[0]) as $self
@@ -76,7 +81,8 @@ releases() {
 
 # Fetches TAG's SHA256SUMS line for the archive into $work/sum.new; returns 1 on any failure.
 fetch_sum() {
-  curl -fsSL --max-time 60 -o "$work/SHA256SUMS" "$download/$1/SHA256SUMS" 2>/dev/null &&
+  curl -fsSL --max-time 60 "${retry[@]}" -o "$work/SHA256SUMS" "$download/$1/SHA256SUMS" \
+    2>/dev/null &&
     grep ' zigbox-repos\.tar\.gz$' "$work/SHA256SUMS" > "$work/sum.new"
 }
 
@@ -86,7 +92,7 @@ fetch_sum() {
 take() {
   rm -rf "$work/next"
   mkdir "$work/next"
-  if ! curl -fsSL --max-time 300 -o "$work/next/zigbox-repos.tar.gz" \
+  if ! curl -fsSL --max-time 300 "${retry[@]}" -o "$work/next/zigbox-repos.tar.gz" \
     "$download/$1/zigbox-repos.tar.gz" 2>/dev/null; then
     echo "$1's zigbox-repos.tar.gz did not download"
     return 1
@@ -178,6 +184,7 @@ fi
 fetch_sum "$tag" || fail "$tag's SHA256SUMS did not download or does not list zigbox-repos.tar.gz"
 target=$tag
 take "$tag" > "$work/why" || fail "$(cat "$work/why")"
+retry=()
 
 deadline=$(( $(date +%s) + wait_seconds ))
 while :; do

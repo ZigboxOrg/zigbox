@@ -2,8 +2,10 @@
 # Tests .github/actions/site-serves/wait.sh against a local HTTP server (python3's http.server)
 # that plays the site, the release downloads and the releases API: it passes when the site serves
 # the archive's files, passes once a stale site catches up, follows a refreshed asset or a newer
-# release during the wait, skips a prerelease and a release with a newer one, and otherwise fails
-# with one line, prefixed with the caller, naming what was served instead.
+# release during the wait, skips a prerelease and a release with a newer one (but not one with a
+# newer draft or prerelease, nor a release not listed yet), retries a request that fails once
+# before the wait, refuses an archive whose files are not regular files, and otherwise fails with
+# one line, prefixed with the caller, naming what was served instead.
 # Usage: .github/site-serves-test.sh (from the repository root).
 set -euo pipefail
 
@@ -42,13 +44,14 @@ publish() {
   (cd "$work/root/dl/$tag" && sha256sum zigbox-repos.tar.gz > SHA256SUMS)
 }
 
-# releases ENTRY...: the API's release list, each ENTRY TAG,CREATED,PRERELEASE,HAS_ARCHIVE.
+# releases ENTRY...: the API's release list, each ENTRY TAG,CREATED,PRERELEASE,HAS_ARCHIVE[,DRAFT].
 releases() {
-  local entry tag created pre has json="["
+  local entry tag created pre has draft json="["
   for entry in "$@"; do
-    IFS=, read -r tag created pre has <<< "$entry"
+    IFS=, read -r tag created pre has draft <<< "$entry"
     [ "$json" = "[" ] || json+=","
-    json+="{\"tag_name\":\"$tag\",\"created_at\":\"$created\",\"draft\":false,\"prerelease\":$pre,"
+    json+="{\"tag_name\":\"$tag\",\"created_at\":\"$created\",\"draft\":${draft:-false},"
+    json+="\"prerelease\":$pre,"
     if [ "$has" = true ]; then
       json+="\"assets\":[{\"name\":\"SHA256SUMS\"},{\"name\":\"zigbox-repos.tar.gz\"}]}"
     else
@@ -67,7 +70,27 @@ make_tree "$work/next" next 'Tue, 24 Nov 2026 10:00:00 UTC'
 publish v0.6.0 "$work/new"
 releases v0.6.0,2026-11-22T19:49:00Z,false,true v0.5.0,2026-11-18T00:50:00Z,false,true
 
-python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$work/root" > "$work/server.log" 2>&1 &
+# Serves $work/root; a GET whose path has a file under $work/fail-once answers 502 once (the file
+# is removed).
+mkdir -p "$work/fail-once"
+python3 -u - "$work/root" "$work/fail-once" > "$work/server.log" 2>&1 <<'EOF' &
+import functools, http.server, os, sys
+root, marks = sys.argv[1], sys.argv[2]
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        mark = os.path.join(marks, self.path.split("?")[0].lstrip("/"))
+        if os.path.isfile(mark):
+            os.remove(mark)
+            self.send_error(502)
+            return
+        super().do_GET()
+    def log_message(self, *args):
+        pass
+handler = functools.partial(Handler, directory=root)
+httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+print("serving on port", httpd.server_address[1], "now", flush=True)
+httpd.serve_forever()
+EOF
 server=$!
 port=""
 for _ in $(seq 1 50); do
@@ -97,6 +120,8 @@ expect() {
   fi
 }
 serve() { rm -rf "$work/root/site"; cp -R "$1/." "$work/root/site/"; }
+# fail_once PATH: the server's next GET of PATH answers 502.
+fail_once() { mkdir -p "$work/fail-once/$(dirname "$1")"; touch "$work/fail-once/$1"; }
 
 # Nothing served yet: a 404, prefixed with the caller.
 expect 1 'release: http://127.0.0.1' SITE_WAIT_SECONDS=0
@@ -126,6 +151,14 @@ helper=$!
 expect 0 'release: waiting, /rpm/aarch64/repodata/repomd.xml differs' \
   SITE_WAIT_SECONDS=20 SITE_POLL_SECONDS=1
 wait "$helper"
+# Nothing changed upstream during that wait, so the archive was not taken again.
+! grep -qF 'now comparing' "$work/out" || fail "retargeted with nothing changed: $(cat "$work/out")"
+# One failed answer from the API, the SHA256SUMS or the archive before the wait is retried.
+for f in api/releases dl/v0.6.0/SHA256SUMS dl/v0.6.0/zigbox-repos.tar.gz; do
+  fail_once "$f"
+  expect 0 "release: $base serves v0.6.0's repositories" SITE_WAIT_SECONDS=0
+  [ ! -e "$work/fail-once/$f" ] || fail "/$f was not requested"
+done
 # The refresh replaces the asset during the wait and the site serves the refreshed one: the wait
 # takes the new archive (checked against the new SHA256SUMS) and passes.
 serve "$work/refreshed"
@@ -152,6 +185,18 @@ expect 0 'v0.6.0 is not the newest release with zigbox-repos.tar.gz (v0.7.0 is)'
 releases v0.7.0,2026-11-24T09:00:00Z,false,false v0.6.0,2026-11-22T19:49:00Z,false,true
 publish v0.6.0 "$work/new"
 expect 1 "v0.6.0's has Date: Sun, 22 Nov 2026" SITE_WAIT_SECONDS=0
+# Nor does a newer prerelease or a newer draft that carries it: the site serves neither.
+releases v0.7.0-rc.1,2026-11-24T09:00:00Z,true,true v0.6.0,2026-11-22T19:49:00Z,false,true
+expect 1 "v0.6.0's has Date: Sun, 22 Nov 2026" SITE_WAIT_SECONDS=0
+releases v0.7.0,2026-11-24T09:00:00Z,false,true,true v0.6.0,2026-11-22T19:49:00Z,false,true
+expect 1 "v0.6.0's has Date: Sun, 22 Nov 2026" SITE_WAIT_SECONDS=0
+# A release the API does not list yet is waited for, never skipped, even beside a newer one.
+releases v0.7.0,2026-11-24T09:00:00Z,false,true v0.5.0,2026-11-18T00:50:00Z,false,true
+expect 1 "v0.6.0's has Date: Sun, 22 Nov 2026" SITE_WAIT_SECONDS=0
+# Of two newer releases, the one created last is named, whatever the list's order.
+releases v0.7.0,2026-11-24T09:00:00Z,false,true v0.8.0,2026-11-25T09:00:00Z,false,true \
+  v0.6.0,2026-11-22T19:49:00Z,false,true
+expect 0 'v0.6.0 is not the newest release with zigbox-repos.tar.gz (v0.8.0 is)' SITE_WAIT_SECONDS=0
 # A prerelease is not waited for, and nothing is downloaded for it.
 releases v0.7.0-rc.1,2026-11-24T09:00:00Z,true,true v0.6.0,2026-11-22T19:49:00Z,false,true
 TAG=v0.7.0-rc.1 expect 0 'release: v0.7.0-rc.1 is a prerelease' SITE_WAIT_SECONDS=0
@@ -181,6 +226,14 @@ expect 2 'release: v0.6.0'"'"'s zigbox-repos.tar.gz does not match its SHA256SUM
 tar -czf "$work/root/dl/v0.6.0/zigbox-repos.tar.gz" -C "$work/new" apt
 (cd "$work/root/dl/v0.6.0" && sha256sum zigbox-repos.tar.gz > SHA256SUMS)
 expect 2 'does not hold' SITE_WAIT_SECONDS=0
+# A compared file that is a symlink in the archive is refused, even when it points at a match.
+cp -R "$work/new" "$work/linked"
+rm "$work/linked/zigbox-archive-keyring.asc"
+ln -s "$work/new/zigbox-archive-keyring.asc" "$work/linked/zigbox-archive-keyring.asc"
+publish v0.6.0 "$work/linked"
+serve "$work/new"
+expect 2 'zigbox-archive-keyring.asc in v0.6.0'"'"'s zigbox-repos.tar.gz is not a regular file' \
+  SITE_WAIT_SECONDS=0
 # A releases API that does not answer is refused.
 expect 2 "release: http://127.0.0.1:$port/none/releases did not answer" SITE_WAIT_SECONDS=0 \
   SITE_API="http://127.0.0.1:$port/none"
