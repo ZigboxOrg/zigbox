@@ -984,7 +984,7 @@ test "explain agrees with the diagnostic except for the instance's summary" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const docs = "https://zigbox.github.io/zigbox/errors/E0805.html";
+    const docs = "https://zigbox.org/errors/box/E0805.html";
     const diagnostic: json.Diagnostic = .{
         .code = "ZBX-E0805",
         .severity = "error",

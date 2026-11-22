@@ -61,8 +61,10 @@ const shell_allowlist = [_][]const u8{
     // The last gate before publishing, and its tamper tests: the program that checks is `gpg`.
     ".github/release-prepare-check.sh",
     ".github/release-prepare-test.sh",
-    // The tap job's check that the formula names only the release's zip, and its test.
+    // The tap job's checks that the formula names only the release's zip and differs from the
+    // tap's only where a release may (glue around `diff` and `grep`), and their test.
     ".github/actions/tap-formula/check-url.sh",
+    ".github/actions/tap-formula/check-diff.sh",
     ".github/tap-formula-test.sh",
     // The weekly re-sign: the same `gpg` glue as release-sign.sh, around its own checks.
     ".github/package-refresh.sh",

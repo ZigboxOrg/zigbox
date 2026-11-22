@@ -23,6 +23,14 @@ pub const Error = error{
     BadTime,
 };
 
+/// Said when the time is out of range. The default (`package_source_date_epoch`, 1980) is below
+/// the range on purpose: a release has no fixed time, so the caller must pass one.
+const bad_time_text = std.fmt.comptimePrint(
+    "the source date is out of range ({d} to {d}): pass the release's time in seconds " ++
+        "since 1970 as -Dsource-date-epoch=N (the tool's --source-date-epoch N)",
+    .{ constants.apt_signed_at_min, constants.apt_signed_at_max },
+);
+
 pub fn describe(err: Error) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
@@ -31,7 +39,7 @@ pub fn describe(err: Error) []const u8 {
         error.BadAsset => "an asset name is not a plain file name, or two assets share one",
         error.TooManyAssets => "more assets than the bound allows",
         error.FileTooLarge => "a file is larger than the bound allows",
-        error.BadTime => "the source date is out of range",
+        error.BadTime => bad_time_text,
     };
 }
 
@@ -249,7 +257,7 @@ fn sbom_head(writer: *std.Io.Writer, inputs: *const Inputs) std.Io.Writer.Error!
         \\      "version": "{s}",
         \\      "description": "Rootless, daemonless Linux container runtime and image builder",
         \\      "licenses": [ {{ "license": {{ "id": "{s}" }} }} ],
-        \\      "purl": "pkg:github/zigbox/zigbox@v{s}",
+        \\      "purl": "pkg:github/zigboxorg/zigbox@v{s}",
         \\      "externalReferences": [
         \\        {{ "type": "website", "url": "https://zigbox.org" }},
         \\        {{ "type": "vcs", "url": "https://github.com/ZigboxOrg/zigbox" }}
@@ -361,7 +369,7 @@ test "the sbom is valid JSON that says what is in the build and that nothing els
     try std.testing.expectEqualStrings("1.5", root.get("specVersion").?.string);
     const main = root.get("metadata").?.object.get("component").?.object;
     const purl = main.get("purl").?.string;
-    try std.testing.expectEqualStrings("pkg:github/zigbox/zigbox@v1.2.3", purl);
+    try std.testing.expectEqualStrings("pkg:github/zigboxorg/zigbox@v1.2.3", purl);
     try std.testing.expectEqualStrings("1.2.3", main.get("version").?.string);
     const id = main.get("licenses").?.array.items[0].object.get("license").?.object.get("id");
     try std.testing.expectEqualStrings("Apache-2.0", id.?.string);

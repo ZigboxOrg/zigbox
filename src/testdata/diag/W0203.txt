@@ -3,4 +3,4 @@ warning[ZBX-W0203]: skipped a run record that can't be read
          record
   fix    look at them:   ls -l "/home/alice/.local/state/zbx/runs"
   more   zbx explain W0203 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/W0203.html
+  docs   https://zigbox.org/errors/box/W0203.html

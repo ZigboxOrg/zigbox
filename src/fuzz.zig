@@ -1228,10 +1228,10 @@ fn parse_arguments(arguments: []const []const u8) UsageError!Parsed {
 
 pub fn main(init: std.process.Init) u8 {
     var buffer: [4096]u8 = undefined;
-    var file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &buffer);
+    var file_writer = stdio_writer(.stdout(), init.io, &buffer);
     const out = &file_writer.interface;
     var error_buffer: [256]u8 = undefined;
-    var error_writer: std.Io.File.Writer = .init(.stderr(), init.io, &error_buffer);
+    var error_writer = stdio_writer(.stderr(), init.io, &error_buffer);
     const seeds: Seeds = .{ .out = out, .err = &error_writer.interface };
 
     var arguments_storage: [4][]const u8 = undefined;
@@ -1280,6 +1280,19 @@ pub fn main(init: std.process.Init) u8 {
     out.print("fuzz: {s} ok\n", .{parsed.fuzzer.name}) catch return constants.tool_exit_failed;
     out.flush() catch return constants.tool_exit_failed;
     return constants.tool_exit_ok;
+}
+
+/// A writer for stdout or stderr that writes at the descriptor's own offset, as the panic handler
+/// does. `File.Writer.init` is positional: it writes at an offset of its own, from 0, and never
+/// moves the descriptor's. With both streams sent to one file (`> log 2>&1`, and `zig build
+/// check`, which gives each shard one log for both), the result lines were written over the seed
+/// lines, and a crash's trace, written at the descriptor's offset (still 0), over both: the
+/// release fuzz run of 0.6.0-rc1 aborted with no `fuzz:` line left to replay.
+fn stdio_writer(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
+    assert(buffer.len > 0);
+    const writer: std.Io.File.Writer = .initStreaming(file, io, buffer);
+    assert(writer.mode == .streaming);
+    return writer;
 }
 
 /// Where a fuzzer's seed line goes: stderr, which `zig build` shows when the run crashes (it
@@ -1417,6 +1430,34 @@ test "shard shares add up to the iterations and differ by at most one" {
     }
 }
 
+test "seed lines survive a crash when stdout and stderr share one file" {
+    // Goal: the seed line is still in the log when the run dies, with both streams in one file
+    // as `zig build check` and `> log 2>&1` arrange (a positional writer lost it: 0.6.0-rc1's
+    // release fuzz run). Method: both writers on one file, as `main` makes them, then a trace
+    // written at the descriptor's offset, as the panic handler writes it; every line must be
+    // there, in order.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "log", .{ .read = true });
+    defer file.close(io);
+    var out_buffer: [64]u8 = undefined;
+    var out = stdio_writer(file, io, &out_buffer);
+    var err_buffer: [64]u8 = undefined;
+    var err = stdio_writer(file, io, &err_buffer);
+    const seeds: Seeds = .{ .out = &out.interface, .err = &err.interface };
+    try seeds.announce("logs", 7, 3);
+    try out.interface.writeAll("fuzz: cli ok\n");
+    try out.interface.flush();
+    try seeds.announce("text", 8, 3);
+    try file.writeStreamingAll(io, "thread 1 panic: reached unreachable code\n");
+    var text: [256]u8 = @splat(0xaa);
+    const length = try file.readPositionalAll(io, &text, 0);
+    const expected = "fuzz: logs seed=7 iterations=3\nfuzz: cli ok\n" ++
+        "fuzz: text seed=8 iterations=3\nthread 1 panic: reached unreachable code\n";
+    try std.testing.expectEqualStrings(expected, text[0..length]);
+}
+
 test "parse_arguments accepts the documented forms and refuses the rest" {
     // Goal: `<fuzzer>`, `<fuzzer> <seed>` and `<fuzzer> <seed> <iterations>` parse; hex seeds
     // work; every malformed form is a named error.
@@ -1444,6 +1485,20 @@ test "every fuzzer survives a fixed seed for a few hundred iterations" {
         var splitmix = std.Random.SplitMix64.init(12345);
         for (0..500) |_| fuzzer.run_iteration(splitmix.next());
     }
+}
+
+test "logs: a write interrupted past the retry bound stops the log, and the log stays whole" {
+    // Goal: a regression found by 0.6.0-rc1's release fuzz run (`logs`, seed 19, iteration
+    // 574572; seed 20 fails too): at a 27.9% interrupt rate one write of the log was interrupted
+    // 17 times in a row, `write_all` gave up as `store_io_retries_max` says it must, and the
+    // oracle's claim that the writer always finishes failed. Method: that iteration's seed, which
+    // must still reach the writer giving up, and then the whole fuzzer on it.
+    var splitmix = std.Random.SplitMix64.init(19);
+    for (0..574572) |_| _ = splitmix.next();
+    const seed = splitmix.next();
+    try std.testing.expectEqual(@as(u64, 10899674490826961297), seed);
+    try std.testing.expect(logs_fuzz.cap_gave_up(seed));
+    logs_fuzz.fuzz_logs(seed);
 }
 
 test "doctor: interrupts that make a write give up are not a missing diagnostic" {

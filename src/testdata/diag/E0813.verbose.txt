@@ -4,4 +4,4 @@ error[ZBX-E0813]: a Dockerfile stage can't be used
   line   9
   fix    give each stage its own name
   more   zbx explain E0813
-  docs   https://zigbox.github.io/zigbox/errors/E0813.html
+  docs   https://zigbox.org/errors/box/E0813.html

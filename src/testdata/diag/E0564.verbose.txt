@@ -5,4 +5,4 @@ error[ZBX-E0564]: the subject token for workload identity cannot be read
   fix    check that the token is there and current: an OIDC token lasts minutes
          in GitHub Actions the job needs 'permissions: id-token: write'
   more   zbx explain E0564
-  docs   https://zigbox.github.io/zigbox/errors/E0564.html
+  docs   https://zigbox.org/errors/box/E0564.html

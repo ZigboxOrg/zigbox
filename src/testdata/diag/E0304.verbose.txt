@@ -8,4 +8,4 @@ error[ZBX-E0304]: systemd refused the container's scope, or its job failed
   step   start_scope (6 of 69)
   fix    see what the manager logged:   journalctl --user -n 20
   more   zbx explain E0304
-  docs   https://zigbox.github.io/zigbox/errors/E0304.html
+  docs   https://zigbox.org/errors/box/E0304.html

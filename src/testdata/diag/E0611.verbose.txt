@@ -7,4 +7,4 @@ error[ZBX-E0611]: a socket could not be made inside the container
   step   join_user
   fix    run as the user that started the container, then check the host:   zbx doctor
   more   zbx explain E0611
-  docs   https://zigbox.github.io/zigbox/errors/E0611.html
+  docs   https://zigbox.org/errors/box/E0611.html

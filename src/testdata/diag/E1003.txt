@@ -3,4 +3,4 @@ error[ZBX-E1003]: the virtual machine did not answer in time
   fix    stop what is left of it:      zbx vm stop
          read how far the guest got:   tail -n 20 '/Users/ada/Library/Application Support/zbx/vm/console.log'
   more   zbx explain E1003 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E1003.html
+  docs   https://zigbox.org/errors/box/E1003.html

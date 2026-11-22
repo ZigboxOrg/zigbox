@@ -7,4 +7,4 @@ error[ZBX-E0716]: can't read the state volume to export it
   path   /home/alice/.local/share/zbx/state/pgdata/data/base
   fix    stop what changes the volume, then export again
   more   zbx explain E0716
-  docs   https://zigbox.github.io/zigbox/errors/E0716.html
+  docs   https://zigbox.org/errors/box/E0716.html

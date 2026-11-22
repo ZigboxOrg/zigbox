@@ -15,8 +15,6 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const codes = @import("diag/codes.zig");
 
-const site_url = "https://zigbox.github.io/zigbox/";
-
 const head_start =
     \\<!doctype html>
     \\<html lang="en">
@@ -176,9 +174,11 @@ fn write_head(
     emit_format(writer, "<title>{s} \u{b7} Zigbox</title>\n", .{title});
     emit(writer, "<meta name=\"description\" content=\"");
     write_escaped(writer, summary);
-    emit_format(writer, "\">\n<link rel=\"canonical\" href=\"" ++ site_url ++ "errors/{s}\">\n", .{
-        file,
-    });
+    emit_format(
+        writer,
+        "\">\n<link rel=\"canonical\" href=\"" ++ constants.docs_url_base ++ "{s}\">\n",
+        .{file},
+    );
     emit(writer, head_fonts ++ fonts_url ++ head_end);
 }
 

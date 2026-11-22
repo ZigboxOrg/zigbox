@@ -4740,11 +4740,19 @@ const FrameSink = struct {
         write_frame(sink.host, sink.fd, frame_warning, null, text) catch return;
     }
 
-    /// The start is reported next: later lines of a lazy run go to its log alone.
-    fn end(sink: *FrameSink) void {
+    /// Sends the frame that reports the start (started or failed), whole, and ends the sink in
+    /// the same critical section: a resolver or FUSE thread's warning can neither land inside
+    /// it nor follow it. Later lines of a lazy run go to its log alone.
+    fn finish(sink: *FrameSink, tag: u8, head: ?u8, body: []const u8) host_mod.Error!void {
+        assert(tag > frame_warning);
+        assert(tag <= frame_failed);
+        assert(body.len < constants.output_bytes_max);
         while (!sink.lock.tryLock()) std.Thread.yield() catch {};
         defer sink.lock.unlock();
+        // The start is reported once.
+        assert(!sink.ended);
         sink.ended = true;
+        try write_frame(sink.host, sink.fd, tag, head, body);
     }
 };
 
@@ -4838,14 +4846,14 @@ fn supervise(
     const handle = &storage.handle;
     if (lazy == .remote) {
         attach_remote(host, invocation, storage, &sink, &diag) catch {
-            return supervise_failed(host, invocation, fd, &diag);
+            return supervise_failed(invocation, &sink, &diag);
         };
     }
     // The serving threads end with the container's mount namespace: joined after the run, and
     // the registry token wiped, before `exit_now` (which runs no caller's `defer`).
     defer if (lazy != .none) lazy_finish(storage);
     runtime.start(host, container, options, handle, &diag) catch {
-        return supervise_failed(host, invocation, fd, &diag);
+        return supervise_failed(invocation, &sink, &diag);
     };
     const started_bytes_max = constants.container_name_bytes_max +
         constants.scope_name_bytes_max + 24 + constants.store_digest_text_bytes + 1;
@@ -4859,20 +4867,15 @@ fn supervise(
         scope,
         tree,
     }) catch unreachable; // A name, a pid, a scope name and a tree fit the buffer.
-    sink.end();
-    write_frame(host, fd, frame_started, null, made) catch {};
+    sink.finish(frame_started, null, made) catch {};
     host.close(fd); // The caller can go; the container's end is ours to see to.
     _ = runtime.wait(handle);
     return constants.exit_ok;
 }
 
-/// The supervisor's start failed: the diagnostic goes to the caller as the failed frame.
-fn supervise_failed(
-    host: Host,
-    invocation: *const Invocation,
-    fd: host_mod.Handle,
-    diag: *Diag,
-) u8 {
+/// The supervisor's start failed: the diagnostic goes to the caller as the failed frame, sent
+/// through the sink, since a lazy run's threads may still be warning until `lazy_finish`.
+fn supervise_failed(invocation: *const Invocation, sink: *FrameSink, diag: *Diag) u8 {
     if (diag.code == null) {
         diag.raise(.B0001);
         diag.cause("a failure reached the supervisor with no diagnostic", .{});
@@ -4881,7 +4884,7 @@ fn supervise_failed(
     var buffer: [constants.output_bytes_max]u8 = undefined;
     const text = render.render(diag, invocation.options.mode(), false, &buffer);
     const code = diag.exit_code_in(.container_run);
-    write_frame(host, fd, frame_failed, code, text) catch return code;
+    sink.finish(frame_failed, code, text) catch return code;
     return code;
 }
 
@@ -6611,6 +6614,35 @@ test "run -d: a failed start passes the supervisor's diagnostic and code through
     try testing.expectEqual(@as(u8, 126), failed);
     sim.interface().close(read);
     try testing.expectEqualStrings("zbx: refused\n", sim.stderr());
+    try testing.expectEqual(@as(usize, 0), sim.stdout().len);
+}
+
+test "run -d: the sink ends with its final frame, and a later warning is not sent" {
+    // Goal: the frame that reports the start is the last one on the pipe, whole, even while a
+    // lazy run's threads still warn (review of 0.6.0 RC1). Method: one thread, in order: a
+    // warning, the failed frame, then a warning as a resolver thread would send it after the
+    // failure; the caller must see the first warning, the refusal and its code, then the end.
+    var sim: HostSim = undefined;
+    sim_run.init(&sim, 9);
+    const host = sim.interface();
+    const pipe = try host.pipe();
+    const options: Options = .{ .runs_container = true };
+    var sink: FrameSink = .{ .host = host, .fd = pipe.write, .options = options };
+    sink.warning("zbx: warning: before\n");
+    try testing.expect(!sink.ended);
+    try sink.finish(frame_failed, 126, "zbx: refused\n");
+    try testing.expect(sink.ended);
+    sink.warning("zbx: warning: after\n");
+    host.close(pipe.write);
+    var diag: Diag = undefined;
+    diag.reset();
+    const failed = try relay(host, pipe.read, options, &test_container, &test_ran, &diag);
+    try testing.expectEqual(@as(u8, 126), failed);
+    // Nothing follows the failed frame: the late warning was dropped, not queued.
+    var rest: [1]u8 = .{0xaa};
+    try testing.expectEqual(@as(usize, 0), try host.read_some(pipe.read, &rest));
+    host.close(pipe.read);
+    try testing.expectEqualStrings("zbx: warning: before\nzbx: refused\n", sim.stderr());
     try testing.expectEqual(@as(usize, 0), sim.stdout().len);
 }
 

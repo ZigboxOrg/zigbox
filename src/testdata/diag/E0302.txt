@@ -5,4 +5,4 @@ error[ZBX-E0302]: the user bus refused to authenticate this user
   fix    see which bus this process uses:   echo $DBUS_SESSION_BUS_ADDRESS
          or log in again through a systemd session
   more   zbx explain E0302 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0302.html
+  docs   https://zigbox.org/errors/box/E0302.html

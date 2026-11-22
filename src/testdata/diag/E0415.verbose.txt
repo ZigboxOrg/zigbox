@@ -5,4 +5,4 @@ error[ZBX-E0415]: the directory tree is bigger than an import limit
   path   /deep/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d
   fix    split the directory, or leave out what the root filesystem does not need
   more   zbx explain E0415
-  docs   https://zigbox.github.io/zigbox/errors/E0415.html
+  docs   https://zigbox.org/errors/box/E0415.html

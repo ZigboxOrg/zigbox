@@ -5,4 +5,4 @@ error[ZBX-E0602]: pasta is too old
   pasta  /usr/bin/pasta
   fix    install a newer passt package:   sudo apt install passt
   more   zbx explain E0602
-  docs   https://zigbox.github.io/zigbox/errors/E0602.html
+  docs   https://zigbox.org/errors/box/E0602.html

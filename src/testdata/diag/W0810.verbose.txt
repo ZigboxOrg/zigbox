@@ -6,4 +6,4 @@ warning[ZBX-W0810]: the import has steps that are not hermetic
   steps  1
   fix    pin what each step fetches; zbx import --hermetic refuses such steps
   more   zbx explain W0810
-  docs   https://zigbox.github.io/zigbox/errors/W0810.html
+  docs   https://zigbox.org/errors/box/W0810.html

@@ -5,4 +5,4 @@ error[ZBX-E0518]: zbx.lock can't be read
   path   /home/alice/project/zbx.lock
   fix    remove the lock and pull again to write a new one:   rm '/home/alice/project/zbx.lock'
   more   zbx explain E0518
-  docs   https://zigbox.github.io/zigbox/errors/E0518.html
+  docs   https://zigbox.org/errors/box/E0518.html

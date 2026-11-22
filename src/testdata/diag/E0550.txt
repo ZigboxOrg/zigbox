@@ -3,4 +3,4 @@ error[ZBX-E0550]: the source cannot be packed into an image
          or tree by that name
   fix    list what the store keeps:   zbx store ls
   more   zbx explain E0550 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0550.html
+  docs   https://zigbox.org/errors/box/E0550.html

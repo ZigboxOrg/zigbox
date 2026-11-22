@@ -2,7 +2,8 @@ name: Check the formula against the tap
 description: >
   Fetches Formula/zigbox.rb from ZigboxOrg/homebrew-tap main and compares it with the generated
   formula. Refuses unless the difference is only the url, version and sha256 lines (plus the
-  lines listed below, which the move to a universal binary changes once). Writes nothing to the
+  lines check-diff.sh lists, which the move to a universal binary and the move to ZigboxOrg and
+  Apache-2.0 change once). Writes nothing to the
   tap. The caller sets GH_TOKEN to a token that can read the tap and runs the pinned gh.
 inputs:
   formula:
@@ -30,7 +31,7 @@ runs:
         TAP: ZigboxOrg/homebrew-tap
       run: |
         # Before anything is fetched: the formula names exactly one url, and it is the release's zip.
-        # The line filter below allows any url line, so this is the check on the value.
+        # The line rule (check-diff.sh) allows any url line, so this is the check on the value.
         "$GITHUB_ACTION_PATH/check-url.sh" "$FORMULA" "$WANT_URL"
         current="${RUNNER_TEMP}/tap-current.rb"
         info=$(gh api "repos/$TAP/contents/Formula/zigbox.rb?ref=main" --jq '.sha')
@@ -41,18 +42,8 @@ runs:
           echo "changed=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        # diff exits 1 when the files differ, which they do here; under pipefail that would end the
-        # step silently, so its status is dropped (2, trouble, cannot happen: both files exist).
-        changed=$({ diff -U0 "$current" "$FORMULA" || true; } | { grep -E '^[+-]' || true; } | { grep -Ev '^(\+\+\+|---)' || true; })
-        # url, version and sha256 change every release. The other lines are what the move to one
-        # universal binary changes, once: the header comment and the two comment lines that say why
-        # the arm64-only dependency stays.
-        allowed='^[+-] *(url|version|sha256) "|^[+-]# zbx for macOS|^-  depends_on arch: :arm64$'
-        allowed+='|^\+  # The universal zip carries an x86_64 slice|^\+  # silicon: an Intel Mac is refused'
-        if [ -n "$(grep -Ev "$allowed" <<< "$changed" || true)" ]; then
-          echo "release: the formula differs from the tap's in more than url, version and sha256:" >&2
-          printf '%s\n' "$changed" >&2
-          exit 1
-        fi
+        # The rule on which lines may differ, tested against the tap's real formula by
+        # .github/tap-formula-test.sh.
+        "$GITHUB_ACTION_PATH/check-diff.sh" "$current" "$FORMULA"
         echo "tap: the formula differs from the tap's only in allowed lines"
         echo "changed=true" >> "$GITHUB_OUTPUT"

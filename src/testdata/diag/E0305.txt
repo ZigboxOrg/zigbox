@@ -4,4 +4,4 @@ error[ZBX-E0305]: a scope with this container's name already exists
   fix    choose another name:      zbx run --name <other-name> ...
          or stop the other unit:   systemctl --user stop zbx-web-1.scope
   more   zbx explain E0305 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0305.html
+  docs   https://zigbox.org/errors/box/E0305.html

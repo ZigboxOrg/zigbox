@@ -6,4 +6,4 @@ error[ZBX-E0566]: Google refused to impersonate the service account
   perm   iam.serviceAccounts.getAccessToken
   fix    grant the pool's principal roles/iam.workloadIdentityUser on the service account
   more   zbx explain E0566
-  docs   https://zigbox.github.io/zigbox/errors/E0566.html
+  docs   https://zigbox.org/errors/box/E0566.html

@@ -6,4 +6,4 @@ error[ZBX-E0522]: no image of that name is locked or in the store
   ref    registry.test/fixture/open:3.20
   fix    pull it (this also records it in zbx.lock):   zbx pull 'registry.test/fixture/open:3.20'
   more   zbx explain E0522
-  docs   https://zigbox.github.io/zigbox/errors/E0522.html
+  docs   https://zigbox.org/errors/box/E0522.html

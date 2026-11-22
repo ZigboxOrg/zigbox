@@ -4,4 +4,4 @@ error[ZBX-E0516]: a layer can't be unpacked
   layer  1
   fix    the image is damaged or unusual; try another tag or build
   more   zbx explain E0516
-  docs   https://zigbox.github.io/zigbox/errors/E0516.html
+  docs   https://zigbox.org/errors/box/E0516.html

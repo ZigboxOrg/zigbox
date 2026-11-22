@@ -3,4 +3,4 @@ error[ZBX-E0708]: a state volume with that name exists already
          the trash; restoring would replace it
   fix    move the new one to the trash first, if it is not needed:   zbx state rm pgdata
   more   zbx explain E0708 · rerun with --verbose for the full cause chain
-  docs   https://zigbox.github.io/zigbox/errors/E0708.html
+  docs   https://zigbox.org/errors/box/E0708.html

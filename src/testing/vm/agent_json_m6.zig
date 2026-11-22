@@ -430,7 +430,7 @@ const e0706 = "{\"code\":\"ZBX-E0706\",\"severity\":\"error\",\"blame\":\"user\"
     "[{\"sentence\":\"stop the container that holds it, then run again:\",\"command\":" ++
     "\"zbx stop pg\"},{\"sentence\":\"or, if this run only reads it, mount it with " ++
     "NAME:PATH:ro\",\"command\":null}],\"docs\":" ++
-    "\"https://zigbox.github.io/zigbox/errors/E0706.html\"," ++
+    "\"https://zigbox.org/errors/box/E0706.html\"," ++
     "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}\n";
 
 test "a refusal is read from its code and context, with the holder in the context" {
@@ -477,7 +477,7 @@ test "the skip warning names the path inside the volume" {
         "\"summary\":\"a file was left out of the export\",\"causes\":[\"/p is a fifo, which " ++
         "the archive does not keep\"],\"while\":[\"exporting a state volume\"]," ++
         "\"context\":{\"path\":\"/p\"},\"fixes\":[{\"sentence\":\"nothing to do\"," ++
-        "\"command\":null}],\"docs\":\"https://zigbox.github.io/zigbox/errors/W0703.html\"," ++
+        "\"command\":null}],\"docs\":\"https://zigbox.org/errors/box/W0703.html\"," ++
         "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}\n";
     try check_skip_warning(arena, line, "/p");
     try testing.expectError(error.RefusalWrong, check_skip_warning(arena, line, "/q"));

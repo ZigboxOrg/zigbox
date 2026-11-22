@@ -274,7 +274,7 @@ pub fn check_refusal(
     if (first.fixes.len == 0) return error.FixWrong;
     const command = first.fixes[0].command orelse return error.FixWrong;
     if (!std.mem.startsWith(u8, command, "zbx ")) return error.FixWrong;
-    const page = try std.fmt.allocPrint(arena, "/errors/{s}.html", .{code[4..]});
+    const page = try std.fmt.allocPrint(arena, "/errors/box/{s}.html", .{code[4..]});
     if (!std.mem.endsWith(u8, first.docs, page)) return error.DiagnosticWrong;
     return first;
 }
@@ -545,7 +545,7 @@ const refusal_line = "{\"code\":\"ZBX-E0519\",\"severity\":\"error\",\"blame\":\
     "\"while\":[\"w\"],\"context\":{\"ref\":\"alpine:3.20\",\"expect\":\"" ++ tree_expected ++
     "\",\"actual\":\"" ++ tree_actual ++ "\",\"path\":\"/p/zbx.lock\"},\"fixes\":[{\"sentence\":" ++
     "\"to take the store's image:\",\"command\":\"zbx pull 'alpine:3.20'\"},{\"sentence\":" ++
-    "\"or restore\",\"command\":null}],\"docs\":\"https://z.example/errors/E0519.html\"}\n";
+    "\"or restore\",\"command\":null}],\"docs\":\"https://z.example/errors/box/E0519.html\"}\n";
 
 test "a refusal is read from its members: code, both digests, the fix's command" {
     // Goal: step 5 without parsing a message. Right: exit 125, empty stdout, E0519 with the two
@@ -631,7 +631,7 @@ test "explain is the document with the code, summary and docs the diagnostic car
     try testing.expectEqual(@as(usize, 1), all.len);
     const entry = "{\"schema\":\"zbx.explain/1\",\"code\":\"ZBX-E0519\",\"severity\":\"error\"," ++
         "\"blame\":\"user\",\"summary\":\"zbx.lock and the store disagree about an image\"," ++
-        "\"explanation\":\"prose\\nmore\",\"docs\":\"https://z.example/errors/E0519.html\"}\n";
+        "\"explanation\":\"prose\\nmore\",\"docs\":\"https://z.example/errors/box/E0519.html\"}\n";
     const right: Streams = .{ .stdout = entry, .stderr = "" };
     try check_explain(arena, right, 0, all[0]);
     const other = try std.mem.replaceOwned(u8, arena, entry, "disagree", "agree");

@@ -34,7 +34,7 @@ approval of the `release` environment. Nobody tags by hand. After the approval:
 - `tap` and `site` (environment `release-publish`, `main` only, no reviewers) commit the formula
   to `ZigboxOrg/homebrew-tap` and run the zigbox.org deploy, waiting for it;
 - `verify`, on `macos-15` and `macos-15-intel`, checks the public zip and runs
-  `brew install zigbox/tap/zigbox`, `zbx --version` and `brew test zigbox`.
+  `brew install zigboxorg/tap/zigbox`, `zbx --version` and `brew test zigboxorg/tap/zigbox`.
 
 A failure before `publish` leaves a draft and nothing public; the formula and the site name the
 release only after it is public. If a job fails, re-run the failed jobs, or start `release` by
@@ -210,7 +210,7 @@ the signed packages. All of it is reproducible (fixed mtime, owner and order; gz
 
 - `zbx-<v>-linux-x86_64.tar.gz` and `zbx-<v>-linux-aarch64.tar.gz`: the static ReleaseSafe `zbx`,
   `LICENSE` and a short `README.txt`.
-- `zbx-<v>.cdx.json`: a CycloneDX 1.5 SBOM (version, licence, purl `pkg:github/zigbox/zigbox@v<v>`,
+- `zbx-<v>.cdx.json`: a CycloneDX 1.5 SBOM (version, licence, purl `pkg:github/zigboxorg/zigbox@v<v>`,
   the SHA-256 of each binary, the Zig toolchain version, and the statement that there are no
   third-party components).
 - With `-Dpackages-dir=zig-out/packages` (the tree `release-sign.sh` signed), the debs and rpms,

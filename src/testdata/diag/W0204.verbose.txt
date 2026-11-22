@@ -4,5 +4,5 @@ warning[ZBX-W0204]: the container's output is not being kept
   path   /home/alice/.local/state/zbx/logs
   fix    free space, or choose another state directory:   df -h "/home/alice/.local/state/zbx/logs"
   more   zbx explain W0204
-  docs   https://zigbox.github.io/zigbox/errors/W0204.html
+  docs   https://zigbox.org/errors/box/W0204.html
 zbx: note: scope zbx-web-1.scope went by itself just after the run ended

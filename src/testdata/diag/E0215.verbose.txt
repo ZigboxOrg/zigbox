@@ -9,4 +9,4 @@ error[ZBX-E0215]: can't set up a --mount
   step   bind_mount_dir (59 of 74)
   fix    see what this host allows:   zbx doctor
   more   zbx explain E0215
-  docs   https://zigbox.github.io/zigbox/errors/E0215.html
+  docs   https://zigbox.org/errors/box/E0215.html

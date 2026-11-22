@@ -4,5 +4,5 @@ warning[ZBX-W0202]: can't save the run record
   path   /home/alice/.local/state/zbx/runs
   fix    free space, or choose another state directory:   df -h "/home/alice/.local/state/zbx/runs"
   more   zbx explain W0202
-  docs   https://zigbox.github.io/zigbox/errors/W0202.html
+  docs   https://zigbox.org/errors/box/W0202.html
 zbx: note: scope zbx-web-1.scope went by itself just after the run ended

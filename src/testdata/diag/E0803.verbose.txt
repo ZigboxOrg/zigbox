@@ -8,4 +8,4 @@ error[ZBX-E0803]: a build input is refused
   at     line 4, column 78
   fix    copy what it names into the project, and list the copy
   more   zbx explain E0803
-  docs   https://zigbox.github.io/zigbox/errors/E0803.html
+  docs   https://zigbox.org/errors/box/E0803.html

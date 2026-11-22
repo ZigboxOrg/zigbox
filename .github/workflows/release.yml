@@ -1069,21 +1069,32 @@ jobs:
           zip: ${{ runner.temp }}/public/zbx-${{ needs.plan.outputs.version }}-macos-universal.zip
           version: ${{ needs.plan.outputs.version }}
           gatekeeper: 'true'
+      # The address every diagnostic prints (constants.docs_url_base plus `<code>.html`) must
+      # answer once the site is deployed: exactly that address, not the bare path it redirects
+      # to, so a dropped redirect fails here. zigbox.org redirects `<code>.html` to `<code>`, so
+      # the redirect is followed.
+      - name: An error page answers on zigbox.org
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          page=https://zigbox.org/errors/box/E0001.html
+          code=$(/usr/bin/curl -sSL --retry 3 -o /dev/null -w '%{http_code}' "$page")
+          [ "$code" = 200 ] || { echo "release: $page answered $code, not 200" >&2; exit 1; }
+          echo "errors: $page answers 200"
       # The formula needs Apple silicon (depends_on arch: :arm64), so an Intel Mac checks the zip
-      # above and nothing more.
+      # and the error page above and nothing more.
       - name: brew install, zbx --version and brew test
         if: ${{ runner.arch == 'ARM64' }}
         run: |
           set -euo pipefail
           brew update
-          brew install zigbox/tap/zigbox || brew upgrade zigbox/tap/zigbox
+          brew install zigboxorg/tap/zigbox || brew upgrade zigboxorg/tap/zigbox
           out=$(zbx --version)
           echo "$out"
           case "$out" in
             *"zbx $VERSION"*) ;;
             *) echo "release: zbx --version does not say $VERSION" >&2; exit 1 ;;
           esac
-          brew test zigbox/tap/zigbox
+          brew test zigboxorg/tap/zigbox
 
   # The whole signing script with a throwaway key: import from stdin, round 1 and 2, the check,
   # every gpg --verify and rpm -Kv, the archive. It attaches nothing and dispatches nothing.
@@ -1115,7 +1126,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q rpm shellcheck
       - name: ShellCheck
-        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/package-refresh.sh .github/package-refresh-test.sh
+        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/actions/tap-formula/check-diff.sh .github/package-refresh.sh .github/package-refresh-test.sh
       - name: Every local action loads from the workflow's commit
         run: |
           # A release commit predates later tooling fixes, so `./.github/actions/...` (resolved in
@@ -1142,7 +1153,7 @@ jobs:
         run: .github/release-sign-test.sh "$RUNNER_TEMP/out"
       - name: The draft check passes the honest draft and refuses tampered ones
         run: .github/release-prepare-test.sh "$RUNNER_TEMP/out"
-      - name: The tap check refuses a formula whose url is not the release's zip
+      - name: The tap check refuses a wrong url, and a formula that differs from the tap's where it may not
         run: .github/tap-formula-test.sh
       - name: Refresh and refuse with a throwaway key
         run: .github/package-refresh-test.sh "$RUNNER_TEMP/refresh"

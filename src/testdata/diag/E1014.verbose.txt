@@ -4,4 +4,4 @@ error[ZBX-E1014]: the virtual machine's disk is full
   fix    see what the images cost, and remove what you do not need:          zbx store du --by-image
          or make the disk bigger, and stop the machine so that it applies:   zbx vm config --disk 128G && zbx vm stop
   more   zbx explain E1014
-  docs   https://zigbox.github.io/zigbox/errors/E1014.html
+  docs   https://zigbox.org/errors/box/E1014.html

@@ -9,7 +9,7 @@ warning[ZBX-W0201]: mapping only your own id into the container
          install on Debian, Ubuntu:   sudo apt install uidmap
          install on Fedora:           sudo dnf install shadow-utils
   more   zbx explain W0201
-  docs   https://zigbox.github.io/zigbox/errors/W0201.html
+  docs   https://zigbox.org/errors/box/W0201.html
 error[ZBX-E0523]: the image's user needs more ids than this run maps
   while  setting the user the image runs as
   cause  the image runs as user 1000, group 50, and this run maps only root
@@ -17,4 +17,4 @@ error[ZBX-E0523]: the image's user needs more ids than this run maps
   gid    50
   fix    give your account id ranges and the helpers; the doctor shows how:   zbx doctor
   more   zbx explain E0523
-  docs   https://zigbox.github.io/zigbox/errors/E0523.html
+  docs   https://zigbox.org/errors/box/E0523.html

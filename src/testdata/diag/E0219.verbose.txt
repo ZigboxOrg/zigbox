@@ -4,4 +4,4 @@ error[ZBX-E0219]: bad value for a logs option
   value  many
   fix    give a number of lines:   zbx logs --tail 20 web
   more   zbx explain E0219
-  docs   https://zigbox.github.io/zigbox/errors/E0219.html
+  docs   https://zigbox.org/errors/box/E0219.html
