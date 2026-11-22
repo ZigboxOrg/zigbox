@@ -176,9 +176,20 @@ from the workflow's commit with `zig run`, after `gh api` has fetched:
 - `ci`: the newest `push` run of `ci.yml` at the release commit, and all of its jobs with their
   steps. It must be a completed success at that commit, the job listing must be the whole of
   that run's, and every job that `ci.yml` at the release commit defines must be in it exactly
-  once, by the name the API gives it (its `name:`, else its id), so a dropped or renamed job
-  refuses instead of leaving one row fewer. A job whose name the renderer cannot predict from
-  the file (a matrix, a reusable workflow, an expression in the name) refuses too.
+  once, by the name the API gives it (its `name:`, else its id), and the run must hold no job
+  the file does not define, so a dropped or renamed job refuses instead of leaving one row fewer.
+  One matrix shape is read, the one `ci.yml`'s `fuzz` job has: a `strategy:` with at most
+  `fail-fast:` and `max-parallel:` beside a `matrix:` of exactly one key whose value is a
+  one-line list of plain words and numbers (`shard: [1, 2, 3, 4]`), in a job whose `name:` holds
+  `${{ matrix.shard }}` (spelled with those spaces) and no other expression. That job is one
+  name per value, the value substituted as written, as GitHub renders it (`fuzz (shard 1 of 4,
+  every fuzzer, fresh seeds)`), and each of those must be in the run once. Any other job whose
+  name the renderer cannot predict from the file refuses: `include` or `exclude`, a second
+  matrix key, a block list, a matrix from an expression (`fromJSON`), a value YAML could read
+  as something else (`1.10`, `010`, `yes`), a matrix job with no `name:`, another expression
+  in the name, or a reusable workflow (`uses:`). A matrix job skipped by its `if:` is listed by
+  the API under its unexpanded name, so it refuses as a missing job
+  ([the decision](../decisions/2026-11-22-release-evidence-matrix.md)).
 - `release`: this run's own `plan the release`, `macOS gates (hosted)` and `the tap and the site
   are reachable` jobs, the ones `draft` needs. The Mac gate is `mac-check`, not `mac.yml`, so the
   release does not wait for `mac.yml` and the table does not either. Each named job must be in
@@ -208,7 +219,8 @@ missing or repeated job. 0.5.3 is the example: its
 `demo-m6d` job was green with every demo step skipped, and its row says `skipped (allowed: ...)`
 and names them
 (`src/release_evidence/0.5.3-table.md`, rendered from the API's recorded answers for 0.5.3 by the
-unit test and by the `test` job). The table is also written to the draft job's step summary.
+unit test and by the `test` job). 0.6.0's answers (`0.6.0-*`, the first release with the fuzz
+matrix) are rendered the same way. The table is also written to the draft job's step summary.
 
 The token is the job's `GITHUB_TOKEN` with `actions: read`, which `gh` reads from `GH_TOKEN` in
 the environment; it is never printed and never on a command line.

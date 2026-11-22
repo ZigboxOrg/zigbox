@@ -1,0 +1,11 @@
+{
+ "id": 45050090867,
+ "name": "release",
+ "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+ "event": "workflow_dispatch",
+ "status": "completed",
+ "conclusion": "failure",
+ "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867",
+ "created_at": "2026-11-22T17:33:14Z",
+ "run_attempt": 1
+}
