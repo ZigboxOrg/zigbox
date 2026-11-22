@@ -191,17 +191,33 @@ first, so the files of an earlier run never stay beside this one's.
 
 ### The site deploy
 
-The site's deploy (`.github/workflows/deploy.yml` in `ZigboxOrg/website`) copies the newest
-release's asset to `https://zigbox.org/apt`, `/rpm` and the two keyring files byte for byte
-([decision](../decisions/2026-11-10-packages-on-zigbox-org.md)). It refuses an asset that holds
-anything else (links, dot files, `.html`, `to-sign/`, the test key) or lacks `InRelease`,
-`Release.gpg` or a `repomd.xml.asc`, and after deploying it fetches every file back and fails
-unless zigbox.org serves the same bytes. The release's `publish` job sends it `repository_dispatch`
-of type `site` with the release App's token (`GITHUB_TOKEN` cannot write to that repository), finds
-the run that started and fails unless it succeeded. The deploy also runs every six hours on its own.
-After a release, check a client with `apt update` and `dnf makecache` against zigbox.org.
-The refresh workflow sends it the same `repository_dispatch` of type `site` with the release App's
-token after it re-dates the trees.
+Cloudflare deploys zigbox.org (owner, 2026-11-22;
+[decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)): it serves the newest release
+that is not a prerelease and carries `zigbox-repos.tar.gz`, at `https://zigbox.org/apt`, `/rpm` and
+the two keyring files, byte for byte as the asset holds them
+([decision](../decisions/2026-11-10-packages-on-zigbox-org.md)). Nothing in this repository
+deploys the site, and neither the release nor the refresh dispatches the website repository's
+`deploy.yml`.
+
+The release and the refresh only wait for it, with `.github/actions/site-serves/`: the release's
+`site` job (`zigbox.org serves the release`) and the refresh's last steps download the release's
+public `zigbox-repos.tar.gz`, check it against its `SHA256SUMS`, and poll zigbox.org every 60 s
+for up to an hour until it serves the archive's `apt/dists/stable/Release`, `Release.gpg` and
+`InRelease`, both `rpm/*/repodata/repomd.xml` and `repomd.xml.asc`, and
+`zigbox-archive-keyring.gpg` and `.asc`, byte for byte. A poll that finds a mismatch looks at the
+releases again: when the refresh has replaced the asset, or a newer release is out, the wait
+compares against that archive instead (one line says so). A prerelease, or a release finished
+after a newer one carrying the archive, is never served, so the wait is skipped with one line
+saying why and the job passes (`verify` still runs).
+
+On timeout the job fails with one line naming the caller and what zigbox.org served instead,
+such as its `Release` date. Then the site has not been deployed from the release: start the
+owner's Cloudflare deploy (see the
+[decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)), and once zigbox.org serves
+the release, re-run the release run's failed jobs (`site`, which `verify` follows). A refresh
+needs no re-run, since its asset is already replaced: check that zigbox.org's
+`apt/dists/stable/InRelease` has a `Valid-Until` at least ten days away. After a release, check a
+client with `apt update` and `dnf makecache` against zigbox.org.
 
 ## Release assets
 
@@ -322,8 +338,8 @@ prints the `gpg` command for each file it needs signed (rounds 1 and 2 above). `
 will not overwrite a file, so use an empty signatures directory every time. The tag is made by
 publishing the draft release in `release.yml`, never by hand; only with the owner's written
 go-ahead in `docs/decisions/` create the tag and release with `gh release create` from the gated
-commit, run `release.yml` by `workflow_dispatch`, and start the site deploy with `gh workflow run deploy.yml --repo
-ZigboxOrg/website`.
+commit and run `release.yml` by `workflow_dispatch`; Cloudflare deploys zigbox.org, and the
+run's `site` job waits for it.
 
 For the Mac zip, on a Mac with the Developer ID certificate in the login keychain and a notary
 profile there (`xcrun notarytool store-credentials zbx-notary`), from a logged-in graphical

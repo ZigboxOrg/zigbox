@@ -26,7 +26,7 @@ jobs:
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # Holds ZIGBOX_SIGNING_KEY, ZIGBOX_SIGNING_PASSPHRASE and the release App's key.
+    # Holds ZIGBOX_SIGNING_KEY and ZIGBOX_SIGNING_PASSPHRASE.
     environment: package-refresh
     permissions:
       contents: write # `gh release upload` to the release
@@ -105,43 +105,12 @@ jobs:
           done
           echo "package-refresh: the upload failed; the release may hold mixed assets, re-upload the run's artifact" >&2
           exit 1
-      - name: Mint the App token
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      # Cloudflare deploys zigbox.org from the release's assets; the refresh only waits until it
+      # serves the new archive's files (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md).
+      - uses: ./.github/actions/site-serves
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: ZigboxOrg
-          repositories: website
-          permission-contents: write
-          permission-actions: read
-      - name: Dispatch the site deploy and wait for it
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          site=ZigboxOrg/website
-          since=$(date -u -d '30 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
-          gh api -X POST "repos/$site/dispatches" -f event_type=site
-          run_id=""
-          for _ in $(seq 1 60); do
-            run_id=$(gh api -X GET "repos/$site/actions/workflows/deploy.yml/runs" -f event=repository_dispatch \
-              --jq "[.workflow_runs[] | select(.created_at >= \"$since\")] | sort_by(.created_at) | first | .id // empty")
-            [ -n "$run_id" ] && break
-            sleep 10
-          done
-          [ -n "$run_id" ] || { echo "package-refresh: the site deploy did not start within 10 minutes" >&2; exit 1; }
-          echo "site: waiting for https://github.com/$site/actions/runs/$run_id"
-          for _ in $(seq 1 90); do
-            result=$(gh api "repos/$site/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "")"')
-            case "$result" in
-              "completed success") echo "site: deployed"; exit 0 ;;
-              completed*) echo "package-refresh: the site deploy ended: $result" >&2; exit 1 ;;
-            esac
-            sleep 20
-          done
-          echo "package-refresh: the site deploy did not finish within 30 minutes" >&2
-          exit 1
+          tag: ${{ steps.release.outputs.tag }}
+          who: package-refresh
       # What clients see: the served InRelease must be the new one and valid for at least ten more
       # days. A fresh signing gives 21; less than 10 means the refresh did not reach the site.
       - name: The served InRelease is fresh
