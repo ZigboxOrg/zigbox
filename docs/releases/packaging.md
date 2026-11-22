@@ -191,20 +191,33 @@ first, so the files of an earlier run never stay beside this one's.
 
 ### The site deploy
 
-The site's deploy (`.github/workflows/deploy.yml` in `ZigboxOrg/website`) copies the newest
-release's asset to `https://zigbox.org/apt`, `/rpm` and the two keyring files byte for byte
-([decision](../decisions/2026-11-10-packages-on-zigbox-org.md)). It refuses an asset that holds
-anything else (links, dot files, `.html`, `to-sign/`, the test key) or lacks `InRelease`,
-`Release.gpg` or a `repomd.xml.asc`, and after deploying it fetches every file back and fails
-unless zigbox.org serves the same bytes. Cloudflare deploys zigbox.org; neither the release nor
-the refresh dispatches that workflow
-([decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)). Both only wait: the
-release's `site` job (`zigbox.org serves the release`) and the refresh's last steps download the
-release's public `zigbox-repos.tar.gz`, check it against `SHA256SUMS`, and poll every 60 s for up
-to an hour until zigbox.org serves its `apt/dists/stable/Release` and `InRelease`, both
-`repomd.xml` and `zigbox-archive-keyring.gpg` byte for byte (`.github/actions/site-serves/`). On
-timeout they fail with one line naming what zigbox.org served instead, such as its `Release`
-date. After a release, check a client with `apt update` and `dnf makecache` against zigbox.org.
+Cloudflare deploys zigbox.org (owner, 2026-11-22;
+[decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)): it serves the newest release
+that is not a prerelease and carries `zigbox-repos.tar.gz`, at `https://zigbox.org/apt`, `/rpm` and
+the two keyring files, byte for byte as the asset holds them
+([decision](../decisions/2026-11-10-packages-on-zigbox-org.md)). Nothing in this repository
+deploys the site, and neither the release nor the refresh dispatches the website repository's
+`deploy.yml`.
+
+The release and the refresh only wait for it, with `.github/actions/site-serves/`: the release's
+`site` job (`zigbox.org serves the release`) and the refresh's last steps download the release's
+public `zigbox-repos.tar.gz`, check it against its `SHA256SUMS`, and poll zigbox.org every 60 s
+for up to an hour until it serves the archive's `apt/dists/stable/Release`, `Release.gpg` and
+`InRelease`, both `rpm/*/repodata/repomd.xml` and `repomd.xml.asc`, and
+`zigbox-archive-keyring.gpg` and `.asc`, byte for byte. A poll that finds a mismatch looks at the
+releases again: when the refresh has replaced the asset, or a newer release is out, the wait
+compares against that archive instead (one line says so). A prerelease, or a release finished
+after a newer one carrying the archive, is never served, so the wait is skipped with one line
+saying why and the job passes (`verify` still runs).
+
+On timeout the job fails with one line naming the caller and what zigbox.org served instead,
+such as its `Release` date. Then the site has not been deployed from the release: start the
+owner's Cloudflare deploy (see the
+[decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)), and once zigbox.org serves
+the release, re-run the release run's failed jobs (`site`, which `verify` follows). A refresh
+needs no re-run, since its asset is already replaced: check that zigbox.org's
+`apt/dists/stable/InRelease` has a `Valid-Until` at least ten days away. After a release, check a
+client with `apt update` and `dnf makecache` against zigbox.org.
 
 ## Release assets
 

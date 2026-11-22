@@ -963,11 +963,15 @@ jobs:
             -f message="zigbox $VERSION" -f content="$content" -f sha="$BLOB" -f branch=main > /dev/null
           echo "tap: committed Formula/zigbox.rb for $VERSION"
 
-  # Cloudflare deploys zigbox.org from the newest release that carries zigbox-repos.tar.gz; the
-  # release dispatches nothing and only waits, up to an hour, until zigbox.org serves the
-  # archive's apt Release and InRelease, both rpm repomd.xml and the keyring byte for byte
-  # (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md). No secret, no environment: the
-  # archive is the public download, checked against the release's SHA256SUMS.
+  # Cloudflare deploys zigbox.org from the newest non-prerelease release that carries
+  # zigbox-repos.tar.gz; the release dispatches nothing and only waits, up to an hour, until
+  # zigbox.org serves the archive's apt and dnf metadata, signatures and keyrings byte for byte
+  # (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md). A prerelease, or a release
+  # finished after a newer one carrying the archive, is never served: the step says so in one
+  # line and passes without waiting, so `verify` still runs; the decision is made from the
+  # releases API inside the job, so no `if:` differs between a release run and a dispatch re-run.
+  # No secret, no environment: the archive is the public download, checked against the
+  # release's SHA256SUMS.
   site:
     name: zigbox.org serves the release
     needs: [plan, tap]
@@ -990,6 +994,7 @@ jobs:
       - uses: ./.release-tools/.github/actions/site-serves
         with:
           tag: ${{ needs.plan.outputs.tag }}
+          who: release
 
   # What a user does: take the public zip and check it (Apple silicon and Intel), then, on Apple
   # silicon, install from the tap and run it. No secret, no environment.

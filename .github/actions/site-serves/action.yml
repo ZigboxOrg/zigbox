@@ -1,13 +1,19 @@
 name: Wait for zigbox.org to serve the release
 description: >
-  Downloads the published release's zigbox-repos.tar.gz and SHA256SUMS from the public release
-  download URL, checks the archive's hash against the sums, then waits (wait.sh) until the site
-  serves the archive's apt Release and InRelease, both rpm repomd.xml and the keyring byte for
-  byte. Cloudflare deploys zigbox.org from the newest release that carries the archive; nothing
-  here deploys it (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md). Needs no token.
+  Waits (wait.sh) until the site serves the published release's zigbox-repos.tar.gz, downloaded
+  from the public release URL and checked against the release's SHA256SUMS: the apt Release,
+  Release.gpg and InRelease, both rpm repomd.xml and their .asc, and both keyrings, byte for
+  byte. Cloudflare deploys zigbox.org from the newest non-prerelease release that carries the
+  archive; nothing here deploys it (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md).
+  A prerelease, or a release with a newer one carrying the archive, is not waited for (one line
+  says why, and the step passes). A refresh that replaces the asset, or a newer release, during
+  the wait moves what is compared against.
 inputs:
   tag:
     description: The published release's tag, e.g. v0.6.0.
+    required: true
+  who:
+    description: The caller, the prefix of every line (release or package-refresh).
     required: true
   site:
     description: The site's base URL.
@@ -17,24 +23,19 @@ inputs:
     description: How long to wait for the site before failing.
     required: false
     default: '3600'
+  token:
+    description: A token that reads the repository's releases (the API's rate limit).
+    required: false
+    default: ${{ github.token }}
 runs:
   using: composite
   steps:
-    - name: Download the release's repositories and wait for the site
+    - name: Wait for the site to serve the release's repositories
       shell: bash --noprofile --norc -euo pipefail {0}
       env:
         TAG: ${{ inputs.tag }}
         SITE: ${{ inputs.site }}
+        SITE_WHO: ${{ inputs.who }}
         SITE_WAIT_SECONDS: ${{ inputs.wait-seconds }}
-      run: |
-        dir="$RUNNER_TEMP/site-serves"
-        rm -rf "$dir"
-        mkdir "$dir"
-        base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
-        curl -fsSL --retry 3 -o "$dir/zigbox-repos.tar.gz" "$base/zigbox-repos.tar.gz"
-        curl -fsSL --retry 3 -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
-        grep ' zigbox-repos\.tar\.gz$' "$dir/SHA256SUMS" > "$dir/sum" ||
-          { echo "release: $TAG's SHA256SUMS does not list zigbox-repos.tar.gz" >&2; exit 1; }
-        (cd "$dir" && sha256sum --quiet -c sum) ||
-          { echo "release: $TAG's zigbox-repos.tar.gz does not match its SHA256SUMS" >&2; exit 1; }
-        "$GITHUB_ACTION_PATH/wait.sh" "$dir/zigbox-repos.tar.gz" "$SITE"
+        GH_TOKEN: ${{ inputs.token }}
+      run: '"$GITHUB_ACTION_PATH/wait.sh" "$TAG" "$SITE"'

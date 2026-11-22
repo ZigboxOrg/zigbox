@@ -110,6 +110,7 @@ jobs:
       - uses: ./.github/actions/site-serves
         with:
           tag: ${{ steps.release.outputs.tag }}
+          who: package-refresh
       # What clients see: the served InRelease must be the new one and valid for at least ten more
       # days. A fresh signing gives 21; less than 10 means the refresh did not reach the site.
       - name: The served InRelease is fresh

@@ -76,8 +76,9 @@ release PR merged to main (supervisor; version in build.zig.zon, notes in docs/r
        │              `mac`'s output when `mac` ran, else against `plan`'s; refused with neither),
        │              then commit Formula/zigbox.rb to ZigboxOrg/homebrew-tap main
        ├─ site        no secret: wait (up to an hour) until zigbox.org serves the public
-       │              zigbox-repos.tar.gz's apt Release, InRelease, both rpm repomd.xml and the
-       │              keyring byte for byte; Cloudflare deploys the site, the release does not
+       │              zigbox-repos.tar.gz's apt and dnf metadata, signatures and keyrings byte
+       │              for byte; Cloudflare deploys the site, the release does not; a prerelease
+       │              or a release with a newer one is not waited for (one line, and it passes)
        └─ verify      macos-15 and macos-15-intel: the public zip (signature, Gatekeeper,
                       both architectures, zbx --version), then brew install, zbx --version, brew test
 ```
