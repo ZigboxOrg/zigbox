@@ -109,6 +109,8 @@ const rules = [_]Rule{
         ".github/actions/find-draft/*",
         ".github/actions/tap-formula/*",
         ".github/actions/mac-check-zip/*",
+        ".github/actions/site-serves/*",
+        ".github/site-serves-test.sh",
     } },
     // demo-m6d's gate on the owner's Google setup runs in its job alone.
     .{ .patterns = &.{".github/actions/m6d-setup/*"}, .only = &.{"m6d"} },

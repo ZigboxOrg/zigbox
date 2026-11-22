@@ -196,12 +196,15 @@ release's asset to `https://zigbox.org/apt`, `/rpm` and the two keyring files by
 ([decision](../decisions/2026-11-10-packages-on-zigbox-org.md)). It refuses an asset that holds
 anything else (links, dot files, `.html`, `to-sign/`, the test key) or lacks `InRelease`,
 `Release.gpg` or a `repomd.xml.asc`, and after deploying it fetches every file back and fails
-unless zigbox.org serves the same bytes. The release's `publish` job sends it `repository_dispatch`
-of type `site` with the release App's token (`GITHUB_TOKEN` cannot write to that repository), finds
-the run that started and fails unless it succeeded. The deploy also runs every six hours on its own.
-After a release, check a client with `apt update` and `dnf makecache` against zigbox.org.
-The refresh workflow sends it the same `repository_dispatch` of type `site` with the release App's
-token after it re-dates the trees.
+unless zigbox.org serves the same bytes. Cloudflare deploys zigbox.org; neither the release nor
+the refresh dispatches that workflow
+([decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)). Both only wait: the
+release's `site` job (`zigbox.org serves the release`) and the refresh's last steps download the
+release's public `zigbox-repos.tar.gz`, check it against `SHA256SUMS`, and poll every 60 s for up
+to an hour until zigbox.org serves its `apt/dists/stable/Release` and `InRelease`, both
+`repomd.xml` and `zigbox-archive-keyring.gpg` byte for byte (`.github/actions/site-serves/`). On
+timeout they fail with one line naming what zigbox.org served instead, such as its `Release`
+date. After a release, check a client with `apt update` and `dnf makecache` against zigbox.org.
 
 ## Release assets
 
@@ -322,8 +325,8 @@ prints the `gpg` command for each file it needs signed (rounds 1 and 2 above). `
 will not overwrite a file, so use an empty signatures directory every time. The tag is made by
 publishing the draft release in `release.yml`, never by hand; only with the owner's written
 go-ahead in `docs/decisions/` create the tag and release with `gh release create` from the gated
-commit, run `release.yml` by `workflow_dispatch`, and start the site deploy with `gh workflow run deploy.yml --repo
-ZigboxOrg/website`.
+commit and run `release.yml` by `workflow_dispatch`; Cloudflare deploys zigbox.org, and the
+run's `site` job waits for it.
 
 For the Mac zip, on a Mac with the Developer ID certificate in the login keychain and a notary
 profile there (`xcrun notarytool store-credentials zbx-notary`), from a logged-in graphical

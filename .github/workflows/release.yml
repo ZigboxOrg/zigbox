@@ -10,9 +10,11 @@
 #   linux, mac                   sign and attach to the draft; the owner's ONE approval (`release`)
 #   prepare                      check the assets and the tap diff; still nothing is public
 #   publish                      the draft becomes the release, and that makes the tag
-#   tap, site, verify            the formula, the zigbox.org deploy, an install on two Macs
+#   tap, site, verify            the formula, zigbox.org serving the release (Cloudflare
+#                                deploys it; the release only waits), an install on two Macs
 #
-# A failure before `publish` leaves a draft and nothing else: no tag, no formula, no site change.
+# A failure before `publish` leaves a draft and nothing else: no tag, no formula, no new
+# repositories for zigbox.org to serve.
 # Every job is idempotent: a re-run of a failed run, or a manual run with the version, from main,
 # finishes a half-done release (a draft is reused; a published release goes on to tap and site).
 #
@@ -45,6 +47,7 @@ on:
       - '.github/release-sign-test.sh'
       - '.github/package-refresh.sh'
       - '.github/package-refresh-test.sh'
+      - '.github/site-serves-test.sh'
       - '.github/actions/**'
       - 'src/mac_release.zig'
       - 'packaging/homebrew/**'
@@ -260,9 +263,10 @@ jobs:
         run: '[ ! -d "$RUNNER_TEMP/release-tools" ] || mv "$RUNNER_TEMP/release-tools" .release-tools'
 
   # Everything the owner's secrets are for, tried before the owner is asked for anything: the
-  # App's token for the tap and the site, a read of the tap's formula, the site's deploy workflow.
+  # App's token for the tap and a read of the tap's formula. zigbox.org needs no secret: the
+  # release only waits for it (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md).
   preflight:
-    name: the tap and the site are reachable
+    name: the tap is reachable
     needs: plan
     if: ${{ needs.plan.outputs.go == 'true' }}
     runs-on: ubuntu-24.04
@@ -287,7 +291,7 @@ jobs:
           sparse-checkout: /.github/actions/
           sparse-checkout-cone-mode: false
       - uses: ./.release-tools/.github/actions/setup-gh
-      # The App is installed on the tap and the site only, never on this repository.
+      # The App is installed on the tap, never on this repository.
       - name: Mint the App token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -295,18 +299,14 @@ jobs:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ZigboxOrg
-          repositories: |
-            homebrew-tap
-            website
+          repositories: homebrew-tap
           permission-contents: write
-          permission-actions: read
-      - name: Read the tap and the site's deploy workflow
+      - name: Read the tap
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           gh api "repos/ZigboxOrg/homebrew-tap/contents/Formula/zigbox.rb?ref=main" --jq .path
-          gh api "repos/ZigboxOrg/website/actions/workflows/deploy.yml" --jq .state
 
   # The draft: notes from docs/releases/<version>.md, then the CI evidence table, targeting the
   # release commit. A draft makes no tag. An existing draft is reused (its notes refreshed), so a
@@ -388,7 +388,7 @@ jobs:
             --gate ci .github/workflows/ci.yml "$dir/ci-runs.json" "$dir/ci-jobs.json" \
             --current release .release-tools/.github/workflows/release.yml \
             "$dir/release-run.json" "$dir/release-jobs.json" \
-            "plan the release,macOS gates (hosted),the tap and the site are reachable" \
+            "plan the release,macOS gates (hosted),the tap is reachable" \
             --allow-skip "$M6D" "Google WIF is not set up yet" \
             > "$dir/table.md"
           { cat "docs/releases/$VERSION.md"; echo; cat "$dir/table.md"; } > "$dir/notes.md"
@@ -773,11 +773,8 @@ jobs:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ZigboxOrg
-          repositories: |
-            homebrew-tap
-            website
-          permission-contents: write
-          permission-actions: read
+          repositories: homebrew-tap
+          permission-contents: read
       # The diff against the tap is checked now, while a refusal still leaves only a draft.
       - name: The tap's formula differs only where it may
         uses: ./.release-tools/.github/actions/tap-formula
@@ -966,23 +963,20 @@ jobs:
             -f message="zigbox $VERSION" -f content="$content" -f sha="$BLOB" -f branch=main > /dev/null
           echo "tap: committed Formula/zigbox.rb for $VERSION"
 
-  # The deploy fetches every apt and rpm file back from zigbox.org and compares bytes, so a
-  # green run is the check. Its run is the first `repository_dispatch` run created after the
-  # dispatch; both waits are bounded.
+  # Cloudflare deploys zigbox.org from the newest release that carries zigbox-repos.tar.gz; the
+  # release dispatches nothing and only waits, up to an hour, until zigbox.org serves the
+  # archive's apt Release and InRelease, both rpm repomd.xml and the keyring byte for byte
+  # (docs/decisions/2026-11-22-site-deployed-by-cloudflare.md). No secret, no environment: the
+  # archive is the public download, checked against the release's SHA256SUMS.
   site:
-    name: deploy zigbox.org
+    name: zigbox.org serves the release
     needs: [plan, tap]
     if: ${{ always() && needs.tap.result == 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    environment: release-publish
+    timeout-minutes: 75
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.plan.outputs.sha }}
-          persist-credentials: false
       # Local actions load from the workflow's own commit, not the release commit, so a fix to
       # release tooling reaches a release commit made before it (docs/releases/automation.md).
       - name: Check out the release tools at the workflow's commit
@@ -993,44 +987,9 @@ jobs:
           persist-credentials: false
           sparse-checkout: /.github/actions/
           sparse-checkout-cone-mode: false
-      - uses: ./.release-tools/.github/actions/setup-gh
-      - name: Mint the App token
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      - uses: ./.release-tools/.github/actions/site-serves
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: ZigboxOrg
-          repositories: website
-          permission-contents: write
-          permission-actions: read
-      - name: Dispatch the site deploy and wait for it
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          site=ZigboxOrg/website
-          since=$(date -u -d '30 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
-          gh api -X POST "repos/$site/dispatches" -f event_type=site
-          run_id=""
-          for _ in $(seq 1 60); do
-            run_id=$(gh api -X GET "repos/$site/actions/workflows/deploy.yml/runs" -f event=repository_dispatch \
-              --jq "[.workflow_runs[] | select(.created_at >= \"$since\")] | sort_by(.created_at) | first | .id // empty")
-            [ -n "$run_id" ] && break
-            sleep 10
-          done
-          [ -n "$run_id" ] || { echo "release: the site deploy did not start within 10 minutes" >&2; exit 1; }
-          echo "site: waiting for https://github.com/$site/actions/runs/$run_id"
-          for _ in $(seq 1 90); do
-            result=$(gh api "repos/$site/actions/runs/$run_id" --jq '"\(.status) \(.conclusion // "")"')
-            case "$result" in
-              "completed success") echo "site: deployed"; exit 0 ;;
-              completed*) echo "release: the site deploy ended: $result" >&2; exit 1 ;;
-            esac
-            sleep 20
-          done
-          echo "release: the site deploy did not finish within 30 minutes" >&2
-          exit 1
+          tag: ${{ needs.plan.outputs.tag }}
 
   # What a user does: take the public zip and check it (Apple silicon and Intel), then, on Apple
   # silicon, install from the tap and run it. No secret, no environment.
@@ -1135,7 +1094,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q rpm shellcheck
       - name: ShellCheck
-        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/actions/tap-formula/check-diff.sh .github/package-refresh.sh .github/package-refresh-test.sh
+        run: shellcheck .github/release-sign.sh .github/release-sign-test.sh .github/release-prepare-check.sh .github/release-prepare-test.sh .github/tap-formula-test.sh .github/actions/tap-formula/check-url.sh .github/actions/tap-formula/check-diff.sh .github/package-refresh.sh .github/package-refresh-test.sh .github/actions/site-serves/wait.sh .github/site-serves-test.sh
       - name: Every local action loads from the workflow's commit
         run: |
           # A release commit predates later tooling fixes, so `./.github/actions/...` (resolved in
@@ -1179,6 +1138,8 @@ jobs:
         run: .github/release-prepare-test.sh "$RUNNER_TEMP/out"
       - name: The tap check refuses a wrong url, and a formula that differs from the tap's where it may not
         run: .github/tap-formula-test.sh
+      - name: The site wait passes a site that serves the archive and names what a stale one serves
+        run: .github/site-serves-test.sh
       - name: Refresh and refuse with a throwaway key
         run: .github/package-refresh-test.sh "$RUNNER_TEMP/refresh"
       - name: The archive holds what packaging.md says and nothing secret

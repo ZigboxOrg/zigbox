@@ -75,7 +75,9 @@ release PR merged to main (supervisor; version in build.zig.zon, notes in docs/r
        ├─ tap         env release-publish: the published assets checked again (the zip against
        │              `mac`'s output when `mac` ran, else against `plan`'s; refused with neither),
        │              then commit Formula/zigbox.rb to ZigboxOrg/homebrew-tap main
-       ├─ site        repository_dispatch to ZigboxOrg/website, wait for the deploy
+       ├─ site        no secret: wait (up to an hour) until zigbox.org serves the public
+       │              zigbox-repos.tar.gz's apt Release, InRelease, both rpm repomd.xml and the
+       │              keyring byte for byte; Cloudflare deploys the site, the release does not
        └─ verify      macos-15 and macos-15-intel: the public zip (signature, Gatekeeper,
                       both architectures, zbx --version), then brew install, zbx --version, brew test
 ```
@@ -109,7 +111,7 @@ commit, the one `ci` ran on.
 | `ci` green on the commit (the API, not the event) | `plan` |
 | tag absent or at this commit; no published release at another commit | `plan` |
 | macOS build and every gate | `mac-check` |
-| App token mints for the tap and the site; tap formula readable; site `deploy.yml` found | `preflight` |
+| App token mints for the tap; tap formula readable | `preflight` |
 | a draft at another commit; two drafts | `draft`, `find-draft` |
 | signature, notarization, `lipo -archs` (both), `spctl`, `zbx --version` of the signed zip | `mac` |
 | the draft's assets (exactly), `SHA256SUMS` and `SHA256SUMS.macos` against them, the signature on `SHA256SUMS`, the formula's url, version and hash, the archive listing | `prepare` |
@@ -240,10 +242,11 @@ the environment; it is never printed and never on a command line.
 - The temporary keychain is put on the user search list for the signing step, because `codesign`
   needs it there to resolve the chain; the `always()` step restores the list the job found. Both
   steps are the same in `mac-test`.
-- The App can write the contents of two repositories, `homebrew-tap` and `website`, and
-  read Actions on the site; it is not installed on `ZigboxOrg/zigbox`. Its key is a secret of
-  `release-publish` alone (no reviewers, `main` only): `preflight`, `prepare`, `tap` and `site`
-  can read it. `tap-approve` is the one job that adds an approval in front of `tap` (for a
+- The App writes the contents of one repository, `homebrew-tap`; it is not installed on
+  `ZigboxOrg/zigbox`. Its key is a secret of `release-publish` alone (no reviewers, `main` only):
+  `preflight`, `prepare` and `tap` can read it. `site` holds no secret and no environment: it
+  dispatches nothing and only waits for zigbox.org, which Cloudflare deploys
+  ([decision](../decisions/2026-11-22-site-deployed-by-cloudflare.md)). `tap-approve` is the one job that adds an approval in front of `tap` (for a
   re-dispatch on a published release); it runs on `release`, holds no secret and runs nothing. Tokens are minted per job for the repositories that job needs.
 - `publish` and the draft use `GITHUB_TOKEN` with `contents: write` on `ZigboxOrg/zigbox`, in jobs that
   hold no signing secret. A tag made with `GITHUB_TOKEN` starts no workflow, and none is meant to.
@@ -263,7 +266,7 @@ the environment; it is never printed and never on a command line.
 
 | # | Item | Kind | Where | Owner of it | Exists? |
 |---|---|---|---|---|---|
-| 1 | GitHub App "Zigbox Release": Contents read and write, Metadata read, Actions read | GitHub App | Zigbox org, installed on `homebrew-tap` and `website` only | owner | new (uninstall from `zigbox` if installed) |
+| 1 | GitHub App "Zigbox Release": Contents read and write, Metadata read | GitHub App | Zigbox org, installed on `homebrew-tap` only (`website` and Actions read are no longer used) | owner | new (uninstall from `zigbox` if installed) |
 | 2 | `RELEASE_APP_ID` | variable | env `release-publish` | owner | new |
 | 3 | `RELEASE_APP_PRIVATE_KEY` (the App's `.pem`) | secret | env `release-publish` | owner | new |
 | 4 | Environment `release-publish`: deployments from `main` only, no reviewers | environment | ZigboxOrg/zigbox | owner | new |
@@ -276,10 +279,10 @@ the environment; it is never printed and never on a command line.
 | 11 | GitHub-hosted runners `ubuntu-24.04`, `macos-15`, `macos-15-intel` | runners | GitHub | GitHub | exist |
 | 12 | Zig 0.17.0, `gh` 2.74.0 (SHA-256 pinned), `actions/*` (full SHA) | tools | `.github/actions/`, `release.yml` | implementer | changed |
 | 13 | `release.yml`: `plan`, `mac-check`, `preflight`, `draft`, `linux`, `mac`, `prepare`, `publish`, `tap-approve`, `tap`, `site`, `verify`, `test`, `mac-test`, `draft-test` | workflow | ZigboxOrg/zigbox | implementer | changed |
-| 14 | `.github/actions/`: `setup-gh`, `find-draft`, `tap-formula`, `mac-check-zip` | actions | ZigboxOrg/zigbox | implementer | new |
+| 14 | `.github/actions/`: `setup-gh`, `find-draft`, `tap-formula`, `mac-check-zip`, `site-serves` | actions | ZigboxOrg/zigbox | implementer | new |
 | 15 | `zig build mac-release` builds and joins both architectures; tests | code | ZigboxOrg/zigbox | implementer | changed |
 | 16 | `packaging.md`, this file, AGENTS.md line, STYLE.md (`lipo`), decision | docs | ZigboxOrg/zigbox | implementer, supervisor | changed |
-| 17 | Site `deploy.yml` accepting `repository_dispatch` type `site` | workflow | ZigboxOrg/website | — | exists |
+| 17 | zigbox.org deployed by Cloudflare from the newest release carrying `zigbox-repos.tar.gz` | site | Cloudflare | owner | exists; the release no longer dispatches `ZigboxOrg/website`'s `deploy.yml` |
 
 No longer needed: the `release-tag` environment, the `MAC_RELEASE_RUNNER_LABEL` variable, the
 self-hosted release runner and its separate macOS user, the runner group. (`MAC_RUNNER_LABEL` and
@@ -301,10 +304,10 @@ no runner to set up and no macOS user to make.
 
 **1. The GitHub App.** In the browser: Zigbox organisation → Settings → Developer settings →
 GitHub Apps → New GitHub App. Name `Zigbox Release`; no webhook (untick Active); repository
-permissions **Contents: Read and write**, **Actions: Read**, Metadata: Read; "Only on this
+permissions **Contents: Read and write**, Metadata: Read; "Only on this
 account". Create it, note the App ID, and **Generate a private key** (a `.pem` downloads). Then
-**Install App** → Zigbox → Only select repositories: `homebrew-tap` and `website`
-(not `zigbox`).
+**Install App** → Zigbox → Only select repositories: `homebrew-tap` (not `zigbox`; the release
+no longer writes to or reads Actions of `website`).
 
 **2. The environment `release-publish`, and the `release` policy.**
 

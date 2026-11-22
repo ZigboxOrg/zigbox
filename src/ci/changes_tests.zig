@@ -136,6 +136,10 @@ const rows = [_]Row{
         .true_outputs = &.{"code"},
     },
     .{
+        .paths = &.{ ".github/actions/site-serves/wait.sh", ".github/site-serves-test.sh" },
+        .true_outputs = &.{"code"},
+    },
+    .{
         .paths = &.{".github/release-sign-test.sh"},
         .true_outputs = &.{"code"},
     },

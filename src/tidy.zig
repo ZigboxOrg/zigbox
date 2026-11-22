@@ -69,6 +69,10 @@ const shell_allowlist = [_][]const u8{
     // The weekly re-sign: the same `gpg` glue as release-sign.sh, around its own checks.
     ".github/package-refresh.sh",
     ".github/package-refresh-test.sh",
+    // The release's wait for zigbox.org to serve its repositories (glue around `curl` and `cmp`
+    // on a runner with no Zig), and its test against a local HTTP server.
+    ".github/actions/site-serves/wait.sh",
+    ".github/site-serves-test.sh",
 };
 
 /// The files that make up the shipped `zbx` binary. Their functions must average at least
