@@ -247,8 +247,17 @@ jobs:
       - uses: ./.release-tools/.github/actions/setup-zig-macos
       - name: The VM kernel
         run: test -f .zig-cache/zbx-vm/kernel/Image || zig build vm-kernel-fetch
+      # tidy walks the whole workspace, and the release commit's tidy is fixed (it cannot skip
+      # `.release-tools`, and bans the tools' shell scripts), so the gate runs with the tools
+      # moved out. The actions have all loaded by now; the next step puts them back for the
+      # checkout action's post-job cleanup.
       - name: Every gate
-        run: zig build check --summary all
+        run: |
+          mv .release-tools "$RUNNER_TEMP/release-tools"
+          zig build check --summary all
+      - name: Put the release tools back
+        if: ${{ always() }}
+        run: '[ ! -d "$RUNNER_TEMP/release-tools" ] || mv "$RUNNER_TEMP/release-tools" .release-tools'
 
   # Everything the owner's secrets are for, tried before the owner is asked for anything: the
   # App's token for the tap and the site, a read of the tap's formula, the site's deploy workflow.
