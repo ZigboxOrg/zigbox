@@ -219,7 +219,11 @@ const module_allowlist = [_][]const u8{
     "zigbox",
 };
 
-const skipped_directories = [_][]const u8{ ".git", ".zig-cache", "zig-out", "zig-pkg" };
+// `.release-tools` is the release workflow's second checkout (the workflow commit's actions), not
+// part of the tree under test.
+const skipped_directories = [_][]const u8{
+    ".git", ".zig-cache", "zig-out", "zig-pkg", ".release-tools",
+};
 
 pub const Rule = enum {
     line_too_long,
