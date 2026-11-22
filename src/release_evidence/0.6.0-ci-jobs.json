@@ -1,0 +1,2417 @@
+{
+ "total_count": 29,
+ "jobs": [
+  {
+   "id": 137259504339,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "what changed",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259504339",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Pick the jobs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    }
+   ]
+  },
+  {
+   "id": 137259938745,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m1 (Ubuntu 24.04 VM, KVM, Alpine rootfs)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938745",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M1 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938746,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m0 (Ubuntu 24.04 VM, KVM)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938746",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M0 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259938748,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "D-Bus client against a real dbus-daemon",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938748",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Install dbus-daemon",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Run the client against a private session bus",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Post Install dbus-daemon",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    }
+   ]
+  },
+  {
+   "id": 137259938756,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "build (both targets, size gate)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938756",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Build",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Release builds and size check",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Trust surface for wasm32-freestanding",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Fuzzers for aarch64-macos",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938765,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "tidy",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938765",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Formatting, line and function length, banned patterns, assertion density",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938792,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m2b (Ubuntu 24.04 VM, KVM, Alpine rootfs, workload knobs)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938792",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M2b demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938798,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "errors site is up to date",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938798",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Generated pages match the registry",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938820,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "fuzz (shard 3 of 4, every fuzzer, fresh seeds)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938820",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Fuzz shard 3 of 4",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938842,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "fuzz (shard 2 of 4, every fuzzer, fresh seeds)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938842",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Fuzz shard 2 of 4",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938851,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "fuzz (shard 4 of 4, every fuzzer, fresh seeds)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938851",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Fuzz shard 4 of 4",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938856,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "fuzz (shard 1 of 4, every fuzzer, fresh seeds)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938856",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Fuzz shard 1 of 4",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938871,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-s2 (Ubuntu 24.04 VM, KVM, lazy start from a throttled registry)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938871",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Free disk",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Run the S2 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 18
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 19
+    }
+   ]
+  },
+  {
+   "id": 137259938898,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m6b (Ubuntu 24.04 VM, KVM, upgrade from M6)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938898",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M6b demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259938899,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-s2-lazy (Ubuntu 24.04 VM, KVM, zbx run --lazy over FUSE)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938899",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the S2 lazy check",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938902,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m10 (Ubuntu 24.04 VM, KVM, --device and --gpu)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938902",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M10 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938915,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m6 (Ubuntu 24.04 VM, KVM, upgrade from M5)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938915",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M6 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259938932,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m9 (Ubuntu 24.04 VM, KVM, zbx import of a Dockerfile)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938932",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M9 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259938948,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m4 (Ubuntu 24.04 VM, KVM, pull, upgrade, agent test)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938948",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Cache the pulled blobs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Run the M4 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Cache the pulled blobs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 18
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 19
+    }
+   ]
+  },
+  {
+   "id": 137259938976,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m8b (Ubuntu 24.04 VM, KVM, listener handoff)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938976",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M8b demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938978,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m6d (Ubuntu 24.04 VM, KVM, Artifact Registry and gcr.io through WIF)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938978",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Check the Google setup",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 4
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 5
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 6
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 7
+    },
+    {
+     "name": "Run the M6d demo",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 8
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938980,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m5 (Ubuntu 24.04 VM, KVM, upgrade from M4)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938980",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M5 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259938982,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m2 (Ubuntu 24.04 VM, KVM, Alpine rootfs, limits)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938982",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M2 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259938985,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "test",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938985",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Unit, snapshot and simulation tests",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Run ./.github/actions/zig-cache",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137259938995,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m8-packages (four guests, KVM)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259938995",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the other guest images",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M8 packages demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the other guest images",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259939022,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m8 (Ubuntu 24.04 VM, KVM, upgrade from v0.3.1)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259939022",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M8 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259939055,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m7 (Ubuntu 24.04 VM, KVM, upgrade from 0.2.0)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259939055",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Run the M7 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137259939076,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-c4 (Ubuntu 24.04 VM, KVM, container_socket, exec network, hosts file)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259939076",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the C4 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137259939195,
+   "run_id": 45039162888,
+   "run_attempt": 1,
+   "head_sha": "82981d00c300de2806abfef2bdaee2caf84f670c",
+   "name": "demo-m3 (Ubuntu 24.04 VM, KVM, Alpine rootfs, store)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45039162888/job/137259939195",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Enable KVM",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Run the M3 demo",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 8
+    },
+    {
+     "name": "Post Cache the Alpine rootfs",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Post Cache the VM base image",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Install QEMU",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Run ./.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  }
+ ]
+}

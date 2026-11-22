@@ -1,0 +1,414 @@
+{
+ "total_count": 15,
+ "jobs": [
+  {
+   "id": 137293076232,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "plan the release",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293076232",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.release-tools/.github/actions/setup-gh",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Plan",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Post Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 9
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    }
+   ]
+  },
+  {
+   "id": 137293077488,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "test the Mac signing steps (throwaway identity)",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293077488",
+   "steps": []
+  },
+  {
+   "id": 137293077720,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "test the signing script (throwaway key)",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293077720",
+   "steps": []
+  },
+  {
+   "id": 137293077805,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "test the draft steps (throwaway release)",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293077805",
+   "steps": []
+  },
+  {
+   "id": 137293162811,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "the tap and the site are reachable",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293162811",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.release-tools/.github/actions/setup-gh",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Mint the App token",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Read the tap and the site's deploy workflow",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Post Mint the App token",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 10
+    },
+    {
+     "name": "Post Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 11
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 12
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    }
+   ]
+  },
+  {
+   "id": 137293162825,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "macOS gates (hosted)",
+   "status": "completed",
+   "conclusion": "success",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293162825",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.release-tools/.github/actions/setup-zig-macos",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "The VM kernel",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Every gate",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 6
+    },
+    {
+     "name": "Put the release tools back",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 7
+    },
+    {
+     "name": "Post Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 13
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    }
+   ]
+  },
+  {
+   "id": 137293164464,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "approve a tap of a published release",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137293164464",
+   "steps": []
+  },
+  {
+   "id": 137299232527,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "draft the release",
+   "status": "completed",
+   "conclusion": "failure",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299232527",
+   "steps": [
+    {
+     "name": "Set up job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 1
+    },
+    {
+     "name": "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 2
+    },
+    {
+     "name": "Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 3
+    },
+    {
+     "name": "Run ./.release-tools/.github/actions/setup-gh",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 4
+    },
+    {
+     "name": "Run ./.release-tools/.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 5
+    },
+    {
+     "name": "Render the CI evidence",
+     "status": "completed",
+     "conclusion": "failure",
+     "number": 6
+    },
+    {
+     "name": "Run ./.release-tools/.github/actions/find-draft",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 7
+    },
+    {
+     "name": "Create the draft, or refresh the notes of the one that exists",
+     "status": "completed",
+     "conclusion": "skipped",
+     "number": 8
+    },
+    {
+     "name": "Post Run ./.release-tools/.github/actions/setup-zig",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 14
+    },
+    {
+     "name": "Post Check out the release tools at the workflow's commit",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 15
+    },
+    {
+     "name": "Post Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 16
+    },
+    {
+     "name": "Complete job",
+     "status": "completed",
+     "conclusion": "success",
+     "number": 17
+    }
+   ]
+  },
+  {
+   "id": 137299386205,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "sign and notarize (macOS)",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299386205",
+   "steps": []
+  },
+  {
+   "id": 137299386276,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "sign and attach (apt and rpm)",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299386276",
+   "steps": []
+  },
+  {
+   "id": 137299386803,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "check the draft before publishing",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299386803",
+   "steps": []
+  },
+  {
+   "id": 137299387125,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "publish the release",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299387125",
+   "steps": []
+  },
+  {
+   "id": 137299387141,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "commit the formula to the tap",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299387141",
+   "steps": []
+  },
+  {
+   "id": 137299388112,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "install and run (${{ matrix.os }})",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299388112",
+   "steps": []
+  },
+  {
+   "id": 137299388140,
+   "run_id": 45050090867,
+   "run_attempt": 1,
+   "head_sha": "4be0c6235791c9a0ffde6e9019aeabc44f2df5fe",
+   "name": "deploy zigbox.org",
+   "status": "completed",
+   "conclusion": "skipped",
+   "html_url": "https://github.com/ZigboxOrg/zigbox/actions/runs/45050090867/job/137299388140",
+   "steps": []
+  }
+ ]
+}

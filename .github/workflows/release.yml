@@ -1158,6 +1158,21 @@ jobs:
             "Google WIF is not set up yet" \
             > "$RUNNER_TEMP/table.md"
           diff -u "$f/0.5.3-table.md" "$RUNNER_TEMP/table.md"
+      # 0.6.0's: ci.yml at its release commit has the fuzz matrix, four jobs from one
+      # (docs/decisions/2026-11-22-release-evidence-matrix.md).
+      - name: The evidence table renders 0.6.0's recorded runs
+        run: |
+          f=src/release_evidence
+          zig run src/release_evidence.zig -- \
+            --product ZigboxOrg/zigbox@82981d00c300de2806abfef2bdaee2caf84f670c \
+            --gate ci "$f/0.6.0-ci.yml" "$f/0.6.0-ci-runs.json" "$f/0.6.0-ci-jobs.json" \
+            --current release "$f/0.6.0-release.yml" \
+            "$f/0.6.0-release-run.json" "$f/0.6.0-release-jobs.json" \
+            "plan the release,macOS gates (hosted),the tap and the site are reachable" \
+            --allow-skip "demo-m6d (Ubuntu 24.04 VM, KVM, Artifact Registry and gcr.io through WIF)" \
+            "Google WIF is not set up yet" \
+            > "$RUNNER_TEMP/table-0.6.0.md"
+          diff -u "$f/0.6.0-table.md" "$RUNNER_TEMP/table-0.6.0.md"
       - name: Sign with a throwaway key
         run: .github/release-sign-test.sh "$RUNNER_TEMP/out"
       - name: The draft check passes the honest draft and refuses tampered ones
